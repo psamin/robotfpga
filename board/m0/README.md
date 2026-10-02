@@ -84,6 +84,37 @@ than importing PYNQ or sourcing a profile during preflight:
 Missing commands or permission failures are unresolved observations, not
 permission to assume compatible versions. Do not put passwords in logs.
 
+### Read-only JSON inventory collector
+
+`collect_inventory.py` uses only the Python standard library. It reads the
+same board information plus installed package versions and module listings.
+Each subprocess has a 15-second timeout; noninteractive sudo failures are
+recorded with exit status/stderr. It never imports PYNQ or loads firmware.
+
+After copying it to the board, run once with each existing interpreter:
+
+```bash
+mkdir -p artifacts/m0
+python3 board/m0/collect_inventory.py > artifacts/m0/system-inventory.json
+/usr/local/share/pynq-venv/bin/python board/m0/collect_inventory.py \
+  > artifacts/m0/pynq-inventory.json
+```
+
+Skip the second command if that environment is absent; do not create it just
+to collect inventory. Exit code zero means the JSON was collected, not that
+all observations succeeded or compatibility/M0 passed. Review every command
+status and `unavailable` field before deciding on installation.
+
+Validation status: source and Git whitespace checks only. Execution and
+Python syntax validation are pending: the workstation Python command is an
+unusable Windows Store alias, and the board is unavailable. The collector PR
+stays a draft until interpreter validation is recorded; hardware acceptance
+remains a separate gate. With a usable interpreter, check syntax with:
+
+```bash
+python3 -m py_compile board/m0/collect_inventory.py
+```
+
 ## Acceptance on the actual board
 
 - Board identity and Linux boot are confirmed; the complete runtime inventory
