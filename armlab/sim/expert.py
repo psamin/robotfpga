@@ -80,9 +80,9 @@ class Expert:
         # noise doesn't bounce the arm back up. A gripper closed on nothing reopens via APPROACH.
         dxy = np.linalg.norm(site[:2] - cube[:2])
         missed = g < EMPTY_GRIP and not touching
-        if dxy < 0.010 and site[2] < GRASP_Z + 0.006 and not missed:
+        if dxy < 0.012 and site[2] < GRASP_Z + 0.006 and not missed:
             return Phase.GRASP
-        if not missed and g > HELD_GRIP and (dxy < 0.006 or (dxy < 0.02 and site[2] < HOVER_Z - 0.003)):
+        if not missed and g > HELD_GRIP and (dxy < 0.012 or (dxy < 0.02 and site[2] < HOVER_Z - 0.003)):
             return Phase.DESCEND
         return Phase.APPROACH
 
