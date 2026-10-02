@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "researched_on": "2026-10-01",
+  "milestone": "M0",
+  "hardware_acceptance": "not_run",
+  "board_availability": "User does not have the KR260 yet; board inspection pending",
+  "workflow": "Official Kria Ubuntu 22.04 arm64 plus Kria-PYNQ; prebuilt HelloWorld resizer",
+  "kria_pynq": {
+    "repository": "https://github.com/Xilinx/Kria-PYNQ",
+    "commit": "8b975f43706490d179002900ff281480f7799ca5",
+    "pynq_submodule_commit": "a056b8455f80a145839177102288e1f1d2b8ebe3"
+  },
+  "runtime_requirements": {
+    "ubuntu": "22.04",
+    "architecture": "aarch64",
+    "python": "3.10.x",
+    "pynq": "3.0.1",
+    "numpy": "1.26.4",
+    "pynqmetadata": "0.1.2",
+    "pynqutils": "0.1.1",
+    "boot_firmware": "AMD documents 2022.1 K26 update or later, except 1.04; inspect board before choosing an update"
+  },
+  "helloworld": {
+    "repository": "https://github.com/Xilinx/PYNQ-HelloWorld",
+    "inspected_source_commit": "9728edf2ea6b7bc157acb126f773e93c3e9561c2",
+    "package_version": "3.0.0",
+    "sdist_url": "https://files.pythonhosted.org/packages/b8/76/10a1d1e7025f798dac3487beb93671e8edb313dfff98d10f703fbb660237/pynq_helloworld-3.0.0.tar.gz",
+    "sdist_sha256": "9df564fe536749c55bb29e71120d1bcdeb54560a082c31203804a7ee43e6d355",
+    "kr260_bitstream_url": "https://www.xilinx.com/bin/public/openDownload?filename=pynqhelloworld.resizer.kv260.bit",
+    "upstream_bitstream_md5": "ef9f4221c0a20b56a0d7ab8910d7942c",
+    "kr260_hwh_url": "https://www.xilinx.com/bin/public/openDownload?filename=pynqhelloworld.resizer.kv260.hwh",
+    "upstream_hwh_md5": "e4036cc2b69e3bc043b14325cc901ac0",
+    "note": "Upstream explicitly maps KR260 to these kv260-named files. README's PYNQ 2.7 statement is stale relative to package version and Kria-PYNQ integration; hardware compatibility is not yet verified. Confirm sdist mappings before installation."
+  },
+  "not_required_for_m0": ["Vivado", "Vitis", "Vitis HLS", "PetaLinux", "Vitis AI model tools"],
+  "unresolved_before_installation": [
+    "Board SSH endpoint and user",
+    "Actual OS image identity and checksum, if available",
+    "Actual board identity and boot firmware version",
+    "Kernel, XRT/zocl, xmutil and dfx-mgr package versions",
+    "Existing PYNQ environment and loaded fabric application",
+    "Installer dependency resolution: installer pins core packages but not the whole apt/pip stack",
+    "SHA256 of the actual downloaded bitstream and HWH"
+  ]
+}
