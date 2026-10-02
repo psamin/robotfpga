@@ -12,7 +12,7 @@ INSTRUCTIONS = (("red", "left"), ("red", "right"), ("blue", "left"), ("blue", "r
 TASKS = tuple(f"put the {c} cube in the {b} bin" for c, b in INSTRUCTIONS)
 SUBSTEPS = 10  # 10 x 1/300 s = one 30 Hz control tick
 REST_Q = np.array([0.0, -1.74, 1.69, 0.6, 0.0, 0.5])
-CUBE_X = (0.17, 0.28)  # cube spawn region (m), well clear of the bins
+CUBE_X = (0.16, 0.26)  # cube spawn region (m): top-down hover at 7 cm is reachable here
 CUBE_Y = (-0.09, 0.09)
 CUBE_MIN_GAP = 0.06
 BIN_HALF = 0.045  # inner half-width
