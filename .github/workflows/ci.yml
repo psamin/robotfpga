@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  ref-and-hls-csim:
+    name: int8 reference + HLS C model
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install numpy pytest ruff
+      - name: Lint ref/
+        run: ruff check ref
+      - name: Reference tests
+        run: python -m pytest ref
+      - name: Generate stand-in weights and golden vectors
+        run: python ref/make_standin.py --out artifacts/standin
+      - name: HLS C model vs golden vectors
+        run: make -C hls csim
+      - name: HLS C model under ASan/UBSan
+        run: make -C hls sanitize
