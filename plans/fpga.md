@@ -37,22 +37,26 @@ For `armlab`'s `fpga_backend.py`. The `PolicyAccel` class in `board/run_policy.p
 
 ## What exists, and how it lands on `main`
 
-Everything below is on the `hls-v0.1` branch and checked on a laptop with no Xilinx tools:
-the C model matches all 100 stand-in golden vectors and every per-layer dump, including under
-ASan/UBSan, and the tests fail if the rounding or the padding is broken.
+The work started on the `hls-v0.1` branch (about 1,350 lines). It lands as a chain of PRs, each with its
+own issue. Everything was checked on a laptop with no Xilinx tools: the C model matches all 100 stand-in
+golden vectors and every per-layer dump, including under ASan/UBSan, and the tests fail if the rounding
+or the padding is broken. `hls-v0.1` gets deleted once the chain is merged.
 
-That branch is about 1,350 lines, so it lands as a chain of small PRs, each with its own issue.
-`hls-v0.1` gets deleted once the chain is merged.
+**Merge order:** #2, then #4 → #6 → #8 → #10 (stacked: each one's base is the previous branch, and GitHub
+retargets to `main` as each merges). #12, #14 and #16 are drafts until the PC and board can test them.
 
-| PR | Files | Lines | Needs |
-|---|---|---|---|
-| 1 | this plan | ~110 | |
-| 2 | `ref/intref.py`, `ref/test_intref.py`, `.gitignore`, `requirements.txt` | ~290 | **sign-off from software** (shared contract) |
-| 3 | `ref/make_standin.py` (stand-in weights + vectors in the handoff format) | ~170 | **sign-off from software** (vector format) |
-| 4 | `hls/policy_kernel.h`, `hls/tb_kernel.cpp`, `hls/Makefile` | ~430 | over the size target: the kernel can't be tested without its testbench. Split into layer functions + kernel if reviewers prefer. |
-| 5 | `hls/policy_top.cpp`, `hls/tb_top.cpp`, `hls/run_hls.tcl` | ~165 | lands after Vitis csim and synthesis pass on the PC |
-| 6 | `board/loopback.py` | ~50 | lands after M1 passes on the board |
-| 7 | `board/run_policy.py` | ~100 | lands after M4 passes on the board |
+| Issue | PR | What | Lines | Needs |
+|---|---|---|---|---|
+| #1 | #2 | this plan | ~110 | |
+| #3 | #4 | `ref/intref.py` + tests, `.gitignore`. Adds `pack_obs` / `unpack_actions` (gap #3) | ~370 | **software sign-off** (shared contract) |
+| #5 | #6 | `ref/vectors.py`, `ref/make_standin.py`, tests, [`ref/README.md`](../ref/README.md) with every handoff format | ~380 | **software sign-off** (vector format) |
+| #7 | #8 | `hls/policy_kernel.h`, `hls/tb_kernel.cpp`, `hls/Makefile` | ~430 | the kernel can't be tested without its testbench; can split if preferred |
+| #9 | #10 | CI: ruff + pytest on `ref/`, HLS C model plain and under sanitizers, on every PR | ~30 | |
+| #11 | #12 | `hls/policy_top.cpp`, `hls/tb_top.cpp`, `hls/run_hls.tcl` (draft) | ~165 | Vitis csim + synthesis on the PC |
+| #13 | #14 | `board/loopback.py` (draft) | ~50 | M1 on the board |
+| #15 | #16 | `board/run_policy.py` (draft); `PolicyAccel` is what `fpga_backend.py` can wrap | ~100 | M4 on the board |
+
+The two `ref/` PRs are over the ~200-line target mostly from tests and the format doc.
 
 ## Milestones
 
@@ -60,7 +64,7 @@ Do them in order. Each has a pass condition.
 
 | | Milestone | Pass | Status |
 |---|---|---|---|
-| C | C model of the whole network | all 100 vectors match | **done** on `hls-v0.1` |
+| C | C model of the whole network | all 100 vectors match | **done** (#8, checked in CI by #10) |
 | M0 | Board bring-up | an overlay loads and runs from Python | next |
 | M1 | DMA loopback | 27,658 bytes come back identical; round-trip time written down | |
 | M2/M3 | Single layers on the board | match `layer8`, then `layer1` vectors | folded into M4 because the C model already runs every layer |
