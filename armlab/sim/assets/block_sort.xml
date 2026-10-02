@@ -1,0 +1,64 @@
+<mujoco model="block_sort">
+  <!-- SO-101 sorts a red and a blue cube into a left (+y) and right (-y) bin.
+       The arm faces +x; its base sits on the table at the origin (table top is z = 0).
+       Timestep 1/300 s so 10 physics steps make one 30 Hz control tick exactly. -->
+  <include file="so101/so101.xml"/>
+  <compiler meshdir="so101/assets"/>
+  <option timestep="0.0033333333333333335"/>
+
+  <visual>
+    <headlight diffuse="0.5 0.5 0.5" ambient="0.35 0.35 0.35" specular="0 0 0"/>
+    <global offwidth="256" offheight="256"/>
+    <quality shadowsize="2048"/>
+  </visual>
+
+  <asset>
+    <material name="table" rgba="0.62 0.55 0.45 1"/>
+    <material name="bin" rgba="0.35 0.37 0.40 1"/>
+    <material name="red" rgba="0.85 0.12 0.10 1"/>
+    <material name="blue" rgba="0.10 0.25 0.85 1"/>
+  </asset>
+
+  <default>
+    <default class="bin_wall">
+      <geom type="box" material="bin" condim="3" friction="0.6 0.005 0.0001"/>
+    </default>
+    <default class="cube">
+      <geom type="box" size="0.0125 0.0125 0.0125" mass="0.02" condim="4" friction="1 0.005 0.0001"
+        solref="0.01 1"/>
+    </default>
+  </default>
+
+  <worldbody>
+    <light name="key" pos="0.2 0.1 1.2" dir="0 0 -1" directional="true" diffuse="0.6 0.6 0.6" castshadow="true"/>
+    <geom name="table" type="box" pos="0.15 0 -0.02" size="0.35 0.45 0.02" material="table" condim="3"/>
+
+    <!-- Overhead camera: image up = +x (away from the arm), image right = -y (the arm's right). -->
+    <camera name="overhead" pos="0.17 0 0.62" xyaxes="0 -1 0 1 0 0" fovy="52"/>
+
+    <!-- Bins: 9 cm inner square, 3.5 cm walls. Centers at y = +/-0.20. -->
+    <body name="bin_left" pos="0.14 0.20 0">
+      <geom name="bin_left_floor" class="bin_wall" pos="0 0 0.002" size="0.05 0.05 0.002"/>
+      <geom class="bin_wall" pos="0.0475 0 0.0175" size="0.0025 0.05 0.0175"/>
+      <geom class="bin_wall" pos="-0.0475 0 0.0175" size="0.0025 0.05 0.0175"/>
+      <geom class="bin_wall" pos="0 0.0475 0.0175" size="0.05 0.0025 0.0175"/>
+      <geom class="bin_wall" pos="0 -0.0475 0.0175" size="0.05 0.0025 0.0175"/>
+    </body>
+    <body name="bin_right" pos="0.14 -0.20 0">
+      <geom name="bin_right_floor" class="bin_wall" pos="0 0 0.002" size="0.05 0.05 0.002"/>
+      <geom class="bin_wall" pos="0.0475 0 0.0175" size="0.0025 0.05 0.0175"/>
+      <geom class="bin_wall" pos="-0.0475 0 0.0175" size="0.0025 0.05 0.0175"/>
+      <geom class="bin_wall" pos="0 0.0475 0.0175" size="0.05 0.0025 0.0175"/>
+      <geom class="bin_wall" pos="0 -0.0475 0.0175" size="0.05 0.0025 0.0175"/>
+    </body>
+
+    <body name="cube_red" pos="0.22 0.05 0.0125">
+      <freejoint name="cube_red"/>
+      <geom name="cube_red" class="cube" material="red"/>
+    </body>
+    <body name="cube_blue" pos="0.22 -0.05 0.0125">
+      <freejoint name="cube_blue"/>
+      <geom name="cube_blue" class="cube" material="blue"/>
+    </body>
+  </worldbody>
+</mujoco>
