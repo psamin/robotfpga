@@ -7,3 +7,6 @@ runs/
 datasets/
 *.mp4
 logs/
+hls/build/
+*.jou
+*.log
