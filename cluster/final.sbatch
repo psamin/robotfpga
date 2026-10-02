@@ -12,6 +12,7 @@
 source cluster/env.sh
 OUT=$(fix "$HOME/robotfpga-work/runs/${NAME:-final}")
 FLOAT=$(fix "$FLOAT")
+DATA=$(for d in $DATA; do fix "$d"; done | tr "\n" " ")
 mkdir -p "$OUT"
 W=${SLURM_CPUS_PER_TASK:-8}
 EP=${EP:-50}
