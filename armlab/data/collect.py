@@ -24,7 +24,12 @@ from armlab.sim.env import BlockSortEnv
 from armlab.sim.expert import Expert, Phase
 from armlab.sim.perturb import Perturber
 
-NOISE_LEVELS = (0.0, 0.01, 0.02, 0.03)  # per-episode sigma, normalized units (1 unit ~ 1.7 rad); 0.05 broke grasps
+NOISE_LEVELS = (
+    0.0,
+    0.01,
+    0.02,
+    0.03,
+)  # per-episode sigma, normalized units (1 unit ~ 1.7 rad); 0.05 broke grasps
 NOISE_RHO = 0.8  # AR(1) correlation of the injected noise
 KIND_P = {"none": 0.6, "cube_move": 0.2, "instr_swap": 0.2}
 
