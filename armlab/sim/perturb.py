@@ -22,9 +22,11 @@ class Perturber:
             return False
         if self.kind == "cube_move":
             # only while reaching, so the cube is never yanked out of the gripper
+            color = INSTRUCTIONS[env.instr][0]
             if expert is not None and expert.phase not in (Phase.APPROACH, Phase.DESCEND):
                 return False
-            color = INSTRUCTIONS[env.instr][0]
+            if expert is None and (env.touching_robot(color) or env.cube_pos(color)[2] > 0.02):
+                return False
             other = env.cube_pos("blue" if color == "red" else "red")
             while True:
                 xy = self.rng.uniform([CUBE_X[0], CUBE_Y[0]], [CUBE_X[1], CUBE_Y[1]])
