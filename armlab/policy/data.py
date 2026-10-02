@@ -14,18 +14,22 @@ from armlab.policy.tiny import CHUNK, encode_aux
 
 
 class DemoSet:
-    def __init__(self, root: str | Path, device: str = "cpu", episodes: slice | None = None):
-        shards = sorted(Path(root).glob("shard_*.npz"))
+    def __init__(self, root: str | Path | list, device: str = "cpu", episodes: slice | None = None):
+        roots = root if isinstance(root, list) else [root]
+        shards = sorted(p for r in roots for p in Path(r).glob("shard_*.npz"))
         if not shards:
             raise FileNotFoundError(f"no shard_*.npz in {root}")
-        imgs, auxs, acts, lens, metas = [], [], [], [], []
+        imgs, auxs, acts, chunks, lens, metas = [], [], [], [], [], []
         for p in shards:
             z = np.load(p)
             imgs.append(z["image"])
             auxs.append(encode_aux(z["state"], z["instr"]))
             acts.append(z["action"])
+            # v2+ shards carry the expert's 8-step plan from each state; v1 shards don't
+            chunks.append(z["chunk"] if "chunk" in z.files else None)
             lens.append(z["lengths"])
             metas += json.loads(str(z["meta"]))
+        explicit = all(c is not None for c in chunks)
         lengths = np.concatenate(lens)
         starts = np.concatenate([[0], np.cumsum(lengths)[:-1]])
         keep = np.arange(len(lengths))[episodes] if episodes is not None else np.arange(len(lengths))
@@ -46,8 +50,12 @@ class DemoSet:
         self.device = device
         self.image = torch.from_numpy(image[rows]).to(device)
         self.aux = torch.from_numpy(aux[rows]).to(device)
-        self.chunk = torch.from_numpy(action[np.concatenate(idx)]).to(device)  # [N, 8, 6]
-        self.pad = torch.from_numpy(np.concatenate(pad)).to(device)  # [N, 8] True = past episode end
+        if explicit:  # labels are the expert's own 8-step plan: nothing is past the end
+            self.chunk = torch.from_numpy(np.concatenate(chunks)[rows]).to(device)
+            self.pad = torch.zeros(len(rows), CHUNK, dtype=torch.bool, device=device)
+        else:
+            self.chunk = torch.from_numpy(action[np.concatenate(idx)]).to(device)  # [N, 8, 6]
+            self.pad = torch.from_numpy(np.concatenate(pad)).to(device)  # [N, 8] True = past episode end
 
     def batch(self, idx: torch.Tensor):
         return self.image[idx], self.aux[idx], self.chunk[idx], self.pad[idx]

@@ -32,7 +32,15 @@ class Phase(Enum):
     DONE = 7
 
 
+HELD_GRIP = 0.2  # gripper angle below this with the cube in contact = holding it (0.09 on a cube)
+EMPTY_GRIP = 0.0  # below this with no contact = closed on nothing (-0.17 fully closed)
+
+
 class Expert:
+    """Stateless: the phase is derived from the world state every tick, and the commanded gripper
+    pose steps from the *measured* pose toward the phase goal. So it can label any state, including
+    ones a learner drove into (DAgger [Ross2011-DAgger]), not only states it produced itself."""
+
     def __init__(self, env: BlockSortEnv, speed: float = SPEED):
         self.env = env
         self.ik = TopDownIK(env.m)
@@ -41,11 +49,9 @@ class Expert:
 
     def reset(self) -> None:
         self.phase = Phase.APPROACH
-        self.timer = 0
-        self.cmd = None  # commanded site position
-        self.q = None  # last arm joint solution (warm start)
+        self.q = None  # warm start for IK
+        self.cmd = None  # commanded site position; integrates through servo tracking lag
         self.grip = OPEN
-        self.yaw = 0.0
 
     # ---- helpers ----
     def _targets(self):
@@ -59,79 +65,76 @@ class Expert:
     def _site(self) -> np.ndarray:
         return self.env.d.site("gripperframe").xpos.copy()
 
-    def _held(self, color: str) -> bool:
-        cube = self.env.cube_pos(color)
-        return (
-            self.env.touching_robot(color) and cube[2] > 0.02 and np.linalg.norm(cube - self._site()) < 0.04
-        )
-
-    def _servo(self, goal: np.ndarray, speed: float | None = None) -> bool:
-        step = (speed or self.speed) * DT
-        delta = goal - self.cmd
-        dist = np.linalg.norm(delta)
-        self.cmd = goal.copy() if dist <= step else self.cmd + delta * (step / dist)
-        return dist <= step
+    def _phase(self, site, cube, bin_, color) -> Phase:
+        env = self.env
+        g = float(env.d.qpos[5])
+        touching = env.touching_robot(color)
+        if np.all(np.abs(cube[:2] - bin_[:2]) < 0.045) and not (touching and g < HELD_GRIP):
+            return Phase.DONE if site[2] > HOVER_Z - 0.005 and g > OPEN - 0.1 else Phase.RETREAT
+        if touching and g < HELD_GRIP:
+            if np.linalg.norm(site[:2] - bin_[:2]) < 0.01 and site[2] > HOVER_Z - 0.015:
+                return Phase.RELEASE
+            return Phase.LIFT if site[2] < HOVER_Z - 0.01 else Phase.CARRY
+        # Hysteresis from the world state alone: start descending when aligned within 6 mm, but
+        # once below hover height keep descending (and correcting) while within 20 mm, so tracking
+        # noise doesn't bounce the arm back up. A gripper closed on nothing reopens via APPROACH.
+        dxy = np.linalg.norm(site[:2] - cube[:2])
+        missed = g < EMPTY_GRIP and not touching
+        if dxy < 0.010 and site[2] < GRASP_Z + 0.006 and not missed:
+            return Phase.GRASP
+        if not missed and g > HELD_GRIP and (dxy < 0.006 or (dxy < 0.02 and site[2] < HOVER_Z - 0.003)):
+            return Phase.DESCEND
+        return Phase.APPROACH
 
     # ---- main ----
     def act(self) -> np.ndarray:
-        """Returns raw joint targets (radians, 6)."""
+        """Returns raw joint targets (radians, 6) for the current world state."""
         env = self.env
-        if self.cmd is None:
-            self.cmd = self._site()
-            self.q = env.d.qpos[:5].copy()
+        site = self._site()
         cube, bin_, color = self._targets()
-        p = self.phase
-
-        # Reactive checks: a lost cube sends us back to approach; a finished cube ends the episode.
-        if p in (Phase.LIFT, Phase.CARRY) and not self._held(color) and self.timer > 6:
-            p = Phase.APPROACH
-        if p in (Phase.APPROACH, Phase.DESCEND) and env.in_bin(color, INSTRUCTIONS[env.instr][1]):
-            p = Phase.RETREAT
-
+        if self.q is None:
+            self.q = env.d.qpos[:5].copy()
+        p = self._phase(site, cube, bin_, color)
+        yaw, speed = self._cube_yaw(color), self.speed
         if p == Phase.APPROACH:
             self.grip = OPEN
-            self.yaw = self._cube_yaw(color)
-            above = np.array([cube[0], cube[1], HOVER_Z])
-            if self.cmd[2] < HOVER_Z - 0.01 and np.linalg.norm(self.cmd[:2] - cube[:2]) > 0.01:
-                arrived = False  # rise first so we don't sweep through the cubes
-                self._servo(np.array([*self.cmd[:2], HOVER_Z]))
-            else:
-                arrived = self._servo(above)
-            if arrived and np.linalg.norm(self._site()[:2] - cube[:2]) < 0.006:
-                p = Phase.DESCEND
+            far = np.linalg.norm(site[:2] - cube[:2]) > 0.02
+            goal = (
+                np.array([*site[:2], HOVER_Z]) if site[2] < HOVER_Z - 0.01 and far else [*cube[:2], HOVER_Z]
+            )
         elif p == Phase.DESCEND:
-            self.yaw = self._cube_yaw(color)
-            if self._servo(np.array([cube[0], cube[1], GRASP_Z]), speed=0.6 * self.speed):
-                if abs(self._site()[2] - GRASP_Z) < 0.004:
-                    p = Phase.GRASP
+            self.grip, goal, speed = OPEN, [cube[0], cube[1], GRASP_Z], 0.6 * self.speed
         elif p == Phase.GRASP:
-            self.grip = CLOSED
-            if self.timer >= 8:
-                p = Phase.LIFT
+            self.grip, goal = CLOSED, [cube[0], cube[1], GRASP_Z]
         elif p == Phase.LIFT:
-            if self._servo(np.array([*self.cmd[:2], HOVER_Z])):
-                p = Phase.CARRY
+            self.grip, goal = CLOSED, [*site[:2], HOVER_Z]
         elif p == Phase.CARRY:
-            if (
-                self._servo(np.array([bin_[0], bin_[1], HOVER_Z]))
-                and np.linalg.norm(self._site()[:2] - bin_[:2]) < 0.01
-            ):
-                p = Phase.RELEASE
+            self.grip, goal = CLOSED, [bin_[0], bin_[1], HOVER_Z]
         elif p == Phase.RELEASE:
-            self.grip = OPEN
-            if self.timer >= 8:
-                p = Phase.RETREAT
-        elif p == Phase.RETREAT:
-            self.grip = OPEN
-            if self._servo(np.array([*self.cmd[:2], HOVER_Z + 0.01])):
-                p = Phase.DONE
-
-        if p != self.phase:
-            self.phase, self.timer = p, 0
+            self.grip, goal = OPEN, site
+        else:  # RETREAT / DONE
+            self.grip, goal = OPEN, [*site[:2], HOVER_Z + 0.005]
+        if p in (Phase.LIFT, Phase.CARRY, Phase.RELEASE, Phase.RETREAT, Phase.DONE):
+            yaw = None  # keep the current wrist roll while carrying
+        self.phase = p
+        # Step from the last command (it absorbs servo lag) unless the arm is far from it, which
+        # means something else moved it (a learner, a perturbation): then re-anchor on the arm.
+        base = self.cmd if self.cmd is not None and np.linalg.norm(self.cmd - site) < 0.02 else site
+        delta = np.asarray(goal, float) - base
+        dist = np.linalg.norm(delta)
+        step = speed * DT
+        self.cmd = base + (delta if dist <= step else delta * (step / dist))
+        if yaw is None:
+            self.q, _ = self.ik.solve(self.cmd, yaw=None, q0=self.q, iters=30)
+            self.q[4] = env.d.qpos[4]
         else:
-            self.timer += 1
-
-        self.q, _ = self.ik.solve_symmetric(self.cmd, self.yaw, q0=self.q, iters=30)
+            # a cube grasp repeats every 90 deg: use the copy closest to the gripper's current yaw
+            r = env.d.site_xmat[env.m.site("gripperframe").id].reshape(3, 3)
+            now = np.arctan2(r[1, 1], r[0, 1])
+            yaw = now + (yaw - now + np.pi / 4) % (np.pi / 2) - np.pi / 4
+            self.q, err = self.ik.solve(self.cmd, yaw=yaw, q0=self.q, iters=30)
+            if err > 0.003:
+                self.q, _ = self.ik.solve_symmetric(self.cmd, yaw, q0=self.q, iters=30)
         return np.concatenate([self.q, [self.grip]])
 
 
@@ -164,3 +167,34 @@ def _step_norender(env: BlockSortEnv, q: np.ndarray):
     env.t += 1
     ok = env.success()
     return None, ok or env.t >= env.max_steps, {"success": ok}
+
+
+def expert_chunk(env: BlockSortEnv, expert: Expert, n: int = 8) -> np.ndarray:
+    """The expert's next n normalized actions from the current state: simulate the expert ahead
+    on a full copy of MjData (mj_copyData keeps derived quantities and solver warm-start exactly
+    as they are), so the real episode is untouched. Used as the action-chunk label."""
+    import copy
+
+    import mujoco
+
+    from armlab.sim.env import SUBSTEPS
+
+    real = env.d
+    scratch = getattr(env, "_scratch", None)
+    if scratch is None:
+        scratch = env._scratch = mujoco.MjData(env.m)
+    mujoco.mj_copyData(scratch, env.m, real)
+    saved_instr, saved_t = env.instr, env.t
+    look = copy.copy(expert)
+    out = np.empty((n, 6), np.float32)
+    env.d = scratch
+    try:
+        for i in range(n):
+            q = look.act()
+            out[i] = env.normalize(q)
+            scratch.ctrl[:] = q
+            for _ in range(SUBSTEPS):
+                mujoco.mj_step(env.m, scratch)
+    finally:
+        env.d, env.instr, env.t = real, saved_instr, saved_t
+    return out
