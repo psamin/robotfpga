@@ -41,10 +41,11 @@ class Expert:
     pose steps from the *measured* pose toward the phase goal. So it can label any state, including
     ones a learner drove into (DAgger [Ross2011-DAgger]), not only states it produced itself."""
 
-    def __init__(self, env: BlockSortEnv, speed: float = SPEED):
+    def __init__(self, env: BlockSortEnv, speed: float = SPEED, markov: bool = False):
         self.env = env
         self.ik = TopDownIK(env.m)
         self.speed = speed
+        self.markov = markov  # True: every step starts from the measured pose (no hidden state)
         self.reset()
 
     def reset(self) -> None:
@@ -119,7 +120,8 @@ class Expert:
         self.phase = p
         # Step from the last command (it absorbs servo lag) unless the arm is far from it, which
         # means something else moved it (a learner, a perturbation): then re-anchor on the arm.
-        base = self.cmd if self.cmd is not None and np.linalg.norm(self.cmd - site) < 0.02 else site
+        use_cmd = not self.markov and self.cmd is not None and np.linalg.norm(self.cmd - site) < 0.02
+        base = self.cmd if use_cmd else site
         delta = np.asarray(goal, float) - base
         dist = np.linalg.norm(delta)
         step = speed * DT
