@@ -59,7 +59,8 @@ def chunk_l1(pred: torch.Tensor, target: torch.Tensor, pad: torch.Tensor) -> tor
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", required=True)
+    ap.add_argument("--data", required=True, nargs="+", help="one or more shard directories")
+    ap.add_argument("--data-device", default=None, help="where the dataset lives (default: the GPU)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--steps", type=int, default=40_000)
     ap.add_argument("--bs", type=int, default=256)
@@ -81,8 +82,9 @@ def main() -> None:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
-    train = DemoSet(args.data, dev, episodes=slice(args.val_episodes, None))
-    val = DemoSet(args.data, dev, episodes=slice(0, args.val_episodes))
+    ddev = args.data_device or dev
+    train = DemoSet(args.data, ddev, episodes=slice(args.val_episodes, None))
+    val = DemoSet(args.data, ddev, episodes=slice(0, args.val_episodes))
     print(f"device {dev}: {train.n} train frames, {val.n} val frames", flush=True)
 
     model = TinyPolicy().to(dev)
@@ -98,7 +100,7 @@ def main() -> None:
     log, t0 = [], time.perf_counter()
     for step in range(1, args.steps + 1):
         idx = torch.randint(0, train.n, (args.bs,), device=dev, generator=g)
-        img, aux, chunk, pad = train.batch(idx)
+        img, aux, chunk, pad = (t.to(dev) for t in train.batch(idx.to(ddev)))
         if not args.no_aug:
             img = augment(img)
         loss = chunk_l1(model(*model.prep(img, aux)), chunk, pad)
@@ -115,7 +117,8 @@ def main() -> None:
             with torch.no_grad():
                 vl = []
                 for i in range(0, val.n, 1024):
-                    vi, va, vc, vp = val.batch(torch.arange(i, min(i + 1024, val.n), device=dev))
+                    vb = val.batch(torch.arange(i, min(i + 1024, val.n), device=ddev))
+                    vi, va, vc, vp = (t.to(dev) for t in vb)
                     vl.append(chunk_l1(ema(*ema.prep(vi, va)), vc, vp).item() * len(vi))
                 vloss = sum(vl) / val.n
             rec = {
