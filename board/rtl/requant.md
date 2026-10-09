@@ -51,3 +51,30 @@ K26 synthesis executed successfully on Vivado 2022.2: 154 LUTs, 10 CARRY8,
 zero registers, latches and DSPs; no black boxes. Utilization and checkpoint
 are in `build/requant-synthesis/`. One warning states parallel synthesis
 criteria were not met. No placement/routing or board execution has run.
+
+## Actual reference comparison (issue #71)
+
+`check_requant_reference.py` reads the pinned shared source from Git into a
+fresh build directory and calls its NumPy `requant()` without modifying it.
+It covers all shifts, both clipping modes, extrema, boundary cases and
+2,000 seeded random INT32 values per shift. Metadata records source/vector
+SHA256, revision, Python/NumPy versions, seed and count.
+
+```powershell
+& 'C:/Xilinx/Vivado/2022.2/tps/win64/python-3.8.3/python.exe' ./board/rtl/check_requant_reference.py
+# Use the generated vectors.txt path printed above:
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./board/rtl/run_requant_tests.ps1 -Vectors 'build/requant-reference-ID/vectors.txt'
+```
+
+Other Python environments with NumPy can run the generator. The default
+revision must exist locally; `--revision` explicitly selects another commit.
+XSim checks the declared record count, fields, end of file and every golden
+output in addition to the existing independent-oracle tests.
+Executed October 8, 2026: Python 3.8.3/NumPy 1.18.4 generated 281,652
+actual-reference cases; XSim 2022.2 matched every output (543,315 checks
+including the original oracle suite). Compile/elaboration had no warnings.
+Evidence: `build/requant-reference-c6eee32fcf124f41b93a86180a032172/metadata.json`
+and `build/requant-2e42787c59e64292a250d091cc900984/runner-output.txt`.
+Truncated, invalid-field and extra-record inputs each failed with explicit
+testbench diagnostics and nonzero runner exits. Production RTL is unchanged.
+These are standalone requant cases, not network input/output golden vectors.

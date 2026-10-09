@@ -39,8 +39,10 @@ module tb_requant;
     endtask
 
     initial begin
-        longint signed divisor, boundary;
+        longint signed divisor, boundary, av_file;
         logic [31:0] word, config_word;
+        string vector_path;
+        int fd, count, scanned, s_file, r_file, golden, extra;
         for (int s = 1; s <= 30; s++) begin
             divisor = 64'sd1 << s;
             for (int r = 0; r <= 1; r++) begin
@@ -67,6 +69,24 @@ module tb_requant;
         end
         // Return to valid operation after error; no latched state.
         check(-3, 1, 0); check(-3, 1, 1); check(-1, 1, 0);
+        if ($value$plusargs("VECTORS=%s", vector_path)) begin
+            fd = $fopen(vector_path, "r");
+            if (!fd) $fatal(1, "Cannot open reference vectors");
+            scanned = $fscanf(fd, "%d", count);
+            if (scanned != 1 || count < 1) $fatal(1, "Invalid reference count");
+            repeat (count) begin
+                scanned = $fscanf(fd, "%d %d %d %d", av_file, s_file, r_file, golden);
+                if (scanned != 4 || s_file < 1 || s_file > 30 ||
+                    r_file < 0 || r_file > 1 || golden < -127 || golden > 127)
+                    $fatal(1, "Malformed or truncated reference vectors");
+                check(av_file, s_file, r_file);
+                if ($signed(y) !== golden) $fatal(1, "Actual NumPy reference mismatch");
+            end
+            scanned = $fscanf(fd, "%d", extra);
+            if (scanned != -1) $fatal(1, "Extra reference data");
+            $fclose(fd);
+            $display("REFERENCE PASS: %0d actual NumPy cases", count);
+        end
         $display("PASS: requant %0d checks; seed=69c0ffee", checks);
         $finish;
     end
