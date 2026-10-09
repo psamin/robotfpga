@@ -32,7 +32,8 @@ is the starting point once Linux access is established.
   teleoperation and model/controller-driven motion work outside this audit.
 - Software owner psamin is tracking a tiny-policy weights/vector release
   under [issue #73](https://github.com/psamin/robotfpga/issues/73). Its publication
-  was checked: `handoff-v3r2` was unavailable. Trained-model verification is pending.
+  is published on branch `handoff/v3r2`, commit `5ee0e03`; no GitHub release
+  was found. Trained weights, 100 vectors, 40 layer dumps and eval JSONs are present.
 
 Identify the existing real-arm controller entry point before connecting
 FPGA actions to it. GPU training does not produce the
@@ -48,13 +49,16 @@ real-arm adapter, teleoperation entry point, `fpga_backend.py` or
 The planned `armlab/robot/so101.py` remains absent there. The working
 controller may be external or unpublished; its location is not established.
 
-The read-only handoff checker in [PR #77](https://github.com/psamin/robotfpga/pull/77)
-is ready for the delivered artifact directory. Structural mode checks the
-manifest, weights/hash/layout and exact vector sizes/counts; reference mode
-checks all 100 final outputs and 40 layer dumps. Both modes passed randomized
-stand-in artifacts; five unit tests passed, including corrupt/incomplete-file
-rejection and complete synthetic reference inference. This is not trained-model
-or FPGA acceptance. It does not access motors or replace the board runner.
+The [handoff checker, PR #77](https://github.com/psamin/robotfpga/pull/77), passed
+the trained v3r2 manifest, weight hash/layout and vector sizes, then all 100
+reference outputs and 40 layer dumps. The optimized HLS C model also matched
+all 100 outputs/40 dumps; its real vendor-header stream test passed 100 vectors.
+Weights SHA256: `c87abfae0cbedf771a9ef927f39302a43cdcbb954f7090aca4baa6bef350a732`.
+Windows archive extraction changed `089_out.bin` to 51 bytes under `text=auto`;
+the raw Git blob is correct (48 bytes). Exact blob extraction passed validation.
+Do not use newline-converted binary copies. Published simulation results report
+INT8 Stage C 180/200 success (90%) versus float 196/200 (98%); these are not
+physical-arm or FPGA results. No new bitstream/controller was included.
 
 ## Executed host verification
 

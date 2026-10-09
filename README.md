@@ -14,6 +14,10 @@ was not found in the refreshed repository branches; existing control code
 targets simulation. Ubuntu is expected from the setup owner; PYNQ, SSH and
 the accelerator overlay remain unconfirmed.
 
+Trained [v3r2 policy handoff](https://github.com/psamin/robotfpga/tree/handoff/v3r2/handoff/v3r2)
+is now published on its branch. All 100 outputs and 40 layer dumps matched
+the integer reference and optimized HLS C model; vendor-header stream tests passed.
+
 See [current FPGA status](board/status.md) for owners, verification evidence,
 open review links and next steps. Existing M0 preparation is tracked in
 [PR #18](https://github.com/psamin/robotfpga/pull/18) (runbook/version pins)
