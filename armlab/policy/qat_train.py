@@ -28,7 +28,8 @@ from armlab.util.seed import seed_everything
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", required=True)
+    ap.add_argument("--data", required=True, nargs="+")
+    ap.add_argument("--data-device", default=None)
     ap.add_argument("--float-ckpt", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--steps", type=int, default=10_000)
@@ -47,23 +48,26 @@ def main() -> None:
     torch.backends.cuda.matmul.allow_tf32 = False
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    train = DemoSet(args.data, dev, episodes=slice(args.val_episodes, None))
-    val = DemoSet(args.data, dev, episodes=slice(0, args.val_episodes))
+    ddev = args.data_device or dev
+    train = DemoSet(args.data, ddev, episodes=slice(args.val_episodes, None))
+    val = DemoSet(args.data, ddev, episodes=slice(0, args.val_episodes))
 
     teacher = TinyPolicy().to(dev).eval()
     teacher.load_state_dict(torch.load(args.float_ckpt, map_location=dev)["model"])
     for p in teacher.parameters():
         p.requires_grad_(False)
     g = torch.Generator(device=dev).manual_seed(args.seed)
-    cal = torch.randint(0, train.n, (args.calib,), device=dev, generator=g)
-    q = convert(teacher, train.image[cal], train.aux[cal])
+    cal = torch.randint(0, train.n, (args.calib,), device=dev, generator=g).to(ddev)
+    q = convert(teacher, train.image[cal].to(dev), train.aux[cal].to(dev))
     print(f"exponents a={q.a} w={q.w} shifts={q.shifts()}", flush=True)
 
     def val_l1(fn) -> float:
         tot = 0.0
         with torch.no_grad():
             for i in range(0, val.n, 1024):
-                vi, va, vc, vp = val.batch(torch.arange(i, min(i + 1024, val.n), device=dev))
+                vi, va, vc, vp = (
+                    t.to(dev) for t in val.batch(torch.arange(i, min(i + 1024, val.n), device=ddev))
+                )
                 tot += chunk_l1(fn(vi, va), vc, vp).item() * len(vi)
         return tot / val.n
 
@@ -79,7 +83,7 @@ def main() -> None:
     t0 = time.perf_counter()
     for step in range(1, args.steps + 1):
         idx = torch.randint(0, train.n, (args.bs,), device=dev, generator=g)
-        img, aux, chunk, pad = train.batch(idx)
+        img, aux, chunk, pad = (t.to(dev) for t in train.batch(idx.to(ddev)))
         img = augment(img)
         pred = q(img, aux)
         with torch.no_grad():
