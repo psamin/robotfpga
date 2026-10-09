@@ -77,8 +77,13 @@ Vitis HLS 2022.2 completed the existing accelerator build after a Windows
 project-path fix, pushed to #12. Estimates: 153 BRAM18, 14 URAM, 11 DSP,
 5,472 registers and 17,102 LUTs; estimated period 6.598 ns against a 10 ns target.
 Worst-case latency is 10,251,374 cycles (about 103 ms at 100 MHz), exceeding
-the hard 33 ms ceiling. IP export is not a bitstream or placed/routed timing;
-trained-vector checks, RTL co-simulation, optimization and board integration remain.
+the hard 33 ms ceiling in the baseline. Coordinated eight-channel optimization
+[#78 / PR #79](https://github.com/psamin/robotfpga/pull/79) reduces the maximum
+top estimate to 1,367,716 cycles (13.677 ms): all 100 final vectors and 40 layer
+dumps match, all reduction loops achieve II=1, and IP export completed.
+Estimated resources: 171 BRAM18, 24 URAM, 66 DSP, 8,918 FF and 38,649 LUT;
+period 5.953 ns. Still above 5 ms; trained vectors, RTL co-simulation,
+system resources, placement/routing and board latency remain unverified.
 
 The array change also reran the original MAC test: 338,736 checks passed.
 Simulation includes signed boundaries, reset/clear priority, enabled
@@ -114,7 +119,7 @@ measurement is established by these results. DSP mapping was not forced.
 ## Ownership and next steps
 
 The friend handles current card/board setup; no completion is assumed.
-This FPGA workstream owns issues #59/#61/#63/#65/#67/#69/#71/#74/#76, assigned to Dhyey234.
+This FPGA workstream owns issues #59/#61/#63/#65/#67/#69/#71/#74/#76/#78, assigned to Dhyey234.
 Existing reference, vectors, HLS and board-runner work retains its issue
 owners. Do not duplicate it or change shared formats without joint review.
 With owner coordination confirmed, #11 also assigns Dhyey234; its original

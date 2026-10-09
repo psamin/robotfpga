@@ -39,7 +39,8 @@ Standalone RTL preparation is verified and pushed for review:
   ready to check weights/manifest/vectors; all stand-in reference outputs matched.
 - [Existing HLS accelerator, PR #12](https://github.com/psamin/robotfpga/pull/12):
   Vitis C simulation passed 100 stand-in vectors; synthesis/IP export completed.
-  Worst-case estimated latency is 103 ms at 100 MHz, above the 33 ms ceiling.
+  [Eight-channel optimization, PR #79](https://github.com/psamin/robotfpga/pull/79)
+  reduces the 103 ms baseline estimate to 13.68 ms; vectors/layers match, IP exports.
 
 These PRs are awaiting review/merge. These results establish standalone
 behavior and synthesis, not placed/routed timing or execution on the board.
