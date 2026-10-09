@@ -32,6 +32,7 @@ host and are documented in the corresponding PRs.
 | Reproducible synthesis | [#65](https://github.com/psamin/robotfpga/issues/65) / [PR #66](https://github.com/psamin/robotfpga/pull/66) | Both tops passed at 10 ns with reports/checkpoints; invalid top/lane/period rejected | Open, stacked on #62 |
 | Testbench fault detection | [#67](https://github.com/psamin/robotfpga/issues/67) / [PR #68](https://github.com/psamin/robotfpga/pull/68) | Clean baselines passed; four valid RTL mutants failed explicit scoreboard checks | Open, stacked on #66 |
 | Standalone requantization | [#69](https://github.com/psamin/robotfpga/issues/69) / [PR #70](https://github.com/psamin/robotfpga/pull/70) | 261,663 XSim checks; synthesis: 154 LUTs, zero registers/latches/DSPs | Open, independent from main |
+| Direct requant reference check | [#71](https://github.com/psamin/robotfpga/issues/71) / [PR #72](https://github.com/psamin/robotfpga/pull/72) | 281,652 actual NumPy cases matched RTL; malformed/partial/extra files failed | Open, stacked on #70 |
 
 The array change also reran the original MAC test: 338,736 checks passed.
 Simulation includes signed boundaries, reset/clear priority, enabled
@@ -42,8 +43,11 @@ ignored enable and shared lane enables. Each mutant compiled/elaborated;
 tool errors were not treated as detection. Production RTL was untouched.
 Requantization tests cover shifts 1..30, both clipping modes, negative ties,
 clamp transitions, INT32 extrema, invalid shifts and 100,000 random inputs.
-The independent division/floor oracle follows the inspected integer reference;
-direct NumPy execution and whole-network golden comparisons remain pending.
+The independent division/floor oracle follows the inspected integer reference.
+The actual pinned `requant()` now also executed in Python 3.8.3/NumPy 1.18.4:
+all 281,652 generated cases matched XSim (543,315 total combined checks).
+Metadata records reference revision, hashes, versions, seed and count.
+Whole-network/trained-model golden comparisons remain pending.
 Rounding uses a 33-bit intermediate, without changing the network's separate
 accumulator-domain checks. Parent timing constraints are required for this
 combinational block; no layer or board interface has been added.
@@ -58,7 +62,7 @@ measurement is established by these results. DSP mapping was not forced.
 ## Ownership and next steps
 
 The friend handles current card/board setup; no completion is assumed.
-This FPGA workstream owns issues #59/#61/#63/#65/#67/#69, assigned to Dhyey234.
+This FPGA workstream owns issues #59/#61/#63/#65/#67/#69/#71, assigned to Dhyey234.
 Existing reference, vectors, HLS and board-runner work retains its issue
 owners. Do not duplicate it or change shared formats without joint review.
 
@@ -69,7 +73,7 @@ owners. Do not duplicate it or change shared formats without joint review.
    concise evidence and repeat after reboot. Only then advance M1.
 4. Review/merge #60 before #62, then #66 and #68; retarget each dependent PR to
    main after its base lands. A merge requires approval; issues close on merge.
-   Requantization #70 is independently reviewable against main.
+   Requantization #70 is independently reviewable against main; #72 follows it.
 
 Maintain this page and the root README in the same PR when new confirmed
 status or verification changes their meaning. Record dates, issue/PR links,
