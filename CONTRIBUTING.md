@@ -3,6 +3,12 @@
 Two groups work in this repo at the same time: software (sim, training, quantization, eval) and
 FPGA (HLS/RTL, board bring-up). These rules keep us from doing the same work twice.
 
+## Check QUESTIONS.md after every pull
+
+[QUESTIONS.md](QUESTIONS.md) holds open questions between the software and FPGA sides and a short
+"current state" table. Read it after every pull. Before you push, add your questions, answer the
+ones addressed to you, and fix any state line your change makes stale.
+
 ## Open an issue before you start
 
 1. Check the [open issues](../../issues) to see if someone already has it.

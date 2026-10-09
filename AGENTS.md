@@ -3,6 +3,12 @@
 Humans on both the software and FPGA sides run agents in this repo at the same time. Follow
 [CONTRIBUTING.md](CONTRIBUTING.md), plus these rules.
 
+## Check QUESTIONS.md on every pull and push
+
+After every `git pull`, read [QUESTIONS.md](QUESTIONS.md) and tell your human about anything open
+for them. Before every push, add questions you raised, answers you found, and state changes the
+other side needs. Mark unknowns as unknown; never guess an answer.
+
 ## Claim work through an issue, close it with the PR
 
 1. Before writing code, list open issues and open PRs (`gh issue list`, `gh pr list`). If one already
