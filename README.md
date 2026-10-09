@@ -20,6 +20,8 @@ Standalone RTL preparation is verified and pushed for review:
   3,278,586 lane checks passed across 1, 3 and 8 lanes; synthesis passed.
 - [Reproducible synthesis runner, PR #66](https://github.com/psamin/robotfpga/pull/66):
   both K26 tops passed with the clock constraint applied before synthesis.
+- [Testbench fault detection, PR #68](https://github.com/psamin/robotfpga/pull/68):
+  clean baselines passed; all four injected arithmetic/control faults were caught.
 
 These PRs are awaiting review/merge. These results establish standalone
 behavior and synthesis, not placed/routed timing or execution on the board.
