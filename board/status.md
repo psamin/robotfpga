@@ -32,7 +32,7 @@ is the starting point once Linux access is established.
   teleoperation and model/controller-driven motion work outside this audit.
 - Software owner psamin is tracking a tiny-policy weights/vector release
   under [issue #73](https://github.com/psamin/robotfpga/issues/73). Its publication
-  and suitability for the requested demo have not been verified here.
+  was checked: `handoff-v3r2` was unavailable. Trained-model verification is pending.
 
 Identify the existing real-arm controller entry point before connecting
 FPGA actions to it. GPU training does not produce the
@@ -47,6 +47,14 @@ real-arm adapter, teleoperation entry point, `fpga_backend.py` or
 `remote_backend.py` was found in the inspected remote branch heads.
 The planned `armlab/robot/so101.py` remains absent there. The working
 controller may be external or unpublished; its location is not established.
+
+The read-only handoff checker in [PR #77](https://github.com/psamin/robotfpga/pull/77)
+is ready for the delivered artifact directory. Structural mode checks the
+manifest, weights/hash/layout and exact vector sizes/counts; reference mode
+checks all 100 final outputs and 40 layer dumps. Both modes passed randomized
+stand-in artifacts; five unit tests passed, including corrupt/incomplete-file
+rejection and complete synthetic reference inference. This is not trained-model
+or FPGA acceptance. It does not access motors or replace the board runner.
 
 ## Executed host verification
 
@@ -98,7 +106,7 @@ measurement is established by these results. DSP mapping was not forced.
 ## Ownership and next steps
 
 The friend handles current card/board setup; no completion is assumed.
-This FPGA workstream owns issues #59/#61/#63/#65/#67/#69/#71/#74, assigned to Dhyey234.
+This FPGA workstream owns issues #59/#61/#63/#65/#67/#69/#71/#74/#76, assigned to Dhyey234.
 Existing reference, vectors, HLS and board-runner work retains its issue
 owners. Do not duplicate it or change shared formats without joint review.
 
