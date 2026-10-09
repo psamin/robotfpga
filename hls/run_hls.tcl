@@ -10,7 +10,10 @@
 set here [file dirname [file normalize [info script]]]
 set artifacts [file normalize "$here/../artifacts/standin"]
 
-open_project -reset build/policy_hls
+# Vitis HLS 2022.2 on Windows requires a plain project name, not a path.
+file mkdir "$here/build"
+cd "$here/build"
+open_project -reset policy_hls
 set_top policy_top
 add_files "$here/policy_top.cpp" -cflags "-std=c++14"
 add_files -tb "$here/tb_top.cpp" -cflags "-std=c++14"
