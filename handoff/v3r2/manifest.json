@@ -1,0 +1,215 @@
+{
+  "format_version": 1,
+  "note": "QAT from /nethome/pi34/robotfpga-work/runs/dagger-v3/round2/ckpt_030000.pt, 10000 steps, seed 0",
+  "weights_file": "weights.bin",
+  "total_bytes": 568240,
+  "sha256": "c87abfae0cbedf771a9ef927f39302a43cdcbb954f7090aca4baa6bef350a732",
+  "input": {
+    "packet_bytes": 27658,
+    "image_shape": [
+      96,
+      96,
+      3
+    ],
+    "aux_len": 10
+  },
+  "output": {
+    "len": 48,
+    "shape": [
+      8,
+      6
+    ]
+  },
+  "layers": [
+    {
+      "name": "conv1",
+      "type": "conv",
+      "in_shape": [
+        96,
+        96,
+        3
+      ],
+      "out_shape": [
+        48,
+        48,
+        16
+      ],
+      "relu": true,
+      "shift": 8,
+      "weight_shape": [
+        16,
+        3,
+        3,
+        3
+      ],
+      "weight_offset": 0,
+      "weight_bytes": 432,
+      "bias_offset": 432,
+      "bias_bytes": 64
+    },
+    {
+      "name": "conv2",
+      "type": "conv",
+      "in_shape": [
+        48,
+        48,
+        16
+      ],
+      "out_shape": [
+        24,
+        24,
+        32
+      ],
+      "relu": true,
+      "shift": 7,
+      "weight_shape": [
+        32,
+        3,
+        3,
+        16
+      ],
+      "weight_offset": 496,
+      "weight_bytes": 4608,
+      "bias_offset": 5104,
+      "bias_bytes": 128
+    },
+    {
+      "name": "conv3",
+      "type": "conv",
+      "in_shape": [
+        24,
+        24,
+        32
+      ],
+      "out_shape": [
+        12,
+        12,
+        64
+      ],
+      "relu": true,
+      "shift": 8,
+      "weight_shape": [
+        64,
+        3,
+        3,
+        32
+      ],
+      "weight_offset": 5232,
+      "weight_bytes": 18432,
+      "bias_offset": 23664,
+      "bias_bytes": 256
+    },
+    {
+      "name": "conv4",
+      "type": "conv",
+      "in_shape": [
+        12,
+        12,
+        64
+      ],
+      "out_shape": [
+        6,
+        6,
+        96
+      ],
+      "relu": true,
+      "shift": 7,
+      "weight_shape": [
+        96,
+        3,
+        3,
+        64
+      ],
+      "weight_offset": 23920,
+      "weight_bytes": 55296,
+      "bias_offset": 79216,
+      "bias_bytes": 384
+    },
+    {
+      "name": "conv5",
+      "type": "conv",
+      "in_shape": [
+        6,
+        6,
+        96
+      ],
+      "out_shape": [
+        3,
+        3,
+        128
+      ],
+      "relu": true,
+      "shift": 8,
+      "weight_shape": [
+        128,
+        3,
+        3,
+        96
+      ],
+      "weight_offset": 79600,
+      "weight_bytes": 110592,
+      "bias_offset": 190192,
+      "bias_bytes": 512
+    },
+    {
+      "name": "fc6",
+      "type": "fc",
+      "in_shape": [
+        1162
+      ],
+      "out_shape": [
+        256
+      ],
+      "relu": true,
+      "shift": 8,
+      "weight_shape": [
+        256,
+        1162
+      ],
+      "weight_offset": 190704,
+      "weight_bytes": 297472,
+      "bias_offset": 488176,
+      "bias_bytes": 1024
+    },
+    {
+      "name": "fc7",
+      "type": "fc",
+      "in_shape": [
+        256
+      ],
+      "out_shape": [
+        256
+      ],
+      "relu": true,
+      "shift": 5,
+      "weight_shape": [
+        256,
+        256
+      ],
+      "weight_offset": 489200,
+      "weight_bytes": 65536,
+      "bias_offset": 554736,
+      "bias_bytes": 1024
+    },
+    {
+      "name": "fc8",
+      "type": "fc",
+      "in_shape": [
+        256
+      ],
+      "out_shape": [
+        48
+      ],
+      "relu": false,
+      "shift": 6,
+      "weight_shape": [
+        48,
+        256
+      ],
+      "weight_offset": 555760,
+      "weight_bytes": 12288,
+      "bias_offset": 568048,
+      "bias_bytes": 192
+    }
+  ]
+}
