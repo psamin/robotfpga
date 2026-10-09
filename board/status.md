@@ -71,6 +71,14 @@ host and are documented in the corresponding PRs.
 | Standalone requantization | [#69](https://github.com/psamin/robotfpga/issues/69) / [PR #70](https://github.com/psamin/robotfpga/pull/70) | 261,663 XSim checks; synthesis: 154 LUTs, zero registers/latches/DSPs | Open, independent from main |
 | Direct requant reference check | [#71](https://github.com/psamin/robotfpga/issues/71) / [PR #72](https://github.com/psamin/robotfpga/pull/72) | 281,652 actual NumPy cases matched RTL; malformed/partial/extra files failed | Open, stacked on #70 |
 | Per-lane bias/output | [#74](https://github.com/psamin/robotfpga/issues/74) / [PR #75](https://github.com/psamin/robotfpga/pull/75) | 249,228 lane checks; eight-lane synthesis: 1,643 LUTs, zero registers/latches/DSPs | Open, stacked on #70 |
+| Existing HLS accelerator | [#11](https://github.com/psamin/robotfpga/issues/11) / [PR #12](https://github.com/psamin/robotfpga/pull/12) | Real Vitis C simulation: 100 stand-in vectors passed; synthesis and IP export completed | Draft; latency/integration gates pending |
+
+Vitis HLS 2022.2 completed the existing accelerator build after a Windows
+project-path fix, pushed to #12. Estimates: 153 BRAM18, 14 URAM, 11 DSP,
+5,472 registers and 17,102 LUTs; estimated period 6.598 ns against a 10 ns target.
+Worst-case latency is 10,251,374 cycles (about 103 ms at 100 MHz), exceeding
+the hard 33 ms ceiling. IP export is not a bitstream or placed/routed timing;
+trained-vector checks, RTL co-simulation, optimization and board integration remain.
 
 The array change also reran the original MAC test: 338,736 checks passed.
 Simulation includes signed boundaries, reset/clear priority, enabled
@@ -109,6 +117,8 @@ The friend handles current card/board setup; no completion is assumed.
 This FPGA workstream owns issues #59/#61/#63/#65/#67/#69/#71/#74/#76, assigned to Dhyey234.
 Existing reference, vectors, HLS and board-runner work retains its issue
 owners. Do not duplicate it or change shared formats without joint review.
+With owner coordination confirmed, #11 also assigns Dhyey234; its original
+owner remains assigned. The Windows fix and build evidence use existing PR #12.
 
 1. Confirm the card image and successful Linux boot with the setup owner.
 2. Record board identity, OS, firmware, drivers and Python before selecting
