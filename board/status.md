@@ -4,6 +4,12 @@ Updated October 9, 2026 (America/New_York). Documentation issue
 [#63](https://github.com/psamin/robotfpga/issues/63).
 This is the current FPGA status; dated audits remain historical snapshots.
 
+[Friend handoff, PR #82](https://github.com/psamin/robotfpga/pull/82): clone
+`board/81-fpga-handoff` and run `python3 board/demo/prepare_handoff.py`.
+A fresh single-branch clone gathered 262 pinned files; all 100 trained outputs
+and 40 layer dumps passed preflight. The runbook includes build/board commands;
+`policy.bit`/`policy.hwh` still require Vivado integration and delivery.
+
 ## Board bring-up: M0 pending
 
 - User reports that the KR260 has arrived.
@@ -130,7 +136,7 @@ measurement is established by these results. DSP mapping was not forced.
 ## Ownership and next steps
 
 The friend handles current card/board setup; no completion is assumed.
-This FPGA workstream owns issues #59/#61/#63/#65/#67/#69/#71/#74/#76/#78, assigned to Dhyey234.
+This FPGA workstream owns issues #59/#61/#63/#65/#67/#69/#71/#74/#76/#78/#81, assigned to Dhyey234.
 Existing reference, vectors, HLS and board-runner work retains its issue
 owners. Do not duplicate it or change shared formats without joint review.
 With owner coordination confirmed, #11 also assigns Dhyey234; its original
