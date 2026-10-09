@@ -28,6 +28,7 @@ Full setup reference: [SETUP.md](SETUP.md).
 | # | Asked by | For | Question | Link |
 |---|---|---|---|---|
 | Q5 | psamin | Software (psamin) | Verify LeRobot degrees → sim radians per joint (sign and zero offset; formula in SETUP.md §4.1) | [SETUP.md](SETUP.md) §4.1 |
+| Q6 | athithan-elamaran1 | Software (psamin) | Train TinyPolicy-L, the largest network the FPGA holds on chip (1,812,528 params, 3.2× v3r2, ~26 ms)? Exact layer table, quantization rules and handoff steps in plans/fpga-capacity.md; adopting it changes the shared `LAYERS` contract, so ack in the issue first | [plans/fpga-capacity.md](plans/fpga-capacity.md) |
 
 ## Answered
 
