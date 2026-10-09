@@ -1,4 +1,7 @@
-# Pullable KR260 handoff
+# KR260 handoff: step-by-step runbook
+
+Start with [the root quick start](../../README.md). This is the detailed
+sequence: prepare files → build IP → generate overlay → verify on the board.
 
 This branch gathers exact reviewed-in-progress revisions; it does not merge
 their PRs. Python 3.8+, Git and access to this repository are required.
@@ -7,7 +10,7 @@ The preparation script copies raw Git bytes, avoiding Windows binary newline
 conversion. It refuses an existing output directory and writes per-file
 SHA256 provenance to `bundle.json`. It never accesses the board or motors.
 
-## Your friend: get everything published so far
+## 1. Your friend: pull and prepare the files
 
 Use a fresh clone; these commands do not switch an existing checkout:
 
@@ -35,7 +38,7 @@ Expected trained weight SHA256:
 Preflight must report PASS, 100 reference calls and 40 layer dumps.
 Keep generated bundles, logs and overlays out of commits.
 
-## FPGA workstation: build the IP
+## 2. FPGA workstation: build the IP
 
 Use Vivado/Vitis HLS **2022.2**, targeting `xck26-sfvc784-2LV-c`.
 From the prepared directory, enter `hls/` and run:
@@ -49,7 +52,7 @@ Require the 100-vector PASS message, successful synthesis, and
 `hls/build/policy_hls/sol1/impl/export.zip` plus `impl/ip/component.xml`.
 The export is an IP block, **not a runnable board overlay**.
 
-## Missing deliverable: Vivado board overlay
+## 3. FPGA workstation: generate the missing board overlay
 
 No `policy.bit`/`policy.hwh` is published. The FPGA integration owner must:
 
@@ -70,7 +73,7 @@ executed design. Keep M0/M1/M4 owners coordinated; no milestone is accepted
 by preparing this directory. The board needs working Ubuntu, PYNQ, NumPy,
 DMA allocation support and SSH/file transfer before the next commands.
 
-## Connected board: verify before connecting the arm
+## 4. Connected board: verify before connecting the arm
 
 Copy the prepared directory and matching overlay pair to the KR260. Follow
 the M0 runbook and inventory first. Then confirm IP names and registers in
