@@ -5,8 +5,8 @@
 //   - clang/gcc C model, through tb_kernel.cpp (runs on a laptop, no Xilinx tools)
 //   - the ARM CPU baseline on the board (same loops, -O3)
 //
-// v0.1 goal is correctness (milestone M4), not speed: layers run one after
-// another, about 1 multiply-add per clock. See plans/fpga.md for the M5 steps.
+// Layers run sequentially, with eight independent output channels per
+// reduction step. See board/hls/parallel-validation.md for measured estimates.
 //
 // Spec: ref/intref.py is the tiebreaker.
 #pragma once
@@ -23,6 +23,7 @@ constexpr int AUX_LEN = 10;
 constexpr int PACKET_BYTES = IMG_BYTES + AUX_LEN;  // 27,658
 constexpr int OUT_LEN = 48;
 constexpr int N_LAYERS = 8;
+constexpr int LANES = 8;
 constexpr int WEIGHT_FILE_BYTES = 568240;
 constexpr uint32_t VERSION = 0x00000100;  // 0.1.0
 
@@ -62,13 +63,19 @@ template <int H, int W, int CI, int CO>
 static void conv3x3s2(const int8_t in[H * W * CI], int8_t out[(H / 2) * (W / 2) * CO],
                       const int8_t w[CO][9 * CI], const int32_t b[CO], int s) {
   constexpr int HO = H / 2, WO = W / 2;
+  static_assert(CO % LANES == 0, "output channels must fill all lanes");
 conv_y:
   for (int oy = 0; oy < HO; oy++) {
   conv_x:
     for (int ox = 0; ox < WO; ox++) {
     conv_o:
-      for (int oc = 0; oc < CO; oc++) {
-        int32_t acc = b[oc];
+      for (int oc = 0; oc < CO; oc += LANES) {
+        int32_t acc[LANES];
+#pragma HLS ARRAY_PARTITION variable = acc complete
+        for (int lane = 0; lane < LANES; lane++) {
+#pragma HLS UNROLL
+          acc[lane] = b[oc + lane];
+        }
         int ky = 0, kx = 0, ic = 0;
       conv_k:
         for (int k = 0; k < 9 * CI; k++) {
@@ -76,7 +83,10 @@ conv_y:
           int iy = 2 * oy + ky - 1, ix = 2 * ox + kx - 1;
           bool inside = iy >= 0 && iy < H && ix >= 0 && ix < W;
           int8_t x = inside ? in[(iy * W + ix) * CI + ic] : (int8_t)0;  // zero padding
-          acc += (int32_t)x * (int32_t)w[oc][k];
+          for (int lane = 0; lane < LANES; lane++) {
+#pragma HLS UNROLL
+            acc[lane] += (int32_t)x * (int32_t)w[oc + lane][k];
+          }
           if (++ic == CI) {
             ic = 0;
             if (++kx == 3) {
@@ -85,7 +95,10 @@ conv_y:
             }
           }
         }
-        out[(oy * WO + ox) * CO + oc] = requant(acc, s, true);
+        for (int lane = 0; lane < LANES; lane++) {
+#pragma HLS UNROLL
+          out[(oy * WO + ox) * CO + oc + lane] = requant(acc[lane], s, true);
+        }
       }
     }
   }
@@ -95,15 +108,27 @@ conv_y:
 template <int IN, int OUT>
 static void fc(const int8_t in[IN], int8_t out[OUT], const int8_t w[OUT][IN], const int32_t b[OUT],
                int s, bool relu) {
+  static_assert(OUT % LANES == 0, "outputs must fill all lanes");
 fc_o:
-  for (int o = 0; o < OUT; o++) {
-    int32_t acc = b[o];
+  for (int o = 0; o < OUT; o += LANES) {
+    int32_t acc[LANES];
+#pragma HLS ARRAY_PARTITION variable = acc complete
+    for (int lane = 0; lane < LANES; lane++) {
+#pragma HLS UNROLL
+      acc[lane] = b[o + lane];
+    }
   fc_i:
     for (int i = 0; i < IN; i++) {
 #pragma HLS PIPELINE II = 1
-      acc += (int32_t)in[i] * (int32_t)w[o][i];
+      for (int lane = 0; lane < LANES; lane++) {
+#pragma HLS UNROLL
+        acc[lane] += (int32_t)in[i] * (int32_t)w[o + lane][i];
+      }
     }
-    out[o] = requant(acc, s, relu);
+    for (int lane = 0; lane < LANES; lane++) {
+#pragma HLS UNROLL
+      out[o + lane] = requant(acc[lane], s, relu);
+    }
   }
 }
 
@@ -156,6 +181,16 @@ static int policy_kernel(int mode, Src& in, Sink& out, uint32_t shifts_lo, uint3
 #pragma HLS ARRAY_RESHAPE variable = w6 type = cyclic factor = 8 dim = 2
 #pragma HLS BIND_STORAGE variable = w5 type = ram_1p impl = uram
 #pragma HLS ARRAY_RESHAPE variable = w5 type = cyclic factor = 8 dim = 2
+
+  // Independent output-channel banks supply all eight multipliers each cycle.
+#pragma HLS ARRAY_PARTITION variable = w1 cyclic factor = 8 dim = 1
+#pragma HLS ARRAY_PARTITION variable = w2 cyclic factor = 8 dim = 1
+#pragma HLS ARRAY_PARTITION variable = w3 cyclic factor = 8 dim = 1
+#pragma HLS ARRAY_PARTITION variable = w4 cyclic factor = 8 dim = 1
+#pragma HLS ARRAY_PARTITION variable = w5 cyclic factor = 8 dim = 1
+#pragma HLS ARRAY_PARTITION variable = w6 cyclic factor = 8 dim = 1
+#pragma HLS ARRAY_PARTITION variable = w7 cyclic factor = 8 dim = 1
+#pragma HLS ARRAY_PARTITION variable = w8 cyclic factor = 8 dim = 1
 
   // ---- activations, HWC ----
   static int8_t a0[IMG_BYTES];
