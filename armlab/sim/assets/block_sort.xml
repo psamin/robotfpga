@@ -33,8 +33,12 @@
     <light name="key" pos="0.2 0.1 1.2" dir="0 0 -1" directional="true" diffuse="0.6 0.6 0.6" castshadow="true"/>
     <geom name="table" type="box" pos="0.15 0 -0.02" size="0.35 0.45 0.02" material="table" condim="3"/>
 
-    <!-- Overhead camera: image up = +x (away from the arm), image right = -y (the arm's right). -->
-    <camera name="overhead" pos="0.17 0 0.62" xyaxes="0 -1 0 1 0 0" fovy="52"/>
+    <!-- Overhead camera, oblique: in front of the arm, 0.55 m up, looking back at the workspace
+         center (0.15, 0, 0) at about 57 deg down. A straight-down view hid the cube under the
+         gripper exactly when alignment mattered and gave no height cue. Image right = +y (the
+         left bin, from the arm's point of view). -->
+    <camera name="overhead" pos="0.50 0 0.55" quat="0.67528548 0.20973678 0.20973678 0.67528548" fovy="46"/>
+    <geom name="floor" type="plane" pos="0 0 -0.75" size="3 3 0.05" rgba="0.42 0.42 0.45 1" contype="0" conaffinity="0"/>
 
     <!-- Bins: 9 cm inner square, 3.5 cm walls. Centers at y = +/-0.20. -->
     <body name="bin_left" pos="0.14 0.20 0">
