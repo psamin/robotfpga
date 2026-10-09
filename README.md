@@ -40,3 +40,7 @@ Follow [the detailed runbook](board/demo/README.md), sections 2–4.
 It separates the Vivado workstation steps from the KR260 commands and lists
 the required overlay files, IP names, DMA settings and success checks.
 Do not skip M0/M1 board acceptance. The original handoff landed in PR #82.
+
+## FPGA team status
+
+Owners, verification evidence and open review links: [board/status.md](board/status.md).
