@@ -27,7 +27,6 @@ Full setup reference: [SETUP.md](SETUP.md).
 
 | # | Asked by | For | Question | Link |
 |---|---|---|---|---|
-| Q4 | Dhyey234, psamin | Both sides | Agree the bridge split. Proposed: software owns `remote_backend.py` and the SO-101 controller adapter; FPGA side owns the board inference service and overlay | #87 |
 | Q5 | psamin | Software (psamin) | Verify LeRobot degrees → sim radians per joint (sign and zero offset; formula in SETUP.md §4.1) | [SETUP.md](SETUP.md) §4.1 |
 
 ## Answered
@@ -39,3 +38,4 @@ Full setup reference: [SETUP.md](SETUP.md).
 | A3 | Q1: KR260 boot, versions, endpoint, SSH user | Boots Ubuntu 22.04.4 (kernel 5.15.0-1027-xilinx-zynqmp), Python 3.10.12, PYNQ 3.0.1. Private LAN 192.168.137.35 behind the controller laptop, SSH user `ubuntu` | 2026-10-09 | [#87](https://github.com/psamin/robotfpga/issues/87#issuecomment-6075687430) |
 | A4 | Q2: M0/M1 results | M0: boot, PYNQ and custom overlay load pass. `board/m0/` inventory not run. M1 DMA loopback not run (the built design uses `m_axi`, no DMA) | 2026-10-09 | [#87](https://github.com/psamin/robotfpga/issues/87#issuecomment-6075687430) |
 | A5 | Q3: matching `policy.bit` / `policy.hwh`? | Yes, for the board owner's 16-lane layer engine (source not in git yet, #98). Vitis HLS / Vivado 2022.2, 100 MHz, WNS +2.371 ns; 100/100 v3r2 vectors on hardware, 8.03 ms | 2026-10-09 | [#87](https://github.com/psamin/robotfpga/issues/87#issuecomment-6075687430), #15 |
+| A-Q4 | Bridge split | Agreed by software: software owns `armlab/backends/remote_backend.py` + SO-101 controller adapter; FPGA side owns the board TCP service and overlays. Athithan to contribute his `PolicyBackend` client as the starting PR | 2026-10-09 | [#87](https://github.com/psamin/robotfpga/issues/87#issuecomment-6075858540) |
