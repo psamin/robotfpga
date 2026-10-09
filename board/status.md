@@ -32,7 +32,8 @@ is the starting point once Linux access is established.
   teleoperation and model/controller-driven motion work outside this audit.
 - Software owner psamin is tracking a tiny-policy weights/vector release
   under [issue #73](https://github.com/psamin/robotfpga/issues/73). Its publication
-  is published on branch `handoff/v3r2`, commit `5ee0e03`; no GitHub release
+  is published in [PR #80](https://github.com/psamin/robotfpga/pull/80), branch
+  `handoff/v3r2`, commit `5ee0e03`; no GitHub release
   was found. Trained weights, 100 vectors, 40 layer dumps and eval JSONs are present.
 
 Identify the existing real-arm controller entry point before connecting
@@ -53,6 +54,8 @@ The [handoff checker, PR #77](https://github.com/psamin/robotfpga/pull/77), pass
 the trained v3r2 manifest, weight hash/layout and vector sizes, then all 100
 reference outputs and 40 layer dumps. The optimized HLS C model also matched
 all 100 outputs/40 dumps; its real vendor-header stream test passed 100 vectors.
+Trained-vector 000 Verilog/XSim co-simulation passed all 48 bytes/TLAST:
+1,359,007 inference cycles (13.590 ms at simulated 100 MHz).
 Weights SHA256: `c87abfae0cbedf771a9ef927f39302a43cdcbb954f7090aca4baa6bef350a732`.
 Windows archive extraction changed `089_out.bin` to 51 bytes under `text=auto`;
 the raw Git blob is correct (48 bytes). Exact blob extraction passed validation.
@@ -90,7 +93,7 @@ period 5.953 ns. XSim Verilog co-simulation passed one stand-in vector:
 569,580 cycles for weight loading and 1,359,007 for inference (13.590 ms).
 All 48 bytes/TLAST matched. Process-local removal of inherited `DEBUG=release`
 fixed Vitis's generated compiler command; reproduction is documented in #79.
-Still above 5 ms; trained vectors, full RTL vector coverage, system resources,
+Still above 5 ms; full trained RTL vector coverage, system resources,
 placement/routing and board latency remain unverified.
 
 The array change also reran the original MAC test: 338,736 checks passed.

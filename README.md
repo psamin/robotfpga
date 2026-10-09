@@ -17,6 +17,7 @@ the accelerator overlay remain unconfirmed.
 Trained [v3r2 policy handoff](https://github.com/psamin/robotfpga/tree/handoff/v3r2/handoff/v3r2)
 is now published on its branch. All 100 outputs and 40 layer dumps matched
 the integer reference and optimized HLS C model; vendor-header stream tests passed.
+Trained-vector RTL smoke test passed: all 48 bytes matched in simulated 13.59 ms.
 
 See [current FPGA status](board/status.md) for owners, verification evidence,
 open review links and next steps. Existing M0 preparation is tracked in
