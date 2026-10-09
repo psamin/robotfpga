@@ -120,3 +120,23 @@ Evidence: `build/mac-synth-a091b6bbe731458ca89425c39b5f1c5d/` and
 `build/mac_array-synth-87d46bae33a9450e8d2fbd9752ddb65a/`.
 Invalid top, zero lanes and zero period were rejected with nonzero exits.
 Vivado retained the parallel-synthesis and missing `HD.CLK_SRC` warnings.
+
+## Testbench fault detection (issue #67)
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./board/rtl/run_mac_mutations.ps1
+```
+
+The harness first runs clean single-MAC and array baselines, then deliberately
+breaks zero/sign extension, clear priority, enable hold and per-lane enables
+in separate temporary source copies under `build/mac-faults-<id>/`.
+Production RTL is untouched. Each fault must trigger an explicit scoreboard
+mismatch and nonzero exit; compilation errors do not count as detection.
+Logs are retained and a surviving fault makes the harness fail.
+Executed October 8, 2026 on XSim 2022.2: both baselines passed; all four
+faults compiled/elaborated and were detected by scoreboard mismatches.
+Zero extension failed at MAC check 3, ignored enable at check 10, clear
+priority at check 11, and shared enable at 3-lane check 17 (lane 1).
+Evidence: `build/mac-faults-f745d0927ff242c78f106a0fc2f64b2e/summary.txt`
+and each case's `harness-output.txt`. This demonstrates detection of these
+specific defects, not exhaustive proof of every possible RTL fault.
