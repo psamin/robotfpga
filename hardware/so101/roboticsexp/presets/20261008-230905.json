@@ -1,0 +1,22 @@
+{
+  "created": "2026-10-08T23:09:05",
+  "measured": {
+    "front": {
+      "brightness": 102.1,
+      "fps": 28.5
+    },
+    "wrist": {
+      "brightness": 179.2,
+      "fps": 28.5
+    }
+  },
+  "cameras": {
+    "front": {
+      "focus-abs": "40",
+      "white-balance-temp": "3066"
+    },
+    "wrist": {
+      "white-balance-temp": "4000"
+    }
+  }
+}
