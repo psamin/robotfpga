@@ -29,21 +29,24 @@ host and are documented in the corresponding PRs.
 |---|---|---|---|
 | Signed INT8 MAC | [#59](https://github.com/psamin/robotfpga/issues/59) / [PR #60](https://github.com/psamin/robotfpga/pull/60) | 338,736 cycle checks; synthesis: 94 LUTs, 32 registers, 0 DSPs | Open, not merged |
 | Independent MAC lanes | [#61](https://github.com/psamin/robotfpga/issues/61) / [PR #62](https://github.com/psamin/robotfpga/pull/62) | 3,278,586 lane checks for 1/3/8 lanes; 8-lane synthesis: 745 LUTs, 256 registers, 0 DSPs | Open, stacked on #60 |
+| Reproducible synthesis | [#65](https://github.com/psamin/robotfpga/issues/65) / [PR #66](https://github.com/psamin/robotfpga/pull/66) | Both tops passed at 10 ns with reports/checkpoints; invalid top/lane/period rejected | Open, stacked on #62 |
 
 The array change also reran the original MAC test: 338,736 checks passed.
 Simulation includes signed boundaries, reset/clear priority, enabled
 accumulation, disabled hold, INT32 wrap and reproducible randomized tests.
 Array tests verify lane isolation and non-default lane counts.
 
-Timing reports are preliminary: clock constraints were applied after
-synthesis, interface delays are absent and `HD.CLK_SRC` is unset.
+Timing reports are preliminary: the original scratch runs applied clocks
+after synthesis. The tracked runner in #66 now reads clocks before synthesis
+and reproduces the same resource counts. Interface delays are absent and
+`HD.CLK_SRC` is unset in both workflows.
 No placement/routing, board validation, full-network latency or power
 measurement is established by these results. DSP mapping was not forced.
 
 ## Ownership and next steps
 
 The friend handles current card/board setup; no completion is assumed.
-This FPGA workstream owns issues #59/#61/#63, assigned to Dhyey234.
+This FPGA workstream owns issues #59/#61/#63/#65, assigned to Dhyey234.
 Existing reference, vectors, HLS and board-runner work retains its issue
 owners. Do not duplicate it or change shared formats without joint review.
 
@@ -52,8 +55,8 @@ owners. Do not duplicate it or change shared formats without joint review.
    installation or firmware changes; establish the actual SSH endpoint.
 3. Execute the existing M0 runbook's verified resizer/DMA checks, save
    concise evidence and repeat after reboot. Only then advance M1.
-4. Review/merge #60 before #62; retarget #62 to main after #60 lands.
-   A merge requires approval; neither PR closes its issue until merged.
+4. Review/merge #60 before #62, then #66; retarget each dependent PR to
+   main after its base lands. A merge requires approval; issues close on merge.
 
 Maintain this page and the root README in the same PR when new confirmed
 status or verification changes their meaning. Record dates, issue/PR links,
