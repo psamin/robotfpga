@@ -94,3 +94,29 @@ To reproduce with the Tcl recipe above, also read
 `../../board/rtl/mac_array.sv` and change `-top mac` to `-top mac_array`.
 The same preliminary timing limitations apply; no placement/routing or
 board acceptance has run. This does not define a network scheduling scheme.
+
+## Reproducible synthesis (issue #65)
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./board/rtl/run_mac_synthesis.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./board/rtl/run_mac_synthesis.ps1 -Top mac_array -Lanes 8 -PeriodNs 10
+```
+
+The tracked Tcl script targets K26 and reads the clock constraint before
+synthesis. The runner accepts `-VivadoBin`, `-Top`, `-Lanes` (1..1024) and
+`-PeriodNs` (0.1..1000). `-Lanes` only configures `mac_array`; `mac` always
+contains one accumulator. Lane bounds are runner limits, not a resource-fit
+guarantee. Every invocation uses a fresh `build/<top>-synth-<id>/` directory
+and requires successful exit plus nonempty completion marker, utilization,
+timing and checkpoint files. Do not commit these generated artifacts.
+Input/output delays and the parent clock location remain undefined; these
+reports do not prove operand-path timing closure or board performance.
+The original scratch recipes above are historical evidence; use this runner
+for subsequent builds so the clock constraint participates in synthesis.
+Executed October 8, 2026 on Vivado 2022.2 at 10 ns: both tops passed with
+all required artifacts. Resources remain 94 LUTs/32 registers/0 DSPs for
+`mac` and 745 LUTs/256 registers/0 DSPs for the eight-lane array.
+Evidence: `build/mac-synth-a091b6bbe731458ca89425c39b5f1c5d/` and
+`build/mac_array-synth-87d46bae33a9450e8d2fbd9752ddb65a/`.
+Invalid top, zero lanes and zero period were rejected with nonzero exits.
+Vivado retained the parallel-synthesis and missing `HD.CLK_SRC` warnings.
