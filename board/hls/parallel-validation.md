@@ -103,3 +103,32 @@ The weight load is separate and parameters persist for subsequent inference.
 These are simulated accelerator transactions, without a real DMA, DDR,
 software scheduling, routed clock or trained weights. There is no latency
 distribution or full-vector RTL claim from this single-vector smoke test.
+
+## Trained policy handoff
+
+Fetched `handoff/v3r2` commit `5ee0e03758ee3aaf87a2a04d790779e3a45c9186`.
+Weights SHA256 `c87abfae0cbedf771a9ef927f39302a43cdcbb954f7090aca4baa6bef350a732`.
+The #76 preflight passed all structure/hash checks and compared all 100 final
+outputs/40 layer dumps to the pinned integer reference. Optimized GCC kernel:
+100 outputs/40 dumps PASS; existing real vendor-header `csim.exe`: 100 outputs
+PASS (MinGW runtime DLLs supplied on process PATH).
+
+Generated Verilog/XSim co-simulation also passed trained vector 000: all
+48 bytes and TLAST matched, zero failures. Weight load: 569,580 cycles;
+inference: 1,359,007 cycles (13.590 ms at simulated 100 MHz). Reproduce with
+the smoke-test Tcl above using `artifacts/trained-one` containing the exact
+trained manifest/weights and vector 000. Full trained RTL coverage is pending.
+
+Windows `git archive` extraction expanded `089_out.bin` from its correct
+48-byte Git blob to 51 bytes under the local `text=auto` attributes. The
+preflight rejected it. Re-extracting every file as raw bytes through
+`subprocess.check_output(['git', 'show', revision + ':' + path])` and
+`Path.write_bytes()` preserved the handoff and passed. Do not silently trim
+or normalize binary vectors; validate copied file sizes and hashes.
+
+The additional `-random_stall` diagnostic was stopped before completing its
+weight-load transaction: generated UVM simulation repeatedly printed
+`find kernel block.` and memory use kept growing. It produced no passing
+result. Baseline reports were preserved under `hls/build/baseline-cosim/`;
+the stalled-run log is under `hls/build/stall-diagnostic/`. Random-stall
+coverage remains unresolved; this does not establish an accelerator defect.
