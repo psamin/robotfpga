@@ -24,20 +24,29 @@ is the starting point once Linux access is established.
 - The first demo must use FPGA inference; CPU inference is not the requested fallback.
 - User reports SmolVLA training on a GPU, with model readiness estimated in
   about 90 minutes at the time of the report. This is not a delivery guarantee.
-- Which model will be supplied for the FPGA is unconfirmed. The existing
-  accelerator implements the small INT8 convolution/FC policy. Build-spec
-  section 9 excludes running SmolVLA on the FPGA in the current project scope.
+- User confirms the FPGA model is the small INT8 convolution/FC policy.
+  SmolVLA training is separate; build-spec section 9 excludes running it
+  on this FPGA accelerator in the current project scope.
 - Ubuntu is expected from the setup owner; PYNQ, SSH and a working overlay
-  remain uncertain. The real arm model and motor-controller availability
-  have not been identified.
+  remain uncertain. The user identifies the arm as LeRobot SO-101 and confirms
+  teleoperation and model/controller-driven motion work outside this audit.
 - Software owner psamin is tracking a tiny-policy weights/vector release
   under [issue #73](https://github.com/psamin/robotfpga/issues/73). Its publication
   and suitability for the requested demo have not been verified here.
 
-Confirm the intended model and physical arm/controller before preparing
-deployment or issuing motor commands. GPU training does not produce the
+Identify the existing real-arm controller entry point before connecting
+FPGA actions to it. GPU training does not produce the
 FPGA bitstream; HLS export, Vivado integration, board acceptance and golden
 output checks remain necessary under the existing owners and milestone gates.
+
+Remote branches refreshed and inspected October 9: `sw/16-final` contains
+`armlab/backends/base.py`, `intref_backend.py` and `control/chunking.py`;
+`eval/run.py` routes them to MuJoCo, not physical motors. `board-run-policy`
+contains the prototype `board/run_policy.py` FPGA inference class. No
+real-arm adapter, teleoperation entry point, `fpga_backend.py` or
+`remote_backend.py` was found in the inspected remote branch heads.
+The planned `armlab/robot/so101.py` remains absent there. The working
+controller may be external or unpublished; its location is not established.
 
 ## Executed host verification
 
