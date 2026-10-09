@@ -1,0 +1,133 @@
+{
+  "time": "2026-10-02T07:34:33-0400",
+  "git": "32d24bdc7c5e29f30d9e115faaff5aaa69c14b74",
+  "seed": 0,
+  "config": {
+    "data": [
+      "/nethome/pi34/robotfpga-work/datasets/v3",
+      "/nethome/pi34/robotfpga-work/runs/dagger-v3/dagger_r1",
+      "/nethome/pi34/robotfpga-work/runs/dagger-v3/dagger_r2"
+    ],
+    "data_device": "cpu",
+    "float_ckpt": "/nethome/pi34/robotfpga-work/runs/dagger-v3/round2/ckpt_030000.pt",
+    "out": "/nethome-instruction/pi34/robotfpga-work/runs/final-v3r2/qat",
+    "steps": 10000,
+    "bs": 256,
+    "lr": 0.0001,
+    "distill": 0.5,
+    "calib": 4096,
+    "ema": 0.999,
+    "val_episodes": 64,
+    "seed": 0
+  },
+  "versions": {
+    "python": "3.12.14",
+    "platform": "Linux-5.14.0-687.38.1.el9_8.x86_64-x86_64-with-glibc2.34",
+    "armlab": "0.1.0",
+    "mujoco": "3.14.0",
+    "numpy": "2.2.6",
+    "torch": "2.11.0"
+  },
+  "results": {
+    "log": [
+      {
+        "step": 0,
+        "val_l1_float": 0.01752,
+        "val_l1_int8": 0.02512
+      },
+      {
+        "step": 1000,
+        "loss": 0.02619,
+        "val_l1_int8": 0.0226,
+        "sec": 18.0
+      },
+      {
+        "step": 2000,
+        "loss": 0.02417,
+        "val_l1_int8": 0.02242,
+        "sec": 35.7
+      },
+      {
+        "step": 3000,
+        "loss": 0.02551,
+        "val_l1_int8": 0.02265,
+        "sec": 53.1
+      },
+      {
+        "step": 4000,
+        "loss": 0.02648,
+        "val_l1_int8": 0.0217,
+        "sec": 71.4
+      },
+      {
+        "step": 5000,
+        "loss": 0.02547,
+        "val_l1_int8": 0.02136,
+        "sec": 89.0
+      },
+      {
+        "step": 6000,
+        "loss": 0.02378,
+        "val_l1_int8": 0.02083,
+        "sec": 106.3
+      },
+      {
+        "step": 7000,
+        "loss": 0.02448,
+        "val_l1_int8": 0.02073,
+        "sec": 123.4
+      },
+      {
+        "step": 8000,
+        "loss": 0.02249,
+        "val_l1_int8": 0.01996,
+        "sec": 140.6
+      },
+      {
+        "step": 9000,
+        "loss": 0.02283,
+        "val_l1_int8": 0.01979,
+        "sec": 158.4
+      },
+      {
+        "step": 10000,
+        "loss": 0.02285,
+        "val_l1_int8": 0.02016,
+        "sec": 175.3
+      }
+    ],
+    "a_exp": [
+      7,
+      6,
+      6,
+      6,
+      7,
+      7,
+      6,
+      6,
+      7
+    ],
+    "w_exp": [
+      0,
+      7,
+      7,
+      8,
+      8,
+      8,
+      7,
+      5,
+      7
+    ],
+    "shifts": [
+      8,
+      7,
+      8,
+      7,
+      8,
+      8,
+      5,
+      6
+    ],
+    "sha256": "c87abfae0cbedf771a9ef927f39302a43cdcbb954f7090aca4baa6bef350a732"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "created": "2026-10-08T23:09:05",
+  "note": "recording-session values (collect 20261008-230906), applied for the first policy run",
+  "cameras": {
+    "front": {
+      "focus-abs": "40",
+      "white-balance-temp": "3066"
+    },
+    "wrist": {
+      "white-balance-temp": "4000"
+    }
+  }
+}
