@@ -63,3 +63,34 @@ The report has 19 inputs and 32 outputs without delay constraints and warns
 that `HD.CLK_SRC` is unset; its +8.981 ns register-path WNS does not validate
 the external operand-to-accumulator path or the final clock implementation.
 This is standalone preparation, not M0 acceptance or accelerator integration.
+
+## Independent MAC lanes (issue #61)
+
+`mac_array.sv` instantiates `LANES` copies of `mac`, default 8, minimum 1.
+`a[lane]` and `b[lane]` are signed INT8 bit patterns; `acc[lane]` is an
+independent signed INT32 bit pattern. Packed buses place lane 0 in the least
+significant bits. Interpret slices with `$signed` when doing arithmetic.
+Reset/clear affect every lane; enable is per lane. There is no cross-lane
+sum, extra latency, memory controller or board interface. Eight lanes can
+accept eight operand pairs per enabled clock if upstream supplies them.
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./board/rtl/run_mac_tests.ps1 -Test mac_array
+```
+The testbench checks lane isolation, signed edges, independent disabled hold,
+shared reset/clear priority, both INT32 wrap boundaries and 10,000 randomized
+cycles against widened integer references for lane counts 1, 3 and 8.
+Seeds are `61c0ffee XOR LANES`; all configurations must pass.
+XSim 2022.2 passed without compile/elaboration warnings: 273,200 checks for
+1 lane, 819,618 for 3 lanes, 2,185,768 for 8 lanes (3,278,586 total).
+Evidence: `build/mac_array-6353a7c9f9e142b3978311f25d67c562/runner-output.txt`.
+The unchanged single-MAC test also passed 338,736 checks with the updated
+runner: `build/mac-d4be1a9f6c5b46d0bdb950276cc9d590/runner-output.txt`.
+PR is stacked on #60; review/merge the single MAC first.
+Eight-lane K26 out-of-context synthesis succeeded: 745 LUTs, 256 registers,
+96 CARRY8, zero DSPs and no black boxes. One warning notes parallel synthesis
+criteria were not met. Evidence is in `build/mac-array-synthesis/`.
+To reproduce with the Tcl recipe above, also read
+`../../board/rtl/mac_array.sv` and change `-top mac` to `-top mac_array`.
+The same preliminary timing limitations apply; no placement/routing or
+board acceptance has run. This does not define a network scheduling scheme.
