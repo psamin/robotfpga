@@ -37,5 +37,5 @@ Full setup reference: [SETUP.md](SETUP.md).
 
 | # | Question | Answer | Date | Evidence |
 |---|---|---|---|---|
-| A1 | Real-arm launch command, model, joint order/units, camera/preprocessing | No real-arm controller yet. Model is TinyPolicy v3r2 int8 (SHA-256 `c87abfae…`). Joint order, radians ranges, normalization, camera pose and 96×96 preprocessing are listed in the comment | 2026-10-09 | [#87 comment](https://github.com/psamin/robotfpga/issues/87#issuecomment-6075155040) |
+| A1 | Real-arm launch command, model, joint order/units, camera/preprocessing | Real-arm stack exists in psamin/roboticsexp `so101/` (SmolVLA, different task); TinyPolicy v3r2 not wired to it. Units, ports, cameras, calibration in SETUP.md §2 and §4.1 | 2026-10-09 | [#87 correction](https://github.com/psamin/robotfpga/issues/87#issuecomment-6075239385), [SETUP.md](SETUP.md) |
 | A2 | Software-side review of the golden-vector generator (#6) | Approved from software; used for the v3r2 vectors, HLS C model 100/100 | 2026-10-09 | [#6 comment](https://github.com/psamin/robotfpga/pull/6#issuecomment-6075156540) |
