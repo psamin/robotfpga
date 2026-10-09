@@ -44,6 +44,9 @@ def prepare(destination):
             data = git("show", revision + ":" + name)
             path.write_bytes(data)
             files[relative] = hashlib.sha256(data).hexdigest()
+    verifier = (ROOT / "board/demo/verify_bundle.py").read_bytes()
+    (destination / "board/demo/verify_bundle.py").write_bytes(verifier)
+    files["board/demo/verify_bundle.py"] = hashlib.sha256(verifier).hexdigest()
     if files["artifacts/standin/weights.bin"] != WEIGHTS_HASH:
         raise ValueError("Trained weights do not match the pinned hash")
     provenance = {"pins": PINS, "sha256": files,
@@ -51,7 +54,7 @@ def prepare(destination):
                   "overlay_included": False}
     (destination / "bundle.json").write_text(json.dumps(provenance, indent=2) + "\n")
     print("Prepared {} files in {}".format(len(files), destination))
-    print("Next: run board/demo/handoff_check.py with --verify-reference (see README).")
+    print("Next: verify_bundle.py, then handoff_check.py --verify-reference (see README).")
     print("No bitstream included. Build/integrate HLS IP and complete board acceptance first.")
 
 

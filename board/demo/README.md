@@ -3,7 +3,7 @@
 Start with [the root quick start](../../README.md). This is the detailed
 sequence: prepare files → build IP → generate overlay → verify on the board.
 
-This branch gathers exact reviewed-in-progress revisions; it does not merge
+The preparer on `main` gathers exact reviewed-in-progress revisions; it does not merge
 their PRs. Python 3.8+, Git and access to this repository are required.
 Trained v3r2 weights are included through the pinned handoff in PR #80.
 The preparation script copies raw Git bytes, avoiding Windows binary newline
@@ -15,10 +15,11 @@ SHA256 provenance to `bundle.json`. It never accesses the board or motors.
 Use a fresh clone; these commands do not switch an existing checkout:
 
 ```sh
-git clone --branch board/81-fpga-handoff https://github.com/psamin/robotfpga.git robotfpga-handoff
+git clone --branch main https://github.com/psamin/robotfpga.git robotfpga-handoff
 cd robotfpga-handoff
 python3 board/demo/prepare_handoff.py
 cd build/fpga-handoff
+python3 board/demo/verify_bundle.py
 python3 -m pip install numpy
 python3 board/demo/handoff_check.py artifacts/standin --reference ref/intref.py --verify-reference
 ```
@@ -37,6 +38,10 @@ Expected trained weight SHA256:
 `c87abfae0cbedf771a9ef927f39302a43cdcbb954f7090aca4baa6bef350a732`.
 Preflight must report PASS, 100 reference calls and 40 layer dumps.
 Keep generated bundles, logs and overlays out of commits.
+The bundle verifier checks every recorded file, including sources and scripts;
+run it again after copying to the board. It rejects changed/missing files and
+unsafe provenance paths. It detects accidental corruption, not authenticity:
+`bundle.json` is unsigned, and unlisted extra files are not verified.
 
 ## 2. FPGA workstation: build the IP
 
@@ -84,6 +89,7 @@ version `0x30`, status/ap_return `0x10`, control `0x00`.
 From the prepared directory on the board:
 
 ```sh
+python3 board/demo/verify_bundle.py
 python3 board/demo/handoff_check.py artifacts/standin --reference ref/intref.py --verify-reference
 timeout 300s python3 -u board/run_policy.py policy.bit artifacts/standin
 ```
