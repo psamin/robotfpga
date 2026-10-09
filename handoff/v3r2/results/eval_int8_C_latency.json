@@ -1,0 +1,590 @@
+{
+  "time": "2026-10-02T07:37:43-0400",
+  "git": "32d24bdc7c5e29f30d9e115faaff5aaa69c14b74",
+  "seed": 1000000,
+  "config": {
+    "backend": "intref",
+    "ckpt": [
+      "/nethome-instruction/pi34/robotfpga-work/runs/final-v3r2/qat/export"
+    ],
+    "stage": "C",
+    "episodes": 25,
+    "latency_ms": [
+      33.0,
+      67.0,
+      100.0,
+      133.0,
+      200.0,
+      300.0,
+      500.0
+    ],
+    "workers": 64,
+    "out": "/nethome-instruction/pi34/robotfpga-work/runs/final-v3r2/eval_int8_C_latency.json"
+  },
+  "versions": {
+    "python": "3.12.14",
+    "platform": "Linux-5.14.0-687.38.1.el9_8.x86_64-x86_64-with-glibc2.34",
+    "armlab": "0.1.0",
+    "mujoco": "3.14.0",
+    "numpy": "2.2.6",
+    "torch": "2.11.0"
+  },
+  "results": {
+    "evals": [
+      {
+        "backend": "intref",
+        "ckpt": "/nethome-instruction/pi34/robotfpga-work/runs/final-v3r2/qat/export",
+        "stage": "C",
+        "latency_ms": 33.0,
+        "per_instr": {
+          "put the red cube in the left bin": {
+            "k": 21,
+            "n": 25,
+            "rate": 0.84,
+            "ci95": [
+              0.6534598601976183,
+              0.9359665239142201
+            ],
+            "failures": {
+              "success": 21,
+              "not_in_bin": 4
+            }
+          },
+          "put the red cube in the right bin": {
+            "k": 20,
+            "n": 25,
+            "rate": 0.8,
+            "ci95": [
+              0.6086866446346177,
+              0.9113954589934752
+            ],
+            "failures": {
+              "not_in_bin": 5,
+              "success": 20
+            }
+          },
+          "put the blue cube in the left bin": {
+            "k": 25,
+            "n": 25,
+            "rate": 1.0,
+            "ci95": [
+              0.8668035060468213,
+              1.0
+            ],
+            "failures": {
+              "success": 25
+            }
+          },
+          "put the blue cube in the right bin": {
+            "k": 20,
+            "n": 25,
+            "rate": 0.8,
+            "ci95": [
+              0.6086866446346177,
+              0.9113954589934752
+            ],
+            "failures": {
+              "success": 20,
+              "not_in_bin": 5
+            }
+          }
+        },
+        "all": {
+          "k": 86,
+          "n": 100,
+          "rate": 0.86,
+          "ci95": [
+            0.7786263961619276,
+            0.914737342455351
+          ],
+          "failures": {
+            "success": 86,
+            "not_in_bin": 14
+          }
+        },
+        "infer_ms": {
+          "p50": 7.4705868028104305,
+          "p95": 12.588377110660067
+        },
+        "seconds": 15.4
+      },
+      {
+        "backend": "intref",
+        "ckpt": "/nethome-instruction/pi34/robotfpga-work/runs/final-v3r2/qat/export",
+        "stage": "C",
+        "latency_ms": 67.0,
+        "per_instr": {
+          "put the red cube in the left bin": {
+            "k": 21,
+            "n": 25,
+            "rate": 0.84,
+            "ci95": [
+              0.6534598601976183,
+              0.9359665239142201
+            ],
+            "failures": {
+              "success": 21,
+              "not_in_bin": 4
+            }
+          },
+          "put the red cube in the right bin": {
+            "k": 19,
+            "n": 25,
+            "rate": 0.76,
+            "ci95": [
+              0.5656994004476144,
+              0.8850384226967327
+            ],
+            "failures": {
+              "success": 19,
+              "not_in_bin": 6
+            }
+          },
+          "put the blue cube in the left bin": {
+            "k": 23,
+            "n": 25,
+            "rate": 0.92,
+            "ci95": [
+              0.7503348787704218,
+              0.977780066308908
+            ],
+            "failures": {
+              "success": 23,
+              "not_in_bin": 2
+            }
+          },
+          "put the blue cube in the right bin": {
+            "k": 20,
+            "n": 25,
+            "rate": 0.8,
+            "ci95": [
+              0.6086866446346177,
+              0.9113954589934752
+            ],
+            "failures": {
+              "success": 20,
+              "not_in_bin": 5
+            }
+          }
+        },
+        "all": {
+          "k": 83,
+          "n": 100,
+          "rate": 0.83,
+          "ci95": [
+            0.7445181876635703,
+            0.8910652394022684
+          ],
+          "failures": {
+            "success": 83,
+            "not_in_bin": 17
+          }
+        },
+        "infer_ms": {
+          "p50": 7.498745806515217,
+          "p95": 12.134095327928664
+        },
+        "seconds": 16.2
+      },
+      {
+        "backend": "intref",
+        "ckpt": "/nethome-instruction/pi34/robotfpga-work/runs/final-v3r2/qat/export",
+        "stage": "C",
+        "latency_ms": 100.0,
+        "per_instr": {
+          "put the red cube in the left bin": {
+            "k": 21,
+            "n": 25,
+            "rate": 0.84,
+            "ci95": [
+              0.6534598601976183,
+              0.9359665239142201
+            ],
+            "failures": {
+              "success": 21,
+              "not_in_bin": 4
+            }
+          },
+          "put the red cube in the right bin": {
+            "k": 19,
+            "n": 25,
+            "rate": 0.76,
+            "ci95": [
+              0.5656994004476144,
+              0.8850384226967327
+            ],
+            "failures": {
+              "success": 19,
+              "not_in_bin": 6
+            }
+          },
+          "put the blue cube in the left bin": {
+            "k": 23,
+            "n": 25,
+            "rate": 0.92,
+            "ci95": [
+              0.7503348787704218,
+              0.977780066308908
+            ],
+            "failures": {
+              "success": 23,
+              "not_in_bin": 2
+            }
+          },
+          "put the blue cube in the right bin": {
+            "k": 21,
+            "n": 25,
+            "rate": 0.84,
+            "ci95": [
+              0.6534598601976183,
+              0.9359665239142201
+            ],
+            "failures": {
+              "success": 21,
+              "not_in_bin": 4
+            }
+          }
+        },
+        "all": {
+          "k": 84,
+          "n": 100,
+          "rate": 0.84,
+          "ci95": [
+            0.7557955544110557,
+            0.8990479765052628
+          ],
+          "failures": {
+            "success": 84,
+            "not_in_bin": 16
+          }
+        },
+        "infer_ms": {
+          "p50": 7.496368372812867,
+          "p95": 12.19462065491824
+        },
+        "seconds": 16.4
+      },
+      {
+        "backend": "intref",
+        "ckpt": "/nethome-instruction/pi34/robotfpga-work/runs/final-v3r2/qat/export",
+        "stage": "C",
+        "latency_ms": 133.0,
+        "per_instr": {
+          "put the red cube in the left bin": {
+            "k": 20,
+            "n": 25,
+            "rate": 0.8,
+            "ci95": [
+              0.6086866446346177,
+              0.9113954589934752
+            ],
+            "failures": {
+              "success": 20,
+              "not_in_bin": 5
+            }
+          },
+          "put the red cube in the right bin": {
+            "k": 19,
+            "n": 25,
+            "rate": 0.76,
+            "ci95": [
+              0.5656994004476144,
+              0.8850384226967327
+            ],
+            "failures": {
+              "success": 19,
+              "not_in_bin": 6
+            }
+          },
+          "put the blue cube in the left bin": {
+            "k": 19,
+            "n": 25,
+            "rate": 0.76,
+            "ci95": [
+              0.5656994004476144,
+              0.8850384226967327
+            ],
+            "failures": {
+              "not_in_bin": 5,
+              "success": 19,
+              "still_holding": 1
+            }
+          },
+          "put the blue cube in the right bin": {
+            "k": 20,
+            "n": 25,
+            "rate": 0.8,
+            "ci95": [
+              0.6086866446346177,
+              0.9113954589934752
+            ],
+            "failures": {
+              "success": 20,
+              "not_in_bin": 5
+            }
+          }
+        },
+        "all": {
+          "k": 78,
+          "n": 100,
+          "rate": 0.78,
+          "ci95": [
+            0.6892946528499969,
+            0.849988254963442
+          ],
+          "failures": {
+            "success": 78,
+            "not_in_bin": 21,
+            "still_holding": 1
+          }
+        },
+        "infer_ms": {
+          "p50": 7.645965088158846,
+          "p95": 12.013435503467916
+        },
+        "seconds": 15.7
+      },
+      {
+        "backend": "intref",
+        "ckpt": "/nethome-instruction/pi34/robotfpga-work/runs/final-v3r2/qat/export",
+        "stage": "C",
+        "latency_ms": 200.0,
+        "per_instr": {
+          "put the red cube in the left bin": {
+            "k": 15,
+            "n": 25,
+            "rate": 0.6,
+            "ci95": [
+              0.40739127785127344,
+              0.7659694233580909
+            ],
+            "failures": {
+              "success": 15,
+              "not_in_bin": 10
+            }
+          },
+          "put the red cube in the right bin": {
+            "k": 17,
+            "n": 25,
+            "rate": 0.68,
+            "ci95": [
+              0.48409913734576715,
+              0.8279501248310887
+            ],
+            "failures": {
+              "success": 17,
+              "not_in_bin": 8
+            }
+          },
+          "put the blue cube in the left bin": {
+            "k": 15,
+            "n": 25,
+            "rate": 0.6,
+            "ci95": [
+              0.40739127785127344,
+              0.7659694233580909
+            ],
+            "failures": {
+              "not_in_bin": 10,
+              "success": 15
+            }
+          },
+          "put the blue cube in the right bin": {
+            "k": 17,
+            "n": 25,
+            "rate": 0.68,
+            "ci95": [
+              0.48409913734576715,
+              0.8279501248310887
+            ],
+            "failures": {
+              "not_in_bin": 8,
+              "success": 17
+            }
+          }
+        },
+        "all": {
+          "k": 64,
+          "n": 100,
+          "rate": 0.64,
+          "ci95": [
+            0.542352199811621,
+            0.7272892540950986
+          ],
+          "failures": {
+            "success": 64,
+            "not_in_bin": 36
+          }
+        },
+        "infer_ms": {
+          "p50": 7.574387593194842,
+          "p95": 11.855494091287252
+        },
+        "seconds": 19.2
+      },
+      {
+        "backend": "intref",
+        "ckpt": "/nethome-instruction/pi34/robotfpga-work/runs/final-v3r2/qat/export",
+        "stage": "C",
+        "latency_ms": 300.0,
+        "per_instr": {
+          "put the red cube in the left bin": {
+            "k": 17,
+            "n": 25,
+            "rate": 0.68,
+            "ci95": [
+              0.48409913734576715,
+              0.8279501248310887
+            ],
+            "failures": {
+              "success": 17,
+              "not_in_bin": 8
+            }
+          },
+          "put the red cube in the right bin": {
+            "k": 14,
+            "n": 25,
+            "rate": 0.56,
+            "ci95": [
+              0.37067017019564436,
+              0.7333462505299744
+            ],
+            "failures": {
+              "success": 14,
+              "not_in_bin": 11
+            }
+          },
+          "put the blue cube in the left bin": {
+            "k": 16,
+            "n": 25,
+            "rate": 0.64,
+            "ci95": [
+              0.44518154601046633,
+              0.7975234356826436
+            ],
+            "failures": {
+              "not_in_bin": 9,
+              "success": 16
+            }
+          },
+          "put the blue cube in the right bin": {
+            "k": 19,
+            "n": 25,
+            "rate": 0.76,
+            "ci95": [
+              0.5656994004476144,
+              0.8850384226967327
+            ],
+            "failures": {
+              "success": 19,
+              "not_in_bin": 5,
+              "still_holding": 1
+            }
+          }
+        },
+        "all": {
+          "k": 66,
+          "n": 100,
+          "rate": 0.66,
+          "ci95": [
+            0.5627754565831095,
+            0.74538620502457
+          ],
+          "failures": {
+            "success": 66,
+            "not_in_bin": 33,
+            "still_holding": 1
+          }
+        },
+        "infer_ms": {
+          "p50": 7.535116048529744,
+          "p95": 11.49534503929317
+        },
+        "seconds": 18.8
+      },
+      {
+        "backend": "intref",
+        "ckpt": "/nethome-instruction/pi34/robotfpga-work/runs/final-v3r2/qat/export",
+        "stage": "C",
+        "latency_ms": 500.0,
+        "per_instr": {
+          "put the red cube in the left bin": {
+            "k": 14,
+            "n": 25,
+            "rate": 0.56,
+            "ci95": [
+              0.37067017019564436,
+              0.7333462505299744
+            ],
+            "failures": {
+              "success": 14,
+              "not_in_bin": 10,
+              "still_holding": 1
+            }
+          },
+          "put the red cube in the right bin": {
+            "k": 12,
+            "n": 25,
+            "rate": 0.48,
+            "ci95": [
+              0.30031003928960015,
+              0.6650178204685269
+            ],
+            "failures": {
+              "success": 12,
+              "not_in_bin": 12,
+              "still_holding": 1
+            }
+          },
+          "put the blue cube in the left bin": {
+            "k": 14,
+            "n": 25,
+            "rate": 0.56,
+            "ci95": [
+              0.37067017019564436,
+              0.7333462505299744
+            ],
+            "failures": {
+              "success": 14,
+              "still_holding": 2,
+              "not_in_bin": 9
+            }
+          },
+          "put the blue cube in the right bin": {
+            "k": 11,
+            "n": 25,
+            "rate": 0.44,
+            "ci95": [
+              0.2666537494700256,
+              0.6293298298043557
+            ],
+            "failures": {
+              "not_in_bin": 12,
+              "still_holding": 2,
+              "success": 11
+            }
+          }
+        },
+        "all": {
+          "k": 51,
+          "n": 100,
+          "rate": 0.51,
+          "ci95": [
+            0.4134784047743415,
+            0.6057816990761385
+          ],
+          "failures": {
+            "success": 51,
+            "not_in_bin": 43,
+            "still_holding": 6
+          }
+        },
+        "infer_ms": {
+          "p50": 9.223479311913252,
+          "p95": 11.939839157275859
+        },
+        "seconds": 21.3
+      }
+    ]
+  }
+}
