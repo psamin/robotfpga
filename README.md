@@ -22,6 +22,8 @@ Standalone RTL preparation is verified and pushed for review:
   both K26 tops passed with the clock constraint applied before synthesis.
 - [Testbench fault detection, PR #68](https://github.com/psamin/robotfpga/pull/68):
   clean baselines passed; all four injected arithmetic/control faults were caught.
+- [Rounding and saturation, PR #70](https://github.com/psamin/robotfpga/pull/70):
+  261,663 XSim checks passed; combinational K26 synthesis passed.
 
 These PRs are awaiting review/merge. These results establish standalone
 behavior and synthesis, not placed/routed timing or execution on the board.

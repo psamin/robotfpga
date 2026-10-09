@@ -31,6 +31,7 @@ host and are documented in the corresponding PRs.
 | Independent MAC lanes | [#61](https://github.com/psamin/robotfpga/issues/61) / [PR #62](https://github.com/psamin/robotfpga/pull/62) | 3,278,586 lane checks for 1/3/8 lanes; 8-lane synthesis: 745 LUTs, 256 registers, 0 DSPs | Open, stacked on #60 |
 | Reproducible synthesis | [#65](https://github.com/psamin/robotfpga/issues/65) / [PR #66](https://github.com/psamin/robotfpga/pull/66) | Both tops passed at 10 ns with reports/checkpoints; invalid top/lane/period rejected | Open, stacked on #62 |
 | Testbench fault detection | [#67](https://github.com/psamin/robotfpga/issues/67) / [PR #68](https://github.com/psamin/robotfpga/pull/68) | Clean baselines passed; four valid RTL mutants failed explicit scoreboard checks | Open, stacked on #66 |
+| Standalone requantization | [#69](https://github.com/psamin/robotfpga/issues/69) / [PR #70](https://github.com/psamin/robotfpga/pull/70) | 261,663 XSim checks; synthesis: 154 LUTs, zero registers/latches/DSPs | Open, independent from main |
 
 The array change also reran the original MAC test: 338,736 checks passed.
 Simulation includes signed boundaries, reset/clear priority, enabled
@@ -39,6 +40,13 @@ Array tests verify lane isolation and non-default lane counts.
 The fault harness detected zero extension, clear/enable priority inversion,
 ignored enable and shared lane enables. Each mutant compiled/elaborated;
 tool errors were not treated as detection. Production RTL was untouched.
+Requantization tests cover shifts 1..30, both clipping modes, negative ties,
+clamp transitions, INT32 extrema, invalid shifts and 100,000 random inputs.
+The independent division/floor oracle follows the inspected integer reference;
+direct NumPy execution and whole-network golden comparisons remain pending.
+Rounding uses a 33-bit intermediate, without changing the network's separate
+accumulator-domain checks. Parent timing constraints are required for this
+combinational block; no layer or board interface has been added.
 
 Timing reports are preliminary: the original scratch runs applied clocks
 after synthesis. The tracked runner in #66 now reads clocks before synthesis
@@ -50,7 +58,7 @@ measurement is established by these results. DSP mapping was not forced.
 ## Ownership and next steps
 
 The friend handles current card/board setup; no completion is assumed.
-This FPGA workstream owns issues #59/#61/#63/#65/#67, assigned to Dhyey234.
+This FPGA workstream owns issues #59/#61/#63/#65/#67/#69, assigned to Dhyey234.
 Existing reference, vectors, HLS and board-runner work retains its issue
 owners. Do not duplicate it or change shared formats without joint review.
 
@@ -61,6 +69,7 @@ owners. Do not duplicate it or change shared formats without joint review.
    concise evidence and repeat after reboot. Only then advance M1.
 4. Review/merge #60 before #62, then #66 and #68; retarget each dependent PR to
    main after its base lands. A merge requires approval; issues close on merge.
+   Requantization #70 is independently reviewable against main.
 
 Maintain this page and the root README in the same PR when new confirmed
 status or verification changes their meaning. Record dates, issue/PR links,
