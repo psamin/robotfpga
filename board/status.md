@@ -4,6 +4,18 @@ Updated October 9, 2026 (America/New_York). Documentation issue
 [#63](https://github.com/psamin/robotfpga/issues/63).
 This is the current FPGA status; dated audits remain historical snapshots.
 
+Remote main advanced to `014718f`: software training/QAT/evaluation, v3r2
+handoff and #82 are merged. Fresh main preparation produced 262 pinned files.
+[Bundle integrity, PR #86](https://github.com/psamin/robotfpga/pull/86), issue #85,
+adds a verifier (263-file bundle): all hashes and 100 reference outputs/40
+layer dumps passed; five negative/positive integrity tests passed.
+
+User reports the working arm is USB-connected to another control computer,
+with the KR260 connected to that computer by Ethernet. Proposed deployment:
+keep camera/USB motor control on that computer, send observations to a KR260
+inference service and return action chunks. The real controller command/model
+is not identified yet; TCP/backend integration and board overlay remain pending.
+
 [Friend handoff, PR #82](https://github.com/psamin/robotfpga/pull/82): clone
 `board/81-fpga-handoff` and run `python3 board/demo/prepare_handoff.py`.
 A fresh single-branch clone gathered 262 pinned files; all 100 trained outputs
@@ -142,7 +154,7 @@ measurement is established by these results. DSP mapping was not forced.
 ## Ownership and next steps
 
 The friend handles current card/board setup; no completion is assumed.
-This FPGA workstream owns issues #59/#61/#63/#65/#67/#69/#71/#74/#76/#78/#81/#83, assigned to Dhyey234.
+This FPGA workstream owns issues #59/#61/#63/#65/#67/#69/#71/#74/#76/#78/#81/#83/#85, assigned to Dhyey234.
 Existing reference, vectors, HLS and board-runner work retains its issue
 owners. Do not duplicate it or change shared formats without joint review.
 With owner coordination confirmed, #11 also assigns Dhyey234; its original
