@@ -19,6 +19,26 @@ baseline, not a claim about the image currently being written. The existing
 [inventory collector, PR #20](https://github.com/psamin/robotfpga/pull/20),
 is the starting point once Linux access is established.
 
+## Initial arm demo requirements (reported October 9)
+
+- The first demo must use FPGA inference; CPU inference is not the requested fallback.
+- User reports SmolVLA training on a GPU, with model readiness estimated in
+  about 90 minutes at the time of the report. This is not a delivery guarantee.
+- Which model will be supplied for the FPGA is unconfirmed. The existing
+  accelerator implements the small INT8 convolution/FC policy. Build-spec
+  section 9 excludes running SmolVLA on the FPGA in the current project scope.
+- Ubuntu is expected from the setup owner; PYNQ, SSH and a working overlay
+  remain uncertain. The real arm model and motor-controller availability
+  have not been identified.
+- Software owner psamin is tracking a tiny-policy weights/vector release
+  under [issue #73](https://github.com/psamin/robotfpga/issues/73). Its publication
+  and suitability for the requested demo have not been verified here.
+
+Confirm the intended model and physical arm/controller before preparing
+deployment or issuing motor commands. GPU training does not produce the
+FPGA bitstream; HLS export, Vivado integration, board acceptance and golden
+output checks remain necessary under the existing owners and milestone gates.
+
 ## Executed host verification
 
 Vivado/XSim 2022.2, build 3671981. Target for standalone out-of-context

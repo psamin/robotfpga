@@ -7,6 +7,13 @@ is preparing its Ubuntu microSD card. First boot and the installed image
 version have not been confirmed; M0 hardware acceptance has not run.
 M1 remains gated on M0 acceptance on the actual board.
 
+Initial demo requirement: **FPGA inference**, not a CPU fallback. The user
+reports SmolVLA training on a GPU; the intended FPGA model handoff still needs
+confirmation. The current accelerator targets the small INT8 policy, not a
+SmolVLA checkpoint. Ubuntu is expected from the setup owner; PYNQ, SSH and
+the accelerator overlay are unconfirmed. The physical arm/controller must
+also be identified before an end-to-end arm demo can be prepared.
+
 See [current FPGA status](board/status.md) for owners, verification evidence,
 open review links and next steps. Existing M0 preparation is tracked in
 [PR #18](https://github.com/psamin/robotfpga/pull/18) (runbook/version pins)
