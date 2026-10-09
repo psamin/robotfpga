@@ -1,0 +1,110 @@
+{
+  "time": "2026-10-02T07:35:04-0400",
+  "git": "32d24bdc7c5e29f30d9e115faaff5aaa69c14b74",
+  "seed": 1000000,
+  "config": {
+    "backend": "intref",
+    "ckpt": [
+      "/nethome-instruction/pi34/robotfpga-work/runs/final-v3r2/qat/export"
+    ],
+    "stage": "B",
+    "episodes": 50,
+    "latency_ms": [
+      0.0
+    ],
+    "workers": 64,
+    "out": "/nethome-instruction/pi34/robotfpga-work/runs/final-v3r2/eval_int8_B.json"
+  },
+  "versions": {
+    "python": "3.12.14",
+    "platform": "Linux-5.14.0-687.38.1.el9_8.x86_64-x86_64-with-glibc2.34",
+    "armlab": "0.1.0",
+    "mujoco": "3.14.0",
+    "numpy": "2.2.6",
+    "torch": "2.11.0"
+  },
+  "results": {
+    "evals": [
+      {
+        "backend": "intref",
+        "ckpt": "/nethome-instruction/pi34/robotfpga-work/runs/final-v3r2/qat/export",
+        "stage": "B",
+        "latency_ms": 0.0,
+        "per_instr": {
+          "put the red cube in the left bin": {
+            "k": 47,
+            "n": 50,
+            "rate": 0.94,
+            "ci95": [
+              0.8378265662912299,
+              0.9793854036353695
+            ],
+            "failures": {
+              "success": 47,
+              "not_in_bin": 3
+            }
+          },
+          "put the red cube in the right bin": {
+            "k": 47,
+            "n": 50,
+            "rate": 0.94,
+            "ci95": [
+              0.8378265662912299,
+              0.9793854036353695
+            ],
+            "failures": {
+              "success": 47,
+              "not_in_bin": 3
+            }
+          },
+          "put the blue cube in the left bin": {
+            "k": 41,
+            "n": 50,
+            "rate": 0.82,
+            "ci95": [
+              0.6920368054529739,
+              0.902299172675462
+            ],
+            "failures": {
+              "success": 41,
+              "not_in_bin": 9
+            }
+          },
+          "put the blue cube in the right bin": {
+            "k": 47,
+            "n": 50,
+            "rate": 0.94,
+            "ci95": [
+              0.8378265662912299,
+              0.9793854036353695
+            ],
+            "failures": {
+              "success": 47,
+              "not_in_bin": 2,
+              "still_holding": 1
+            }
+          }
+        },
+        "all": {
+          "k": 182,
+          "n": 200,
+          "rate": 0.91,
+          "ci95": [
+            0.8622332538615105,
+            0.9423130212854665
+          ],
+          "failures": {
+            "success": 182,
+            "not_in_bin": 17,
+            "still_holding": 1
+          }
+        },
+        "infer_ms": {
+          "p50": 7.577252574265003,
+          "p95": 12.70496237557381
+        },
+        "seconds": 15.9
+      }
+    ]
+  }
+}
