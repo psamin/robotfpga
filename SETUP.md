@@ -5,6 +5,8 @@ the policy, the training pipeline, the FPGA build and the board. Every number co
 `main` (the source is named next to it). Anything not built or not measured is marked **NOT BUILT**
 or **UNKNOWN**; do not fill those in by guessing. Open questions live in [QUESTIONS.md](QUESTIONS.md).
 
+Board results added from the board owner's measurements ([#87 board results](https://github.com/psamin/robotfpga/issues/87#issuecomment-6075687430)).
+
 Last verified on 2026-10-09 against:
 - `main`;
 - the local LeRobot calibration files;
@@ -21,10 +23,12 @@ Last verified on 2026-10-09 against:
 | Trained int8 policy (v3r2) | **BUILT** — sim Stage B 91%, Stage C 90% | [handoff/v3r2/README.md](handoff/v3r2/README.md) |
 | Bit-exact int8 reference | **BUILT** | `ref/intref.py` |
 | HLS kernel C model vs golden vectors | **PASS 100/100** | `handoff/v3r2/results/hls_csim.txt` |
-| HLS IP synthesized for the KR260 | **UNKNOWN** (not reported) | QUESTIONS.md Q3 |
-| Board overlay `policy.bit` + `policy.hwh` | **NOT BUILT** | [board/demo/README.md](board/demo/README.md) §3 |
-| KR260 booted with Ubuntu + PYNQ | **UNKNOWN** | QUESTIONS.md Q1, Q2 |
-| Laptop ↔ board network bridge | **NOT BUILT** (contract only) | §7 |
+| Board overlay, layer-engine design (athithan) | **BUILT and passing on hardware**: `policy.bit` + `policy.hwh`, timing met (WNS +2.371 ns). Source not in git yet (#98) | [#87 board results](https://github.com/psamin/robotfpga/issues/87#issuecomment-6075687430), #98 |
+| Board overlay, 8-channel DMA design (#82 runbook) | **NOT BUILT** | [board/demo/README.md](board/demo/README.md) §3 |
+| KR260 booted with Ubuntu + PYNQ | **BUILT**: Ubuntu 22.04.4, PYNQ 3.0.1. M0 passed; M4 passed (100/100 golden vectors, 8.03 ms) | [#87 board results](https://github.com/psamin/robotfpga/issues/87#issuecomment-6075687430) |
+| Laptop ↔ board network bridge | **Board side BUILT** (TCP service, port 5555; 100/100 over Ethernet, 8.8 ms round trip). Laptop client exists outside git; `armlab` `remote_backend.py` not in repo yet (Q4) | §7 |
+| FPGA in the sim loop | **Run:** Stage B 37/40 = 92.5% (CI 0.80–0.97) with the FPGA computing every action | [#87 board results](https://github.com/psamin/robotfpga/issues/87#issuecomment-6075687430) |
+| Real camera + arm state → FPGA | **Run with torque off:** 28 Hz, round trip p50 8.9 ms. Actions logged, arm not moved | [#87 board results](https://github.com/psamin/robotfpga/issues/87#issuecomment-6075687430) |
 | Real SO-101 follower + leader arms | **BUILT: connected and calibrated** with LeRobot (`my_follower`, `my_leader`) | §2.1 |
 | Real cameras | **BUILT:** front Logitech C920 (top view) + wrist camera. **Not** matched to the sim camera | §2.2, §3.4 |
 | Real-arm controller | **BUILT, separate repo:** teleop, recording and rollout in [psamin/roboticsexp `so101/`](https://github.com/psamin/roboticsexp/tree/4d8baf3eba82a4cd5ff067e4a09f47e95f7c05e7/so101). Drives SmolVLA, **not** TinyPolicy or the FPGA | §2.3 |
@@ -40,10 +44,10 @@ Last verified on 2026-10-09 against:
 |---|---|---|
 | Robot arm | SO-101 (TheRobotStudio / LeRobot), 5 arm joints + 1 gripper joint, Feetech STS3215 servos | Owned by psamin; **not connected** |
 | Leader (teleop) arm | SO-101 leader, LeRobot id `my_leader` | **Connected and calibrated** |
-| FPGA board | AMD Kria **KR260** Robotics Starter Kit (K26 SOM, part `xck26-sfvc784-2LV-c`) | **Boot status UNKNOWN** (Q1) |
+| FPGA board | AMD Kria **KR260** Robotics Starter Kit (K26 SOM, part `xck26-sfvc784-2LV-c`) | **Booted, overlay passing** (§8.4) |
 | Cameras | `wrist`: IMX307 module in a 3D-printed mount (`hardware/so101/wrist_camera_mount_IMX307_38mm.stl`); `front`: Logitech C920 looking down from above the table, 640×480 @ 30 fps; `wrist`: on the gripper, 480×640 @ 30 fps (rotated 90°) | **Mounted and used for recording**; front pose not measured |
-| FPGA workstation | Linux or Windows PC with AMD Vivado/Vitis HLS **2022.2** (does not run on macOS) | A teammate's PC has the tools (reported by psamin) |
-| Controller computer | psamin's MacBook (macOS, Apple M3 Pro) runs the real-arm loop over USB serial today | Used by `roboticsexp`; the Ethernet link to the board is not built |
+| FPGA workstation | Windows 11 laptop (board owner) with AMD Vivado / Vitis HLS **2022.2** (the tools do not run on macOS) | Builds the layer-engine overlay |
+| Controller computer | Two setups. (1) psamin's MacBook (macOS, M3 Pro): the `roboticsexp` SmolVLA stack. (2) The board owner's Windows 11 laptop: follower on COM3, leader on COM5, C920 + wrist camera, Ethernet to the KR260 | (2) is the FPGA path; the calibration from #95 is installed there and matches both arms' servo EEPROM exactly |
 | Training compute | GT Futurama cluster (Slurm, `general` partition, L4/L40 nodes); RunPod H100 available | Used for all training so far |
 
 ### 2.1 Arm calibration (LeRobot)
@@ -379,15 +383,23 @@ fix (longer QAT) is **not done**.
 
 ---
 
-## 7. Laptop ↔ board bridge: NOT BUILT
+## 7. Laptop ↔ board bridge: board side BUILT, laptop side outside git
 
-The only thing defined is the contract in [plans/build-spec.md](plans/build-spec.md) §5.6:
+Measured on hardware ([#87 board results](https://github.com/psamin/robotfpga/issues/87#issuecomment-6075687430)):
 
-- **Laptop → board:** the 27,658-byte input packet (§4.2).
-- **Board → laptop:** 48 int8 action bytes + one float32 latency.
-- **Transport:** TCP over Ethernet.
+- **Contract:** [plans/build-spec.md](plans/build-spec.md) §5.6, implemented exactly.
+  - Request: the 27,658-byte packet (§4.2).
+  - Reply: 52 bytes = 48 int8 actions + the FPGA time as a **little-endian float32** in ms.
+- **Board service:** TCP port **5555**, `TCP_NODELAY`. It's threaded, with the FPGA behind a lock,
+  and it refuses to serve unless the golden vectors pass at start-up. Not yet a systemd service.
+- **Network:** KR260 Ethernet port J10D → controller laptop Ethernet. The laptop shares its Wi-Fi
+  (Windows ICS). Board IP `192.168.137.35`, on that private link only; SSH user `ubuntu`.
+- **Measured:** 100/100 vectors over TCP, round trip p50 8.8 ms.
+- **Laptop client:** athithan's `PolicyBackend` client exists (`reset/infer/stats`, one reconnect,
+  then raise) but is **not in git**. Plan per Q4: it lands in `armlab/backends/remote_backend.py`.
 
-**Not specified:** framing, port, byte order of the float32, error codes, timeouts and reconnection.
+**Not specified yet:** timeouts beyond the one reconnect, and behavior when the board is unreachable
+mid-episode. The controller must hold position in that case (§4.4).
 Proposed ownership (QUESTIONS.md Q4, **not agreed**):
 - Software builds `remote_backend.py` (laptop) and the SO-101 controller.
 - FPGA builds the board inference service (wrapping `PolicyAccel` in `board/run_policy.py`) and the
@@ -464,21 +476,42 @@ Register map (generated by HLS):
 
 ### 8.4 Board (KR260)
 
+**As built**, all measured on 2026-10-08/09 ([#87 board results](https://github.com/psamin/robotfpga/issues/87#issuecomment-6075687430)):
+
+| Item | Value |
+|---|---|
+| OS | Ubuntu 22.04.4 for Kria (flashed with Raspberry Pi Imager); kernel `5.15.0-1027-xilinx-zynqmp`, aarch64 |
+| Python / PYNQ | Python 3.10.12; Kria-PYNQ via `sudo bash install.sh -b KR260`, `pynq 3.0.1`; JupyterLab on port 9090 |
+| Overlay | **Layer engine**: one shared conv/FC engine driven by a layer table, 16 int8 MACs per clock, all weights in UltraRAM (loaded once), activations ping-pong in BRAM. `m_axi` 128-bit to DDR via `S_AXI_HP0_FPD`, `s_axilite` control, **no AXI DMA**. Weights and shifts are runtime data, so a new `weights.bin` needs **no rebuild** |
+| Build | Vitis HLS + Vivado 2022.2, 100 MHz `pl_clk0`, scripted end to end. HLS: C sim passed, every loop II = 1. Vivado: WNS +2.371 ns |
+| Utilization | LUT 7,176 (6.1%), FF 8,073 (3.4%), DSP 21 (1.7%), BRAM 34.5/144 (24%), URAM 20/64 (31%) |
+| Overlay load | 1.5 s |
+| M4 | **100/100** v3r2 golden vectors byte-for-byte; 20/20 fresh random observations identical to `ref/intref.py` |
+| Latency | FPGA **p50 8.03 ms**, p95 8.06 ms (Python call incl. buffer copies, 124 inferences/s). Board ARM A53 running `intref` numpy: 70.8 ms. Laptop CPU float torch: 0.67 ms |
+| Source | On the board owner's laptop; being brought into `hls/engine/` and `board/engine/` (#98) |
+
+**Windows checkouts:** with `core.autocrlf=true` (the Git for Windows default), `.bin` vectors can
+be corrupted. One `_out.bin` became 51 bytes, which showed up as a false 99/100. Until
+`.gitattributes` lands (#99), clone with `git -c core.autocrlf=false clone …` or use
+`board/demo/prepare_handoff.py`, which copies raw bytes.
+
+The bring-up steps below are for the #82 DMA design, which is still **not built**.
+
 - **Expected software:** Ubuntu 22.04 for Kria and Kria-PYNQ (`sudo bash install.sh -b KR260`).
-  Actual versions on the board are **UNKNOWN** (Q1).
 - **Bring-up order:**
   - M0: boot plus version inventory (`board/m0/`).
   - M1: DMA loopback with `board/loopback.py`. Record its p50 time as the latency floor.
   - M4: `timeout 300s python3 -u board/run_policy.py policy.bit artifacts/standin`. Acceptance
     requires **100 vectors, 0 failures**. The script can exit 0 after mismatches, so read its output.
-- M0, M1 and M4 results: **none reported** (Q2).
-- The board's IP address and SSH user are **UNKNOWN**. Never put passwords or keys in the repo.
+- Layer-engine results: M0 passed, M1 not applicable (no DMA in that design), M4 passed (above).
+- Never put passwords or keys in the repo.
 
 ---
 
 ## 9. What has to happen, in order, to run the real arm
 
-1. **Board:** M0 → M1 → overlay (§8.3) → M4: 100/100 golden vectors on the KR260. *(FPGA side)*
+1. **Board: DONE** for the layer-engine design: M4 100/100 on the KR260, 8.03 ms. Remaining:
+   bring its source into git (#98) and run the service as a systemd unit. *(FPGA side)*
 2. **Joint mapping:** the arm is already calibrated (§2.1). Still to do: verify the
    LeRobot-degrees → sim-radians signs and offsets (§4.1, Q5). *(software)*
 3. **Scene:**
@@ -488,10 +521,11 @@ Register map (generated by HLS):
    *(software)*
 4. **Controller + safety:** add a TinyPolicy backend to the roboticsexp-style loop (or write
    `robot/so101.py` here), reusing its damping, step cap and glide-home (§4.4). *(software)*
-5. **Bridge:** agree the protocol details in §7, then build `remote_backend.py` and the board
-   service. *(both, Q4)*
-6. **First real run:** run the controller against the board with the arm powered off, logging actions,
-   before any powered run.
+5. **Bridge:** the board service is built. Land the laptop `remote_backend.py` in `armlab`,
+   starting from athithan's client (Q4). *(software)*
+6. **First real run:** already done once with torque off: C920 + follower state → FPGA, actions
+   logged at 28 Hz, 8.9 ms round trip. Next is a powered run with the safety layer (§4.4) and the
+   joint mapping (step 2) verified.
 7. Expect a gap between sim and real. The plan (build-spec Phase 9) is about 50 teleoperated episodes
    on the real cube task, recorded with the existing leader arm and `collect.sh`, and then a
    fine-tune.
