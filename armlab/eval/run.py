@@ -9,6 +9,7 @@ Held-out seeds start at 1,000,000 (training data uses seeds below 100,000).
 import argparse
 import collections
 import multiprocessing as mp
+import os
 import time
 
 import numpy as np
@@ -75,6 +76,8 @@ def evaluate(
     if stage == "A":
         items = [(EVAL_SEED0 + i, 0) for i in range(episodes)]
     jobs = [(backend, ckpt, stage, latency_ms, items[w::workers], max_steps) for w in range(workers)]
+    for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+        os.environ[var] = "1"
     t0 = time.perf_counter()
     with mp.get_context("spawn").Pool(workers) as pool:
         res = [r for rs in pool.map(_worker, jobs) for r in rs]
