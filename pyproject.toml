@@ -26,6 +26,7 @@ packages = ["armlab"]
 [tool.ruff]
 line-length = 110
 target-version = "py312"
+extend-exclude = ["ref", "hls", "board"]  # FPGA-side code keeps its own lint settings
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP"]

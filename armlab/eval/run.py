@@ -26,6 +26,12 @@ def make_backend(name: str, ckpt: str | None):
         from armlab.backends.torch_backend import TorchBackend
 
         return TorchBackend(ckpt)
+    if name in ("intref", "mock-fpga"):
+        from armlab.backends.intref_backend import IntrefBackend
+
+        b = IntrefBackend(ckpt)
+        b.name = name
+        return b
     raise ValueError(f"unknown backend {name}")
 
 
