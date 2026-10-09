@@ -41,14 +41,16 @@ Last verified on 2026-10-09 against:
 | Robot arm | SO-101 (TheRobotStudio / LeRobot), 5 arm joints + 1 gripper joint, Feetech STS3215 servos | Owned by psamin; **not connected** |
 | Leader (teleop) arm | SO-101 leader, LeRobot id `my_leader` | **Connected and calibrated** |
 | FPGA board | AMD Kria **KR260** Robotics Starter Kit (K26 SOM, part `xck26-sfvc784-2LV-c`) | **Boot status UNKNOWN** (Q1) |
-| Cameras | `front`: Logitech C920 looking down from above the table, 640×480 @ 30 fps; `wrist`: on the gripper, 480×640 @ 30 fps (rotated 90°) | **Mounted and used for recording**; front pose not measured |
+| Cameras | `wrist`: IMX307 module in a 3D-printed mount (`hardware/so101/wrist_camera_mount_IMX307_38mm.stl`); `front`: Logitech C920 looking down from above the table, 640×480 @ 30 fps; `wrist`: on the gripper, 480×640 @ 30 fps (rotated 90°) | **Mounted and used for recording**; front pose not measured |
 | FPGA workstation | Linux or Windows PC with AMD Vivado/Vitis HLS **2022.2** (does not run on macOS) | A teammate's PC has the tools (reported by psamin) |
 | Controller computer | psamin's MacBook (macOS, Apple M3 Pro) runs the real-arm loop over USB serial today | Used by `roboticsexp`; the Ethernet link to the board is not built |
 | Training compute | GT Futurama cluster (Slurm, `general` partition, L4/L40 nodes); RunPod H100 available | Used for all training so far |
 
 ### 2.1 Arm calibration (LeRobot)
 
-- **Files (local, not in git):**
+- **In this repo:** [hardware/so101/](hardware/so101/README.md) has copies of both calibration
+  files, `env.sh`, the presets and the wrist camera mount STL, with install instructions.
+- **Originals on psamin's Mac:**
   - follower: `~/.cache/huggingface/lerobot/calibration/robots/so_follower/my_follower.json`
   - leader: `~/.cache/huggingface/lerobot/calibration/teleoperators/so_leader/my_leader.json`
 - **Format:** one entry per joint (`shoulder_pan`, `shoulder_lift`, `elbow_flex`, `wrist_flex`,
