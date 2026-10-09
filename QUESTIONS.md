@@ -11,6 +11,8 @@ if you asked, answered, or changed something the other side needs to know.
 
 ## Current state (2026-10-09)
 
+Full setup reference: [SETUP.md](SETUP.md).
+
 | Area | State | Where |
 |---|---|---|
 | Trained policy | TinyPolicy int8 v3r2, sim only. Int8: Stage B 91%, Stage C 90%. Float: 100% / 98% | [handoff/v3r2/README.md](handoff/v3r2/README.md) |
@@ -18,7 +20,7 @@ if you asked, answered, or changed something the other side needs to know.
 | FPGA handoff | Weights + 100 golden vectors pass the HLS C model (100/100) | [README.md](README.md), [board/demo/README.md](board/demo/README.md) |
 | Bitstream | `policy.bit` / `policy.hwh` not built yet | — |
 | Board (KR260) | No board result reported yet | #87 |
-| Real SO-101 arm | Not connected or calibrated; no controller code yet | #87 |
+| Real SO-101 arm | Follower + leader connected and calibrated (LeRobot); working teleop/record/SmolVLA rollout stack in psamin/roboticsexp. TinyPolicy not wired to it | [SETUP.md](SETUP.md) §2 |
 | Laptop ↔ board bridge | Not implemented; only the spec contract (27,658 bytes in, 48 + float32 out) | [plans/build-spec.md](plans/build-spec.md) §5.6 |
 
 ## Open
@@ -29,7 +31,7 @@ if you asked, answered, or changed something the other side needs to know.
 | Q2 | Dhyey234 | Board owner | M0/M1 results and where their logs are | #87 |
 | Q3 | Dhyey234 | Board owner | Does a matching `policy.bit` / `policy.hwh` exist? Source revision, tool version, measured timing | #87 |
 | Q4 | Dhyey234, psamin | Both sides | Agree the bridge split. Proposed: software owns `remote_backend.py` and the SO-101 controller adapter; FPGA side owns the board inference service and overlay | #87 |
-| Q5 | psamin | Software (psamin) | Measure the mapping from LeRobot SO-101 calibration to the sim's joint radians (zero offsets, signs) | #87 |
+| Q5 | psamin | Software (psamin) | Verify LeRobot degrees → sim radians per joint (sign and zero offset; formula in SETUP.md §4.1) | [SETUP.md](SETUP.md) §4.1 |
 
 ## Answered
 
