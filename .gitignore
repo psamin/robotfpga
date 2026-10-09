@@ -6,3 +6,4 @@ artifacts/
 runs/
 datasets/
 *.mp4
+logs/
