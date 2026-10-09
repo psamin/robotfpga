@@ -1,0 +1,7 @@
+{
+  "P_GAIN": 16,
+  "I_GAIN": 0,
+  "D_GAIN": 32,
+  "SMOOTH_ALPHA": 0.7,
+  "MAX_STEP": 10
+}
