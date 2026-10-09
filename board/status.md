@@ -71,6 +71,12 @@ physical-arm or FPGA results. No new bitstream/controller was included.
 
 ## Executed host verification
 
+[Stream error/recovery tests, PR #84](https://github.com/psamin/robotfpga/pull/84),
+issue #83: real Vitis C simulation passed 100 trained vectors, seven error paths
+and seven valid recoveries. Bad mode, shifts 0/31 and malformed input/weight
+TLAST are checked; four malformed artifact fixtures failed promptly with exit 1.
+This changes the testbench only; no additional RTL or board acceptance is claimed.
+
 Vivado/XSim 2022.2, build 3671981. Target for standalone out-of-context
 synthesis: `xck26-sfvc784-2LV-c`. These results were executed on the Windows
 host and are documented in the corresponding PRs.
@@ -136,7 +142,7 @@ measurement is established by these results. DSP mapping was not forced.
 ## Ownership and next steps
 
 The friend handles current card/board setup; no completion is assumed.
-This FPGA workstream owns issues #59/#61/#63/#65/#67/#69/#71/#74/#76/#78/#81, assigned to Dhyey234.
+This FPGA workstream owns issues #59/#61/#63/#65/#67/#69/#71/#74/#76/#78/#81/#83, assigned to Dhyey234.
 Existing reference, vectors, HLS and board-runner work retains its issue
 owners. Do not duplicate it or change shared formats without joint review.
 With owner coordination confirmed, #11 also assigns Dhyey234; its original

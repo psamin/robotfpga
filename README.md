@@ -22,6 +22,8 @@ Trained-vector RTL smoke test passed: all 48 bytes matched in simulated 13.59 ms
 For the board setup owner: [pullable FPGA handoff, PR #82](https://github.com/psamin/robotfpga/pull/82).
 Clone `board/81-fpga-handoff`, then run `python3 board/demo/prepare_handoff.py`.
 Its runbook gathers pinned sources/artifacts and explains the still-missing board overlay.
+Further [stream verification, PR #84](https://github.com/psamin/robotfpga/pull/84):
+100 trained vectors, seven error paths and seven recoveries passed real Vitis C simulation.
 
 See [current FPGA status](board/status.md) for owners, verification evidence,
 open review links and next steps. Existing M0 preparation is tracked in
