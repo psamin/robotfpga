@@ -61,3 +61,45 @@ These are stand-in C-model checks, not trained-policy validation, RTL
 co-simulation, placed/routed timing, board measurements or motor control.
 The under-5-ms target includes transfers and software overhead; an HLS
 compute estimate alone cannot establish end-to-end acceptance.
+
+## RTL co-simulation smoke test
+
+After synthesis, create `artifacts/cosim-one/vectors/` and copy the original
+`manifest.json`, `weights.bin`, `vectors/000_in.bin` and `vectors/000_out.bin`
+there, preserving the vectors subdirectory. Leave the canonical 100-vector
+handoff untouched. This limits the existing testbench to one weight-load
+transaction and one inference; it is not full RTL vector coverage.
+
+Save this Tcl in `hls/build/` and run Vitis from that directory:
+
+```tcl
+unset -nocomplain env(DEBUG)
+set here [file dirname [file normalize [info script]]]
+cd $here
+open_project policy_hls
+open_solution sol1
+cosim_design -rtl verilog -tool xsim -argv [file normalize "$here/../../artifacts/cosim-one"]
+exit
+```
+
+The inherited Windows `DEBUG=release` environment variable initially caused
+the generated Makefile to pass `release` as a compiler input filename.
+Clearing it inside the tool process resolves compilation without altering
+installed tools or persistent system settings. Vitis may exit zero after an
+error: require a successful co-simulation report, not just an exit code.
+
+Executed October 9: XSim 2022.2 Verilog co-simulation **PASS**, one golden
+vector, zero failures. The test checked all 48 bytes, TLAST placement,
+successful status and stream consumption. Transactions in
+`hls/build/policy_hls/sol1/sim/verilog/policy_top.performance.result.transaction.xml`:
+
+| Transaction | Measured RTL cycles | At 100 MHz |
+|---|---:|---:|
+| Initial weight load | 569,580 | 5.696 ms |
+| One inference | 1,359,007 | 13.590 ms |
+
+The weight load is separate and parameters persist for subsequent inference.
+`hls/build/policy_hls/sol1/sim/report/policy_top_cosim.rpt` reports Verilog Pass.
+These are simulated accelerator transactions, without a real DMA, DDR,
+software scheduling, routed clock or trained weights. There is no latency
+distribution or full-vector RTL claim from this single-vector smoke test.
