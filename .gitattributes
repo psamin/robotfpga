@@ -1,0 +1,7 @@
+# Keep binary files byte-exact on every platform (#99). Without this, Git for Windows' default
+# core.autocrlf=true rewrote a 48-byte vectors/*_out.bin into 51 bytes.
+* text=auto
+*.bin binary
+*.pt binary
+*.stl binary
+*.bit binary
