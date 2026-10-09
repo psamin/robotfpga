@@ -82,8 +82,12 @@ the hard 33 ms ceiling in the baseline. Coordinated eight-channel optimization
 top estimate to 1,367,716 cycles (13.677 ms): all 100 final vectors and 40 layer
 dumps match, all reduction loops achieve II=1, and IP export completed.
 Estimated resources: 171 BRAM18, 24 URAM, 66 DSP, 8,918 FF and 38,649 LUT;
-period 5.953 ns. Still above 5 ms; trained vectors, RTL co-simulation,
-system resources, placement/routing and board latency remain unverified.
+period 5.953 ns. XSim Verilog co-simulation passed one stand-in vector:
+569,580 cycles for weight loading and 1,359,007 for inference (13.590 ms).
+All 48 bytes/TLAST matched. Process-local removal of inherited `DEBUG=release`
+fixed Vitis's generated compiler command; reproduction is documented in #79.
+Still above 5 ms; trained vectors, full RTL vector coverage, system resources,
+placement/routing and board latency remain unverified.
 
 The array change also reran the original MAC test: 338,736 checks passed.
 Simulation includes signed boundaries, reset/clear priority, enabled

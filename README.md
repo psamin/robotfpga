@@ -41,6 +41,7 @@ Standalone RTL preparation is verified and pushed for review:
   Vitis C simulation passed 100 stand-in vectors; synthesis/IP export completed.
   [Eight-channel optimization, PR #79](https://github.com/psamin/robotfpga/pull/79)
   reduces the 103 ms baseline estimate to 13.68 ms; vectors/layers match, IP exports.
+  One-vector Verilog co-simulation passed: 13.59 ms inference at simulated 100 MHz.
 
 These PRs are awaiting review/merge. These results establish standalone
 behavior and synthesis, not placed/routed timing or execution on the board.
