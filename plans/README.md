@@ -8,5 +8,6 @@
 | [references.md](references.md) | Verified literature notes; cite keys used across these docs |
 | [fpga-team-brief.md](fpga-team-brief.md) | The original brief given to the FPGA team (copied verbatim) |
 | [tiny-policy-log.md](tiny-policy-log.md) | Engineering log for the blog post: what was built, measured, and why |
+| [sgs-post-training.md](sgs-post-training.md) | SmolVLA post-training: PPO + SGS teacher, DAgger into SmolVLA, SO-101 transfer |
 
 New plans go in this folder as Markdown. Update a plan in the same PR that changes what it describes.

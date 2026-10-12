@@ -9,7 +9,7 @@ if you asked, answered, or changed something the other side needs to know.
 - Keep **Current state** short and true. Replace stale lines instead of appending.
 - Long discussions belong in an issue; link the issue here.
 
-## Current state (2026-10-09)
+## Current state (2026-10-12)
 
 Full setup reference: [SETUP.md](SETUP.md).
 
@@ -21,6 +21,7 @@ Full setup reference: [SETUP.md](SETUP.md).
 | Bitstream | Board owner's 16-lane layer engine: `policy.bit` / `policy.hwh` built (Vivado 2022.2, 100 MHz, WNS +2.371 ns), not in git yet (#98). #82's DMA design: not built | [#87](https://github.com/psamin/robotfpga/issues/87#issuecomment-6075687430), #98 |
 | Board (KR260) | Ubuntu 22.04.4 + PYNQ 3.0.1. **M4 passed:** v3r2 100/100 golden vectors on hardware, 8.03 ms p50 (ARM A53 numpy 70.8 ms). Sim Stage B with the FPGA in the loop: 37/40 | [#87](https://github.com/psamin/robotfpga/issues/87#issuecomment-6075687430), #15 |
 | Real SO-101 arm | Follower + leader connected and calibrated (LeRobot); working teleop/record/SmolVLA rollout stack in psamin/roboticsexp. TinyPolicy not wired to it | [SETUP.md](SETUP.md) §2 |
+| SmolVLA post-training | Owner m-alan08 (from psamin). Plan only: PPO + SGS teacher, DAgger into SmolVLA, zero-shot SO-101. Nothing trained yet | [#116](https://github.com/psamin/robotfpga/issues/116), [plans/sgs-post-training.md](plans/sgs-post-training.md) |
 | Laptop ↔ board bridge | Board TCP service (§5.6 contract, port 5555) and a laptop `PolicyBackend` client run outside git: 100/100 over Ethernet, 8.8 ms round trip. Ownership still Q4 | [#87](https://github.com/psamin/robotfpga/issues/87#issuecomment-6075687430) |
 
 ## Open
@@ -29,6 +30,8 @@ Full setup reference: [SETUP.md](SETUP.md).
 |---|---|---|---|---|
 | Q5 | psamin | Software (psamin) | Verify LeRobot degrees → sim radians per joint (sign and zero offset; formula in SETUP.md §4.1) | [SETUP.md](SETUP.md) §4.1 |
 | Q6 | athithan-elamaran1 | Software (psamin) | Train TinyPolicy-L, the largest network the FPGA holds on chip (1,812,528 params, 3.2× v3r2, ~26 ms)? Exact layer table, quantization rules and handoff steps in plans/fpga-capacity.md; adopting it changes the shared `LAYERS` contract, so ack in the issue first | [plans/fpga-capacity.md](plans/fpga-capacity.md) |
+| Q7 | m-alan08 | Software (psamin) | Which Futurama GPUs, CUDA version and job time limits can SmolVLA post-training jobs use? Unknown so far | [plans/sgs-post-training.md](plans/sgs-post-training.md) |
+| Q8 | m-alan08 | Software (psamin) | Can m-alan08 take Q5 (degrees ↔ radians), since SmolVLA sim-to-real depends on it? | [plans/sgs-post-training.md](plans/sgs-post-training.md) |
 
 ## Answered
 
