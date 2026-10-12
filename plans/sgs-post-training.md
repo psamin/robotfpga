@@ -85,6 +85,13 @@ matched to sim, and the front pose as unmeasured.
 4. Resolutions: front 640×480, wrist 480×640 (rotated 90°), both 30 fps.
 5. Add `front` and `wrist` cameras to the MJCF. Keep `overhead` untouched (TinyPolicy uses it).
 
+Tools: `armlab.calib.camera` (#141) does steps 1-2 and prints the MuJoCo `<camera>` line. Photo
+session checklist: print a 9x6 checkerboard and a ~15 cm AprilTag 36h11 (measure both after
+printing); 15-20 board photos per camera from varied angles; one front-camera photo of the tag
+lying flat at a measured spot (center and yaw relative to the robot base), with the camera in its
+3D-printed mount. Use AprilTag corner refinement (on by default); without it, an 8 cm tag was off
+by 1-2 cm in synthetic tests.
+
 ## Phase C: SmolVLA distillation (online DAgger)
 
 - Student: SmolVLA from `lerobot/smolvla_base`, inputs `front` and `wrist` images, 6 joint states in
@@ -116,9 +123,9 @@ runs as Slurm jobs on Futurama, submitted by psamin.
 4. GPU simulator benchmark, MJX JAX vs Warp (#125, needs one GPU job), then the MJX/Warp env and
    its CPU parity test (#129).
 5. JAX SGS port, tested against `armlab/rl/sgs.py` (#127).
-6. Batched env with SGS resets (#131), PPO (#133), training CLI + Slurm job (#135); first teacher
-   run; held-out evaluation; SGS vs uniform.
-7. Camera calibration and `front` / `wrist` cameras in the MJCF.
+6. Batched env with SGS resets (#131), PPO (#133), training CLI + Slurm job (#135), held-out
+   evaluation (#137), SGS vs uniform comparison (#139); first teacher runs on the GPU.
+7. Camera calibration tools (#141), photo session, then `front` / `wrist` cameras in the MJCF.
 8. SmolVLA sim adapter (images, state units, task text).
 9. Online DAgger distillation with held-out evaluation.
 10. Real-arm evaluation.
