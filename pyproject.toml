@@ -12,6 +12,12 @@ dependencies = [
 
 [project.optional-dependencies]
 data = ["lerobot[dataset]==0.6.1"]
+rl = [  # GPU simulation for the SGS teacher (plans/sgs-post-training.md)
+    "mujoco-mjx==3.14.0",
+    "mujoco-warp==3.14.0",
+    "jax[cuda12]>=0.7; sys_platform == 'linux'",
+    "jax>=0.7; sys_platform != 'linux'",
+]
 
 [dependency-groups]
 dev = ["pytest>=8", "ruff>=0.6"]
