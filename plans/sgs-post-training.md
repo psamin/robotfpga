@@ -39,10 +39,11 @@ over uniform on the paper's simpler task (rod-in-hole, Fig. 5c), so expect a sma
 |---|---|
 | Rest | Current `BlockSortEnv.reset`: arm at `REST_Q`, cubes in the spawn region. This is how real episodes start |
 | Reaching | Target cube anywhere in the workspace; gripper aligned to its grasp frame by IK, random aperture (cube may drop) |
-| Stable Grasp | Target cube grasped and lifted above the target bin, higher than Near-Goal |
-| Near-Goal | Grasped cube along the drop path into the target bin; height fraction in [0, 1.1] of the path |
+| Stable Grasp | Target cube held at carry height (cube center 5-6 cm), anywhere on the route from the table to the target bin |
+| Near-Goal | Held cube on the drop path into the target bin: fraction 0 rests on the bin floor, 1 just clears the 3.5 cm walls, up to 1.1 |
 
-Each buffer entry is one SGS configuration. Start with N=32,768 (paper's manipulation size). Cubes
+Top-down IK cannot reach much above 6 cm over the bins, so the paper's "Stable Grasp higher than
+Near-Goal" becomes the 5-6 cm carry band. Each buffer entry is one SGS configuration. Start with N=32,768 (paper's manipulation size). Cubes
 are 4-fold symmetric in yaw and the success predicate ignores orientation, so the paper's
 symmetry-aware resets (App. C.3) come for free.
 
@@ -109,7 +110,7 @@ runs as Slurm jobs on Futurama, submitted by psamin.
 ## Order of work (one issue and PR each, ~200 lines)
 
 1. This plan.
-2. Reset families and buffer generator (CPU MuJoCo), with tests.
+2. Reset families (#118), then the buffer generator (CPU MuJoCo), with tests.
 3. Teacher reward, failure and observation on the CPU env, as the reference for MJX.
 4. MJX env and CPU/MJX parity test.
 5. JAX SGS port, tested against `armlab/rl/sgs.py`.
