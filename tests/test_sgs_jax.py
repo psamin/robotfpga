@@ -7,7 +7,13 @@ jnp = jax.numpy
 from armlab.rl import sgs_jax  # noqa: E402
 from armlab.rl.sgs import SGSSampler  # noqa: E402
 
-jax.config.update("jax_enable_x64", True)  # compare with the float64 NumPy reference
+
+@pytest.fixture(autouse=True)
+def x64():
+    """Compare with the float64 NumPy reference; restore float32 so later tests (Warp) are unaffected."""
+    jax.config.update("jax_enable_x64", True)
+    yield
+    jax.config.update("jax_enable_x64", False)
 
 
 def feed(batches, n, h, params=sgs_jax.DEFAULTS):
