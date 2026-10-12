@@ -113,10 +113,11 @@ runs as Slurm jobs on Futurama, submitted by psamin.
 1. This plan.
 2. Reset families (#119), then the buffer generator (#122), with tests.
 3. Teacher reward, failure and observation on the CPU env, as the reference for MJX (#123).
-4. GPU simulator benchmark, MJX JAX vs Warp (#125, needs one GPU job), then the MJX env and its
-   CPU parity test.
-5. JAX SGS port, tested against `armlab/rl/sgs.py`.
-6. PPO + SGS training script and Slurm job; first teacher run; SGS vs uniform.
+4. GPU simulator benchmark, MJX JAX vs Warp (#125, needs one GPU job), then the MJX/Warp env and
+   its CPU parity test (#129).
+5. JAX SGS port, tested against `armlab/rl/sgs.py` (#127).
+6. Batched env with SGS resets (#131), PPO (#133), training CLI + Slurm job (#135); first teacher
+   run; held-out evaluation; SGS vs uniform.
 7. Camera calibration and `front` / `wrist` cameras in the MJCF.
 8. SmolVLA sim adapter (images, state units, task text).
 9. Online DAgger distillation with held-out evaluation.

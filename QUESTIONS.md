@@ -21,7 +21,7 @@ Full setup reference: [SETUP.md](SETUP.md).
 | Bitstream | Board owner's 16-lane layer engine: `policy.bit` / `policy.hwh` built (Vivado 2022.2, 100 MHz, WNS +2.371 ns), not in git yet (#98). #82's DMA design: not built | [#87](https://github.com/psamin/robotfpga/issues/87#issuecomment-6075687430), #98 |
 | Board (KR260) | Ubuntu 22.04.4 + PYNQ 3.0.1. **M4 passed:** v3r2 100/100 golden vectors on hardware, 8.03 ms p50 (ARM A53 numpy 70.8 ms). Sim Stage B with the FPGA in the loop: 37/40 | [#87](https://github.com/psamin/robotfpga/issues/87#issuecomment-6075687430), #15 |
 | Real SO-101 arm | Follower + leader connected and calibrated (LeRobot); working teleop/record/SmolVLA rollout stack in psamin/roboticsexp. TinyPolicy not wired to it | [SETUP.md](SETUP.md) §2 |
-| SmolVLA post-training | Owner m-alan08 (from psamin). PPO + SGS teacher, DAgger into SmolVLA, zero-shot SO-101. Built locally, all unmerged: reset families, 32,768-state buffer, CPU teacher env, JAX SGS (#119 #122 #123 #127). GPU sim benchmark waiting on a job (#125). Nothing trained yet | [#116](https://github.com/psamin/robotfpga/issues/116), [plans/sgs-post-training.md](plans/sgs-post-training.md) |
+| SmolVLA post-training | Owner m-alan08. Teacher pipeline built and tested locally, all unmerged (stack #119 → #122 → #123 → #125 → #129 → #131 → #133 → #135, plus #127): reset buffer, CPU + MJX/Warp teacher envs, JAX SGS, PPO, training CLI + Slurm job. Nothing trained on a GPU yet | [#116](https://github.com/psamin/robotfpga/issues/116), [plans/sgs-post-training.md](plans/sgs-post-training.md) |
 | Laptop ↔ board bridge | Board TCP service (§5.6 contract, port 5555) and a laptop `PolicyBackend` client run outside git: 100/100 over Ethernet, 8.8 ms round trip. Ownership still Q4 | [#87](https://github.com/psamin/robotfpga/issues/87#issuecomment-6075687430) |
 
 ## Open
@@ -33,6 +33,7 @@ Full setup reference: [SETUP.md](SETUP.md).
 | Q7 | m-alan08 | Software (psamin) | Which Futurama GPUs, CUDA version and job time limits can SmolVLA post-training jobs use? Unknown so far | [plans/sgs-post-training.md](plans/sgs-post-training.md) |
 | Q8 | m-alan08 | Software (psamin) | Can m-alan08 take Q5 (degrees ↔ radians), since SmolVLA sim-to-real depends on it? | [plans/sgs-post-training.md](plans/sgs-post-training.md) |
 | Q9 | m-alan08 | Software (psamin) | Please run one GPU job: check out `sw/124-bench-sim` and `sbatch cluster/bench_sim.sbatch` (L40, under 1 h). It decides MJX JAX vs MuJoCo Warp for the teacher. Post the JSON from `~/robotfpga-work/runs/` and any `overflow` lines from the log on #125 | [#125](https://github.com/psamin/robotfpga/pull/125) |
+| Q10 | m-alan08 | Software (psamin) | After Q9 looks sane: from `sw/134-train-teacher`, `sbatch --export=ALL,STRATEGY=sgs,SEED=0,ARGS="--envs 1024 --iters 300" cluster/train_teacher.sbatch` as a short first teacher run, and send `metrics.jsonl` from `~/robotfpga-work/runs/` | [#135](https://github.com/psamin/robotfpga/pull/135) |
 
 ## Answered
 
