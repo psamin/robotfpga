@@ -64,9 +64,10 @@ the step limit.
 finished episode. The NumPy `SGSSampler` stays as the reference; a JAX port runs inside the jitted
 training loop and is tested against it.
 
-**Simulator.** MuJoCo Playground / MJX for PPO (Brax). Same MJCF as the CPU env, so CPU and GPU
-share one physics model. A parity test steps both from identical states. If MJX mesh contacts are
-too slow, try MuJoCo Warp.
+**Simulator.** MJX for PPO, with the same MJCF as the CPU env so CPU and GPU share one physics
+model. A parity test steps both from identical states. Backend: MuJoCo Warp (`impl="warp"`) is the
+front-runner. In a CPU smoke run (#125) it matched CPU MuJoCo within 0.01 mm, while the JAX backend
+launched a cube in one of 8 states. GPU throughput is still unmeasured.
 
 **Experiment.** SGS vs uniform sampling on the same buffer, three training seeds each, at a few
 environment counts (e.g. 1K, 4K, 16K on one GPU). Evaluate on freshly sampled resets, never on
@@ -110,9 +111,10 @@ runs as Slurm jobs on Futurama, submitted by psamin.
 ## Order of work (one issue and PR each, ~200 lines)
 
 1. This plan.
-2. Reset families (#118), then the buffer generator (CPU MuJoCo), with tests.
-3. Teacher reward, failure and observation on the CPU env, as the reference for MJX.
-4. MJX env and CPU/MJX parity test.
+2. Reset families (#119), then the buffer generator (#122), with tests.
+3. Teacher reward, failure and observation on the CPU env, as the reference for MJX (#123).
+4. GPU simulator benchmark, MJX JAX vs Warp (#125, needs one GPU job), then the MJX env and its
+   CPU parity test.
 5. JAX SGS port, tested against `armlab/rl/sgs.py`.
 6. PPO + SGS training script and Slurm job; first teacher run; SGS vs uniform.
 7. Camera calibration and `front` / `wrist` cameras in the MJCF.
@@ -126,4 +128,4 @@ PR #112 (sampler) is reused as is. PR #114 (fixed-bank expert runner) is superse
 
 - Q5 ownership: needed before step 8 is meaningful on hardware.
 - Futurama GPU types, CUDA version and job time limits available to us: unknown.
-- MJX speed with the SO-101 mesh contacts: unknown until step 4.
+- Warp throughput on Futurama GPUs with the SO-101 mesh contacts: unknown until #125's job runs.
