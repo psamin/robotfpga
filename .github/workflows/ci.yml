@@ -25,3 +25,23 @@ jobs:
         run: make -C hls csim
       - name: HLS C model under ASan/UBSan
         run: make -C hls sanitize
+
+  software:
+    name: armlab lint + tests (sim, RL, calibration)
+    runs-on: ubuntu-latest
+    env:
+      MUJOCO_GL: egl  # headless: Mesa's software EGL (llvmpipe); runners have no GPU
+      PYOPENGL_PLATFORM: egl
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.9.5"  # writes uv.lock revision 3, like the committed lock
+          enable-cache: true
+      - run: sudo apt-get update && sudo apt-get install -y libegl1 libegl-mesa0 libgl1-mesa-dri
+      - name: Install (dev + rl + calib; JAX and MuJoCo Warp run on CPU here)
+        run: uv sync --locked --python 3.12 --extra rl --extra calib
+      - name: Lint armlab/ and tests/
+        run: uv run --no-sync ruff check armlab tests
+      - name: Tests
+        run: uv run --no-sync pytest -q
