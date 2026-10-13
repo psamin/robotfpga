@@ -9,7 +9,7 @@ if you asked, answered, or changed something the other side needs to know.
 - Keep **Current state** short and true. Replace stale lines instead of appending.
 - Long discussions belong in an issue; link the issue here.
 
-## Current state (2026-10-09)
+## Current state (2026-10-12)
 
 Full setup reference: [SETUP.md](SETUP.md).
 
@@ -17,10 +17,12 @@ Full setup reference: [SETUP.md](SETUP.md).
 |---|---|---|
 | Trained policy | TinyPolicy int8 v3r2, sim only. Int8: Stage B 91%, Stage C 90%. Float: 100% / 98% | [handoff/v3r2/README.md](handoff/v3r2/README.md) |
 | Policy code | Sim, expert, DAgger, training, QAT, eval merged to `main` | [armlab/](armlab/), [plans/tiny-policy-log.md](plans/tiny-policy-log.md) |
+| SGS simulator integration | Validated locally on `feature/sgs-mujoco-integration`, stacked on #112; not merged. Fixed-bank expert smoke: SGS 8/8, uniform 8/8. Scheduling validation only; no policy training or shared-contract changes | [#113](https://github.com/psamin/robotfpga/issues/113), [plans/sgs-sampler.md](plans/sgs-sampler.md) |
 | FPGA handoff | Weights + 100 golden vectors pass the HLS C model (100/100) | [README.md](README.md), [board/demo/README.md](board/demo/README.md) |
 | Bitstream | Board owner's 16-lane layer engine: `policy.bit` / `policy.hwh` built (Vivado 2022.2, 100 MHz, WNS +2.371 ns), not in git yet (#98). #82's DMA design: not built | [#87](https://github.com/psamin/robotfpga/issues/87#issuecomment-6075687430), #98 |
 | Board (KR260) | Ubuntu 22.04.4 + PYNQ 3.0.1. **M4 passed:** v3r2 100/100 golden vectors on hardware, 8.03 ms p50 (ARM A53 numpy 70.8 ms). Sim Stage B with the FPGA in the loop: 37/40 | [#87](https://github.com/psamin/robotfpga/issues/87#issuecomment-6075687430), #15 |
 | Real SO-101 arm | Follower + leader connected and calibrated (LeRobot); working teleop/record/SmolVLA rollout stack in psamin/roboticsexp. TinyPolicy not wired to it | [SETUP.md](SETUP.md) §2 |
+| SmolVLA post-training | Owner m-alan08. Teacher pipeline built and tested locally, all unmerged (stack #119 → #122 → #123 → #125 → #129 → #131 → #133 → #135, plus #127): reset buffer, CPU + MJX/Warp teacher envs, JAX SGS, PPO, training CLI + Slurm job. Nothing trained on a GPU yet | [#116](https://github.com/psamin/robotfpga/issues/116), [plans/sgs-post-training.md](plans/sgs-post-training.md) |
 | Laptop ↔ board bridge | Board TCP service (§5.6 contract, port 5555) and a laptop `PolicyBackend` client run outside git: 100/100 over Ethernet, 8.8 ms round trip. Ownership still Q4 | [#87](https://github.com/psamin/robotfpga/issues/87#issuecomment-6075687430) |
 
 ## Open
@@ -29,6 +31,10 @@ Full setup reference: [SETUP.md](SETUP.md).
 |---|---|---|---|---|
 | Q5 | psamin | Software (psamin) | Verify LeRobot degrees → sim radians per joint (sign and zero offset; formula in SETUP.md §4.1) | [SETUP.md](SETUP.md) §4.1 |
 | Q6 | athithan-elamaran1 | Software (psamin) | Train TinyPolicy-L, the largest network the FPGA holds on chip (1,812,528 params, 3.2× v3r2, ~26 ms)? Exact layer table, quantization rules and handoff steps in plans/fpga-capacity.md; adopting it changes the shared `LAYERS` contract, so ack in the issue first | [plans/fpga-capacity.md](plans/fpga-capacity.md) |
+| Q7 | m-alan08 | Software (psamin) | Which Futurama GPUs, CUDA version and job time limits can SmolVLA post-training jobs use? Unknown so far | [plans/sgs-post-training.md](plans/sgs-post-training.md) |
+| Q8 | m-alan08 | Software (psamin) | Can m-alan08 take Q5 (degrees ↔ radians), since SmolVLA sim-to-real depends on it? | [plans/sgs-post-training.md](plans/sgs-post-training.md) |
+| Q9 | m-alan08 | Software (psamin) | Please run one GPU job: check out `sw/124-bench-sim` and `sbatch cluster/bench_sim.sbatch` (L40, under 1 h). It decides MJX JAX vs MuJoCo Warp for the teacher. Post the JSON from `~/robotfpga-work/runs/` and any `overflow` lines from the log on #125 | [#125](https://github.com/psamin/robotfpga/pull/125) |
+| Q10 | m-alan08 | Software (psamin) | After Q9 looks sane: from `sw/134-train-teacher`, `sbatch --export=ALL,STRATEGY=sgs,SEED=0,ARGS="--envs 1024 --iters 300" cluster/train_teacher.sbatch` as a short first teacher run, and send `metrics.jsonl` from `~/robotfpga-work/runs/` | [#135](https://github.com/psamin/robotfpga/pull/135) |
 
 ## Answered
 

@@ -30,14 +30,46 @@ the equations without a normalized Beta PDF. Require an explicit nonnegative int
 seed, positive T (values below one clamp), and 0 < eps <= 1. Numerical settings that
 lose positive probabilities in float64 raise ValueError rather than return zeros.
 
-## Next milestone
+## Fixed-bank MuJoCo adapter (issue #113)
 
-Build a small fixed bank of `(seed, instr)` resets spanning all four instructions.
-Call `BlockSortEnv.reset(seed=..., instr=...)` for the sampled ID and record terminal
-`info["success"]` once, including timeout failures. Compare SGS with uniform sampling
-using a fixed policy and separate held-out resets; keep evaluation outcomes out of
-training histories. The current expert can validate plumbing but may saturate success.
-This seed bank adapts the paper's fixed configurations; it does not implement the
-paper's reaching, stable-grasp and near-goal reset families. Before SmolVLA RL,
+`armlab.rl.experiment` implements the first integration milestone. Its frozen bank
+uses integer IDs in tuple order, distinct reset seeds below 100,000, and instructions
+cycled across all four tasks (sizes >= 4). The default is eight configurations.
+NumPy SeedSequence streams `(0,)` and `(1,)` separate bank generation and episode
+selection; both strategies receive the same bank and derived selection seed.
+Selection sequences differ because uniform uses integer draws and SGS uses weighted
+choice. Each run keeps one sampler and records exactly one real outcome per episode.
+
+The executor reuses `sim.expert.run_episode(render=False)` and reads final
+`env.success()`, `env.t`, and `env.failure_reason()`. The existing loop can continue
+past a transient success while the expert retreats. Its initial reset still renders
+an observation, but no video frames are collected; the renderer closes even on errors.
+The runner accepts a replacement episode executor for later learned policies.
+
+Run a small paired engineering check (episode count is total, not per instruction):
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 uv run python -m armlab.rl.experiment --strategy sgs --episodes 8 --bank-size 8 --seed 7
+PYTHONDONTWRITEBYTECODE=1 uv run python -m armlab.rl.experiment --strategy uniform --episodes 8 --bank-size 8 --seed 7
+```
+
+Add `--out runs/sgs-smoke.json` for outcomes, bank, selection counts, initial/final
+probabilities, RNG seed, git hash and dependency versions. Generated outputs stay
+uncommitted. Reproducibility requires the same simulator/runtime, not just a seed.
+Sampling counts describe realized draws; final probabilities describe the next draw.
+
+This is a small fixed-bank adapter, not a reproduction of the paper's 32,768 reset
+configurations or a claim that each seed is a large-scale SGS bucket. It preserves
+episode-level resets but adds none of the paper's grasp/near-goal reset strategies.
+The fixed expert does not learn. High success leaves little outcome diversity;
+unseen-rate initialization can temporarily bias SGS even when every episode succeeds.
+Neither biased scheduling nor a preference for 50% success establishes learning gain.
+
+## Next research milestone
+
+Compare SGS with uniform sampling while actually updating a learnable policy, using
+separate held-out resets and multiple training seeds. Keep evaluation outcomes out
+of training histories. The current expert validates plumbing but saturates success
+in the short smoke experiment, so it cannot establish learning efficiency. Before SmolVLA RL,
 verify observation/action conventions and establish sorting-task fine-tuning and
 closed-loop baseline success. This change adds no inference adapter or RL trainer.
