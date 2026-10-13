@@ -7,6 +7,9 @@
 | [fpga.md](fpga.md) | FPGA-side plan: decisions, accelerator interface, milestones, how `hls-v0.1` lands |
 | [references.md](references.md) | Verified literature notes; cite keys used across these docs |
 | [fpga-team-brief.md](fpga-team-brief.md) | The original brief given to the FPGA team (copied verbatim) |
+| [fpga-capacity.md](fpga-capacity.md) | Largest int8 policy the KR260 engine holds; TinyPolicy-L layer table |
+| [sgs-post-training.md](sgs-post-training.md) | SGS teacher → DAgger post-training plan for SmolVLA |
+| [sgs-sampler.md](sgs-sampler.md) | Success-guided sampling of reset states |
 | [tiny-policy-log.md](tiny-policy-log.md) | Engineering log for the blog post: what was built, measured, and why |
 | [sgs-post-training.md](sgs-post-training.md) | SmolVLA post-training: PPO + SGS teacher, DAgger into SmolVLA, SO-101 transfer |
 

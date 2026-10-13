@@ -76,8 +76,8 @@ Last verified on 2026-10-09 against:
 
 | Setting | Value |
 |---|---|
-| Follower serial port | `/dev/tty.usbmodem5B790811541` |
-| Leader serial port | `/dev/tty.usbmodem5B901030671` |
+| Follower serial port | `/dev/tty.usbmodem…` (find with `lerobot-find-port`) |
+| Leader serial port | `/dev/tty.usbmodem…` (find with `lerobot-find-port`) |
 | `front` camera | OpenCV index 0, 640×480, 30 fps, warmup 3 s |
 | `wrist` camera | OpenCV index 1, 480×640, 30 fps, rotation 90°, warmup 3 s |
 
@@ -109,7 +109,7 @@ Source: [https://github.com/psamin/roboticsexp/tree/4d8baf3eba82a4cd5ff067e4a09f
   and `observation.images.wrist` videos.
 - Task: "Pick up the medicine bottle and place it on the plate". Episodes 11 and 14 are excluded
   from training.
-- A local copy is in `~/.cache/huggingface/lerobot/flyingturtleboop/`.
+- LeRobot caches a local copy under `~/.cache/huggingface/lerobot/`.
 
 **This is a different task from the simulated cube sorting.** The cube-sorting TinyPolicy has never
 run on this stack.
@@ -362,7 +362,7 @@ fix (longer QAT) is **not done**.
 
 ### 6.3 Cluster (GT Futurama)
 
-- GT VPN (GlobalProtect) must be connected; then `ssh pi34@planetexpress-login.cc.gatech.edu`.
+- GT VPN (GlobalProtect) must be connected; then SSH to the cluster login node with your GT account.
 - Login nodes are for submitting jobs only. Every job sources `cluster/env.sh`, which:
   - remaps `/nethome/<user>` to `/nethome-instruction/<user>` (the home symlink is broken on
     compute nodes);
@@ -393,7 +393,7 @@ Measured on hardware ([#87 board results](https://github.com/psamin/robotfpga/is
 - **Board service:** TCP port **5555**, `TCP_NODELAY`. It's threaded, with the FPGA behind a lock,
   and it refuses to serve unless the golden vectors pass at start-up. Not yet a systemd service.
 - **Network:** KR260 Ethernet port J10D → controller laptop Ethernet. The laptop shares its Wi-Fi
-  (Windows ICS). Board IP `192.168.137.35`, on that private link only; SSH user `ubuntu`.
+  (Windows ICS). The board gets a private address on that link; SSH user `ubuntu`.
 - **Measured:** 100/100 vectors over TCP, round trip p50 8.8 ms.
 - **Laptop client:** athithan's `PolicyBackend` client exists (`reset/infer/stats`, one reconnect,
   then raise) but is **not in git**. Plan per Q4: it lands in `armlab/backends/remote_backend.py`.
@@ -414,7 +414,7 @@ Latency budget: under 33 ms end to end (one control tick), target under 5 ms for
 ### 8.1 Prepare the files (any computer with Git + Python 3.8+ + NumPy)
 
 ```sh
-git clone --branch board/81-fpga-handoff https://github.com/psamin/robotfpga.git robotfpga-handoff
+git clone https://github.com/psamin/robotfpga.git robotfpga-handoff
 cd robotfpga-handoff
 python3 board/demo/prepare_handoff.py          # expect: Prepared 262 files
 cd build/fpga-handoff
