@@ -70,7 +70,7 @@ class BlockSortEnv:
         return self.lo + (np.clip(a, -1, 1) + 1) * 0.5 * (self.hi - self.lo)
 
     # ---- episode ----
-    def reset(self, seed: int, instr: int | None = None) -> dict:
+    def reset(self, seed: int, instr: int | None = None, render: bool = True) -> dict:
         rng = np.random.default_rng(seed)
         self.instr = int(rng.integers(4)) if instr is None else int(instr)
         mujoco.mj_resetData(self.m, self.d)
@@ -86,7 +86,7 @@ class BlockSortEnv:
         for _ in range(30):  # let contacts settle
             mujoco.mj_step(self.m, self.d)
         self.t = 0
-        return self.obs()
+        return self.obs(render)
 
     def step(self, target: np.ndarray) -> tuple[dict, bool, dict]:
         """target: normalized joint targets [6] in [-1, 1]. Advances one 30 Hz tick."""
