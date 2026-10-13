@@ -12,6 +12,7 @@ dependencies = [
 
 [project.optional-dependencies]
 data = ["lerobot[dataset]==0.6.1"]
+calib = ["opencv-python-headless>=4.9"]  # camera calibration (armlab/calib)
 rl = [  # GPU simulation for the SGS teacher (plans/sgs-post-training.md)
     "mujoco-mjx==3.14.0",
     "mujoco-warp==3.14.0",
