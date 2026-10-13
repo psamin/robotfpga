@@ -17,6 +17,7 @@ rl = [  # GPU simulation for the SGS teacher (plans/sgs-post-training.md)
     "mujoco-warp==3.14.0",
     "jax[cuda12]>=0.7; sys_platform == 'linux'",
     "jax>=0.7; sys_platform != 'linux'",
+    "matplotlib>=3.8",
 ]
 
 [dependency-groups]

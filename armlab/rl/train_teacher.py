@@ -34,6 +34,7 @@ def family_metrics(family: jax.Array):
         out = {}
         for k, name in enumerate(FAMILIES):
             ended = (dones * (fam == k)).sum()
+            out[f"episodes_{name}"] = ended
             out[f"success_{name}"] = (ok * (fam == k)).sum() / jnp.maximum(ended, 1)
         seen = carry.sgs.counts > 0
         rates = sgs_jax.success_rates(carry.sgs)
