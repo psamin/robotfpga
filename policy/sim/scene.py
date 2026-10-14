@@ -4,9 +4,13 @@ Every episode draws its sizes, mass, friction and positions from RANGES, which a
 estimates from the demos and the front video (#172, #174, #176) and wide enough to contain the real
 values. Positions cover the arm's reachable desk area (reachable_grid), with a share of episodes at
 the demo layout. World frame: robot base at the origin, table top at z = 0, +x forward, +y left.
+
+The GPU simulator batches many envs against one model, so sizes, mass and friction come from K fixed
+size variants (variants) and each env keeps its variant; positions change per episode (place): the
+bottle through its free joint, the plate as a mocap body.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import mujoco
 import numpy as np
@@ -58,21 +62,56 @@ def demo_params() -> SceneParams:
     return SceneParams(**mid, bottle_xy=DEMO_BOTTLE, plate_xy=DEMO_PLATE)
 
 
-def sample_params(rng: np.random.Generator, reachable: np.ndarray, demo_share: float = 0.25) -> SceneParams:
-    """reachable: (N, 2) desk points the arm can grasp at, from reachable_grid."""
-    p = {k: float(rng.uniform(lo, hi)) for k, (lo, hi) in RANGES.items()}
+def _consistent(p: dict) -> dict:
     p["cap_radius"] = min(p["cap_radius"], p["body_radius"])
     p["plate_inner_radius"] = min(p["plate_inner_radius"], p["plate_outer_radius"] - 0.015)
+    return p
+
+
+def variants(k: int, seed: int = 0) -> list[SceneParams]:
+    """k size variants spread over RANGES (Latin hypercube), placed at the demo layout."""
+    rng = np.random.default_rng(seed)
+    cols = {name: (rng.permutation(k) + rng.uniform(size=k)) / k for name in RANGES}
+    out = []
+    for i in range(k):
+        p = _consistent({n: lo + cols[n][i] * (hi - lo) for n, (lo, hi) in RANGES.items()})
+        out.append(SceneParams(**p, bottle_xy=DEMO_BOTTLE, plate_xy=DEMO_PLATE))
+    return out
+
+
+def sample_positions(
+    rng: np.random.Generator, reachable: np.ndarray, p: SceneParams, demo_share: float = 0.25
+):
+    """Bottle and plate (x, y): the demo layout +-DEMO_JITTER, or two reachable points far enough apart."""
     if rng.uniform() < demo_share:
         b = np.add(DEMO_BOTTLE, rng.uniform(-DEMO_JITTER, DEMO_JITTER, 2))
         pl = np.add(DEMO_PLATE, rng.uniform(-DEMO_JITTER, DEMO_JITTER, 2))
     else:
-        gap = p["plate_outer_radius"] + p["body_radius"] + SEPARATION
+        gap = p.plate_outer_radius + p.body_radius + SEPARATION
         while True:
             b, pl = reachable[rng.integers(len(reachable), size=2)]
             if np.linalg.norm(b - pl) > gap:
                 break
-    return SceneParams(**p, bottle_xy=tuple(map(float, b)), plate_xy=tuple(map(float, pl)))
+    return tuple(map(float, b)), tuple(map(float, pl))
+
+
+def sample_params(rng: np.random.Generator, reachable: np.ndarray, demo_share: float = 0.25) -> SceneParams:
+    """reachable: (N, 2) desk points the arm can grasp at, from reachable_grid."""
+    p = SceneParams(
+        **_consistent({k: float(rng.uniform(lo, hi)) for k, (lo, hi) in RANGES.items()}),
+        bottle_xy=DEMO_BOTTLE,
+        plate_xy=DEMO_PLATE,
+    )
+    b, pl = sample_positions(rng, reachable, p, demo_share)
+    return replace(p, bottle_xy=b, plate_xy=pl)
+
+
+def place(model: mujoco.MjModel, data: mujoco.MjData, bottle_xy, plate_xy) -> None:
+    """Put the bottle upright at bottle_xy (at rest) and the plate at plate_xy; call mj_forward after."""
+    adr, dof = model.jnt_qposadr[model.joint("bottle").id], model.jnt_dofadr[model.joint("bottle").id]
+    data.qpos[adr : adr + 7] = [*bottle_xy, 0.0, 1, 0, 0, 0]
+    data.qvel[dof : dof + 6] = 0
+    data.mocap_pos[model.body_mocapid[model.body("plate").id]] = [*plate_xy, 0.0]
 
 
 def _quat(axis, angle):
@@ -127,7 +166,7 @@ def build(p: SceneParams) -> mujoco.MjModel:
         rgba=[1.0, 0.5, 0.1, 1],
     )
 
-    plate = w.add_body(name="plate", pos=[*p.plate_xy, 0.0])
+    plate = w.add_body(name="plate", pos=[*p.plate_xy, 0.0], mocap=True)
     plate.add_geom(
         name="plate_floor",
         type=mujoco.mjtGeom.mjGEOM_CYLINDER,

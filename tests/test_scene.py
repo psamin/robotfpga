@@ -11,8 +11,10 @@ from policy.sim.scene import (  # noqa: E402
     RANGES,
     build,
     demo_params,
+    place,
     reachable_grid,
     sample_params,
+    variants,
 )
 
 pytestmark = pytest.mark.skipif(not so101.tag_available(), reason=f"git tag {so101.TAG} not fetched")
@@ -73,3 +75,22 @@ def test_random_scenes_settle_upright():
     rng, grid = np.random.default_rng(1), reachable_grid()
     for _ in range(10):
         assert upright(settle(build(sample_params(rng, grid)), 0.5)) > 0.99
+
+
+def test_variants_cover_the_ranges():
+    vs = variants(16, seed=0)
+    for name, (lo, hi) in RANGES.items():
+        vals = sorted(getattr(v, name) for v in vs)
+        assert lo <= vals[0] < lo + (hi - lo) / 8 and hi - (hi - lo) / 8 < vals[-1] <= hi
+    assert variants(16, seed=0) == vs
+
+
+def test_place_moves_bottle_and_plate_in_a_built_model():
+    p = demo_params()
+    m = build(p)
+    d = mujoco.MjData(m)
+    place(m, d, (0.2, -0.1), (0.3, 0.15))
+    for _ in range(150):
+        mujoco.mj_step(m, d)
+    assert np.allclose(d.body("bottle").xpos[:2], (0.2, -0.1), atol=0.002) and upright(d) > 0.999
+    assert np.allclose(d.body("plate").xpos[:2], (0.3, 0.15))
