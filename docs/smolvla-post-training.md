@@ -34,12 +34,30 @@ New code goes under `policy/sim/` and `policy/rl/` (software side), with `mujoco
 
 ## What is new for pick and place
 
-**Scene.** One medicine bottle and one plate on the table, the SO-101 at the origin, `front` and
-`wrist` cameras placed from calibration. Sizes, mass and layout are **unknown** (SETUP.md §1); the
-scene is not built until they are measured (Q15).
+**Scene: randomized, not measured** (psamin's suggestion, #177). One bottle and one plate on the
+table, the SO-101 at the origin, `front` and `wrist` cameras placed from calibration. Instead of
+copying exact sizes, every episode draws them from ranges (domain randomization: Tobin et al. 2017,
+Peng et al. 2018; the paper also randomizes object positions across the board, App. C.5). The ranges
+must contain the real values, so they are centred on the estimates below (#172, #174, #176). Initial
+ranges, to revisit after the first teacher runs:
 
-**Success.** The bottle rests on the plate (inside the plate's rim, upright within a tolerance) and
-the gripper no longer touches it. Exact thresholds come from the measured plate and bottle.
+| Parameter | Range | Basis |
+|---|---|---|
+| Bottle height | 7 to 15 cm | taller than about 6.5 cm: the cap is grasped 4 to 6 cm up |
+| Bottle body diameter | 3 to 5 cm | about 3.5 cm from the gripper reading while holding the body (#176) |
+| Cap diameter | 2 to 3.2 cm | about 2.7 cm from the front video, 2.1 cm from the gripper reading |
+| Bottle mass | 20 to 200 g | not estimated; a wide range |
+| Plate outer diameter / flat inner diameter | 16 to 22 cm / 10 to 14 cm | about 19 / 12 cm from the front video |
+| Plate rim height | 1 to 3 cm | not estimated |
+| Friction (bottle, plate, table) | ±30% around MuJoCo defaults | standard dynamics randomization |
+| Bottle and plate positions | anywhere in the arm's reachable area of the desk, with a minimum separation; a share of episodes at the demo layout | psamin: generalize across the desk; the demo spots must stay in the distribution |
+| Visuals | table and object colors, lighting, camera pose and FOV jitter | for the SmolVLA student (step 9) |
+
+The reachable area is found with the arm's IK when the scene is built. Generalizing beyond the taped
+spot is new for SmolVLA (its demos never left it); whether it transfers shows only in real trials.
+
+**Success.** The bottle rests on the plate (center inside the plate's flat inner diameter, upright
+within a tolerance) and the gripper no longer touches it. Thresholds scale with each episode's sizes.
 
 **Reset families** (paper App. A.2, adapted):
 
@@ -107,11 +125,11 @@ plate outer diameter about 0.19 m (a 7-inch paper plate is 0.178 m) with the pat
 edge at about 0.12 m; cap diameter about 0.027 m. Still not settled: bottle height, body diameter and
 mass, the plate's rim height, and the gripper reading to opening width mapping.
 
-## Unknowns (blocking)
+## Unknowns
 
 | Unknown | Needed for | Question |
 |---|---|---|
-| Bottle height, body diameter and mass; plate rim height (plate and cap diameters are estimated above) | scene, success | Q15 |
+| Bottle and plate sizes, mass | scene, success | Not needed: randomized over ranges that contain the estimates (above); Q15 closed |
 | Table layout | Rest family, randomization ranges | Estimated from the demos and checked against the front video (above) |
 | Sim radians to LeRobot units per joint | every SmolVLA input and label | Derived and checked against the demos (`policy/sim/so101.py`, #175); Q16 asks for an on-arm check |
 | Front and wrist camera poses and intrinsics | rendering SmolVLA's inputs | photo session with `calib/camera.py` |
@@ -121,7 +139,8 @@ mass, the plate's rim height, and the gripper reading to opening width mapping.
 1. This plan.
 2. Restore the task-independent code (SGS NumPy + JAX, PPO, calibration tools) into `policy/rl/`
    and `policy/calib/` with its tests and the optional dependency group.
-3. Pick-and-place scene from the Q15 measurements; scripted expert as a sanity check.
+3. Randomized pick-and-place scene (ranges above, reachable area from IK); scripted expert as a
+   sanity check.
 4. Reset families, buffer, CPU teacher env with the pick-and-place success and reward.
 5. MJX/Warp teacher env with parity tests; batched SGS env; training, eval, comparison jobs.
 6. GPU benchmark on the new scene, then the first teacher runs (SGS vs uniform). Each run needs
