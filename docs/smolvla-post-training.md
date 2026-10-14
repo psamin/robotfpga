@@ -62,6 +62,11 @@ grasp (mean 50) and 48 to 85 deg at release, so the scripted expert and the rese
 angled grasps. Generalizing beyond the taped spot is new for SmolVLA (its demos never left it);
 whether it transfers shows only in real trials.
 
+**Size variants (#183).** The GPU simulator batches many envs against one model, so sizes, mass and
+friction come from K fixed size variants (Latin hypercube over the ranges); each env keeps its
+variant, and positions change every episode (bottle free joint, plate as a mocap body). SGS picks
+configurations within each variant.
+
 **Scripted expert (#181).** `policy/sim/expert.py` grasps like the demos (tilted approach chosen per
 target, jaws closing horizontally on the upper body, close until the gripper stops, lift, carry,
 lower, release) as a check that the scene is solvable in physics. It solves the demo scene (195 steps,
