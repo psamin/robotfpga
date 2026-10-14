@@ -6,8 +6,8 @@ first use into a local cache instead of being committed again (CONTRIBUTING.md: 
 Joint conversion (Q16, not verified on the arm): LeRobot reports the five body joints in degrees,
 0 at the middle of each joint's calibrated travel (SETUP.md §2). The sim joints are assumed to read
 the same angle in radians with the same sign. The demo data supports this for shoulder_lift,
-elbow_flex and wrist_flex (every grasp and release lands at or above table height); the sign of
-shoulder_pan only mirrors the layout left/right and is unverified. The gripper's 0-100 scale is not
+elbow_flex and wrist_flex (every grasp and release lands at or above table height), and the front
+video supports the sign of shoulder_pan (policy/sim/demo_video.py). The gripper's 0-100 scale is not
 converted.
 """
 

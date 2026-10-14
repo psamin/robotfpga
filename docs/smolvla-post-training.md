@@ -89,17 +89,30 @@ assumed in `policy/sim/so101.py`.
 
 Read as: the bottle starts about 25 cm out and 9 cm to the left; the plate sits about 32 cm out and
 21 cm to the right, and moves less than the bottle. The two grip groups suggest a narrower part
-higher up (likely the cap) and a wider body, not yet confirmed. Checks behind the assumption: no grasp
-or release lands below the table. Not settled by this data: the sign of shoulder_pan (flipping it
-mirrors the layout left/right), bottle height and mass, plate size, and the gripper reading to
-opening width mapping.
+higher up (likely the cap) and a wider body. Checks behind the assumption: no grasp or release lands
+below the table.
+
+**Checked against the front video (#173).** The front camera looks straight down. `policy/sim/demo_video.py`
+finds the bottle's orange cap at the start and after the release in each training demo (25 detections)
+and fits the joint-data positions to those pixels in a top view:
+
+| Fit | Mean / max mismatch | Robot base lands at |
+|---|---|---|
+| shoulder_pan as assumed | 15.7 / 44.6 px (about 1.9 / 5.3 cm) | pixel (323, 45), on the base in the image |
+| shoulder_pan sign flipped | 28.3 / 80.9 px | pixel (325, 482), off the table: rejected |
+
+So the assumed pan sign holds. With the fitted scale (842 px/m, at cap height, so table-level sizes
+read slightly small): plate center (0.334, -0.189) m, matching the release estimate within 2.5 cm;
+plate outer diameter about 0.19 m (a 7-inch paper plate is 0.178 m) with the patterned rim's inner
+edge at about 0.12 m; cap diameter about 0.027 m. Still not settled: bottle height, body diameter and
+mass, the plate's rim height, and the gripper reading to opening width mapping.
 
 ## Unknowns (blocking)
 
 | Unknown | Needed for | Question |
 |---|---|---|
-| Bottle size, mass, cap shape; plate diameter, height, rim | scene, success | Q15 |
-| Table layout | Rest family, randomization ranges | Estimated from the demos above; left/right needs the pan sign (Q16) |
+| Bottle height, body diameter and mass; plate rim height (plate and cap diameters are estimated above) | scene, success | Q15 |
+| Table layout | Rest family, randomization ranges | Estimated from the demos and checked against the front video (above) |
 | Sim radians to LeRobot units per joint (sign, zero offset, gripper 0 to 100 vs the sim gripper angle) | every SmolVLA input and label | Q16 |
 | Front and wrist camera poses and intrinsics | rendering SmolVLA's inputs | photo session with `calib/camera.py` |
 
