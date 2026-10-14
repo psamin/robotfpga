@@ -1,54 +1,43 @@
 # Contributing
 
-Two groups work in this repo at the same time: software (sim, training, quantization, eval) and
-FPGA (HLS/RTL, board bring-up). These rules keep us from doing the same work twice.
+Software (policy, robot, cluster jobs) and FPGA (HLS, board) work happen here at the same time.
+These rules keep everyone on the same plan and stop duplicated work.
 
-## Project standard (2026-10-13)
+## The project
 
-The deployed model is the **fine-tuned SmolVLA** (trained on our SO-101 demos), running in **full
-precision: BF16 weights in DDR, FP32 math**. Its linear layers run on the KR260 FPGA; everything
-else runs on the board's ARM cores. The plan is [plans/smolvla-fpga.md](plans/smolvla-fpga.md).
+- **Task:** an SO-101 arm picks up a medicine bottle and places it on a plate.
+- **Policy:** the SmolVLA fine-tuned on our real demos. It is the only policy; it is never overwritten.
+- **Hardware:** the KR260 FPGA runs SmolVLA's linear layers in full precision (BF16 weights in DDR,
+  FP32 math); the board's ARM cores run the rest. Plan: [docs/smolvla-fpga.md](docs/smolvla-fpga.md).
+- **Don't train a new policy (sim or real) without the repo owner's approval.** Post-training of the
+  fine-tuned SmolVLA, once approved, writes to a new checkpoint and leaves the original untouched.
+- The earlier cube-sorting work (TinyPolicy, int8, sim, SGS) is removed. It is preserved at the git tag
+  `archive/cube-sorting`; don't build new work on it.
 
-- The int8 TinyPolicy path (`ref/intref.py`, `handoff/v3r2/`, the int8 HLS engines) is **retired**:
-  keep it as reference, don't build new work on it.
-- **Don't train a new policy (sim or real) without the repo owner's approval.** Evaluation,
-  conversion and FPGA work on the existing SmolVLA are fine.
+## Workflow
 
-## Check QUESTIONS.md after every pull
+1. Read [QUESTIONS.md](QUESTIONS.md) after every pull. Before you push, add your questions, answer the
+   ones addressed to you, and fix any state line your change makes stale.
+2. Before starting, check [open issues](../../issues) and PRs. Open an issue that says what you will
+   build and which files you will touch, and assign it to yourself.
+3. Work on a branch; reference the issue in the PR with `Closes #<number>`.
+4. Keep PRs near **200 changed lines**. One PR does one thing. Include tests or say why there are none.
+5. Update the matching doc in [docs/](docs/) in the same PR when your change alters it.
 
-[QUESTIONS.md](QUESTIONS.md) holds open questions between the software and FPGA sides and a short
-"current state" table. Read it after every pull. Before you push, add your questions, answer the
-ones addressed to you, and fix any state line your change makes stale.
+## Ownership
 
-## Open an issue before you start
+| Area | Path | Owner |
+|---|---|---|
+| Policy, evaluation | `policy/` | software |
+| Robot setup and toolkit | `robot/` | software |
+| Cluster jobs | `cluster/` | software |
+| FPGA engine and board runtime | `fpga/` | FPGA |
+| Engine interface (`fpga/hls/float_linear.h`, `fpga/hls/pack_float.py`) and the deployed SmolVLA checkpoint | shared contract | both sides sign off |
 
-1. Check the [open issues](../../issues) to see if someone already has it.
-2. Open an issue that says what you will build and which files you expect to touch.
-3. Assign it to yourself. An assigned issue means "someone is on this".
-4. Reference it in your PR with `Closes #<number>` so it closes when the PR merges.
-
-## Keep PRs small
-
-Aim for about **200 changed lines** per PR. A 2,000-line PR is hard to review and slow to merge.
-If a feature is big, split it into a chain of PRs that each work and pass tests on their own.
-
-- One PR does one thing.
-- Branch off `main`; don't push directly to `main`.
-- Include tests, or say in the PR why there are none.
-- Update the matching file in [plans/](plans/) if your change alters the plan.
-
-## Shared contract files
-
-These files are the agreement between software and FPGA. Changing them needs an issue and a review
-from someone on **each** side:
-
-- the full-precision engine interface: weight packing layout and call signature
-  (`hls/stream/float_linear.h`, `hls/stream/pack_float.py`)
-- the SmolVLA checkpoint the project deploys
-
-If the hardware and the C model (`hls/stream/tb_float.cpp` against PyTorch FP32) disagree, the C
-model is right until both sides agree otherwise.
+If the hardware and the C model (`fpga/hls/tb_float.cpp` against PyTorch FP32) disagree, the C model
+is right until both sides agree otherwise.
 
 ## Don't commit
 
-Generated artifacts (`artifacts/`, build outputs, datasets, checkpoints), secrets, or large binaries.
+Model checkpoints, datasets, build outputs, logs, secrets, or large binaries. Checkpoints live on
+the cluster or Hugging Face; link them instead.

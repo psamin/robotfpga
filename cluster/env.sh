@@ -6,7 +6,7 @@ fix() { [ -e "$1" ] && echo "$1" || echo "${1/#\/nethome\//\/nethome-instruction
 export HOME=$(fix "$HOME")
 REPO=$(fix "${REPO:-$SLURM_SUBMIT_DIR}")
 cd "$REPO"
-SCR=/dev/shm/armlab-${SLURM_JOB_ID:-$$}
+SCR=/dev/shm/robotfpga-${SLURM_JOB_ID:-$$}
 mkdir -p "$SCR"
 trap 'rm -rf "$SCR"' EXIT TERM INT
 export UV_CACHE_DIR=$SCR/uv-cache UV_PROJECT_ENVIRONMENT=$SCR/venv UV_PYTHON_INSTALL_DIR=$SCR/python
