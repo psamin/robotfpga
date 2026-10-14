@@ -27,7 +27,7 @@ linear layers on the FPGA). Cube-sorting work removed; preserved at tag `archive
 
 | # | Asked by | For | Question | Link |
 |---|---|---|---|---|
-| Q12 | psamin | FPGA (@athithan-elamaran1, @Dhyey234) | Synthesize `fpga/hls/float_top.cpp` (`run_float_hls.tcl`, 300 MHz) and build the block design: bundles `hp0..hp3` → S_AXI_HP0–3_FPD, `io` → S_AXI_HPC0_FPD. Report timing, II of the reduction loop, DSP/BRAM/URAM use, then the measured GEMM bandwidth on the board | [docs/smolvla-fpga.md](docs/smolvla-fpga.md) |
+| Q12 | psamin | FPGA (@athithan-elamaran1, @Dhyey234) | In `fpga/hls/`: `vitis_hls -f run_float_hls.tcl` then `vivado -mode batch -source build_bd.tcl` (writes `build/float.bit` + `.hwh`; untested). Report timing, II of the reduction loop, DSP/BRAM/URAM use, then the measured GEMM bandwidth on the board | [docs/smolvla-fpga.md](docs/smolvla-fpga.md) |
 | Q13 | psamin | psamin | Speed vs precision: FP32 math gives ~3–4 s per chunk. Options are BF16 multiplies with FP32 accumulation (several times more MACs per DSP), running the vision encoder less often, or accepting a slower control rate | [docs/smolvla-fpga.md](docs/smolvla-fpga.md) §Verification |
 | Q14 | psamin | @m-alan08 | The SGS pipeline was removed with the cube-sorting sim (recoverable at `archive/cube-sorting`). RL post-training of SmolVLA would need a pick-and-place sim, would start from the `-9604` checkpoint, and would write a new checkpoint. Any training run needs psamin's approval first | [CONTRIBUTING.md](CONTRIBUTING.md) |
 
