@@ -74,6 +74,11 @@ lower, release) as a check that the scene is solvable in physics. It solves the 
 about 15 cm of the base, where angled grasps are cramped and the demos never went, plus one at the
 far edge. These stay in the distribution: whether the RL teacher solves them is part of the result.
 
+**Cameras (#197).** `policy/sim/cameras.py` reads a cameras JSON and mounts `front` in the world
+and `wrist` on the gripper body, rendered at the real sizes (640x480, 480x640). The photo session
+fills it in: `policy.calib.camera intrinsics` and `pose` for each camera, then `wrist` turns the
+wrist camera's world pose and the arm's joint readings at capture into a pose relative to the gripper.
+
 **When measurements still matter.** Not to build the scene, but (1) before DAgger, an on-arm gripper
 check (Q16), because a wrong gripper conversion biases every label, and (2) before real trials, a
 ruler and scale check that the real bottle and plate fall inside the ranges above. Both fit into the

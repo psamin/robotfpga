@@ -122,7 +122,8 @@ def _quat(axis, angle):
     return q
 
 
-def build(p: SceneParams) -> mujoco.MjModel:
+def build(p: SceneParams, cameras: dict | None = None) -> mujoco.MjModel:
+    """The scene for p; cameras: a dict from policy.sim.cameras.load to add front/wrist cameras."""
     spec = mujoco.MjSpec.from_file(str(model_dir() / "so101.xml"))
     spec.option.timestep = TIMESTEP
     for a, b in SELF_EXCLUDE:
@@ -203,6 +204,10 @@ def build(p: SceneParams) -> mujoco.MjModel:
         refname="base",
     )
     sensor.intprm[:3] = [1, 1, 1]  # contacts found between the bottle and the robot's subtree
+    if cameras:
+        from policy.sim.cameras import add_to_spec
+
+        add_to_spec(spec, cameras)
     return spec.compile()
 
 
