@@ -96,9 +96,10 @@ Reported by the board owner, 2026-10-08/09:
 
 1. `make -C fpga/hls test`: C model and test cases.
 2. `cd fpga/hls && vitis_hls -f run_float_hls.tcl`: C sim, synthesis at 300 MHz, IP export.
-3. Block design: Zynq MPSoC with the KR260 preset, PL clock 300 MHz. Connect `float_top` bundles
-   `hp0..hp3` to S_AXI_HP0..HP3_FPD and `io` to S_AXI_HPC0_FPD; AXI-Lite control on M_AXI_HPM0_FPD.
-   Generate `float.bit` + `float.hwh`.
+3. Block design and bitstream: `vivado -mode batch -source build_bd.tcl` (in `fpga/hls/`). It applies the
+   KR260 preset, wires `hp0..hp3` to S_AXI_HP0..HP3_FPD and `io` to S_AXI_HPC0_FPD (all 128-bit), sets the
+   PL clock to 300 MHz, and writes `build/float.bit` + `build/float.hwh` plus timing and utilization
+   reports. The script is untested (no Vivado was available when it was written).
 4. On the board: `from fpga.board.runtime import Engine, fpga_linears`, then
    `fpga_linears(policy, Engine("float.bit"))` on a `SmolVLAPolicy` loaded in FP32. Compare actions
    with PyTorch before driving the arm.
