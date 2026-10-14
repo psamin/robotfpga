@@ -7,7 +7,7 @@ dependencies = ["numpy>=2.0"]
 
 [dependency-groups]
 dev = ["pytest>=8", "ruff>=0.6"]
-rl = ["jax>=0.7"]  # SGS post-training (docs/smolvla-post-training.md); uv sync --group rl
+rl = ["jax>=0.7", "matplotlib>=3.8"]  # SGS, PPO, run comparison (docs/smolvla-post-training.md); uv sync --group rl
 calib = ["mujoco==3.14.0", "opencv-python-headless>=4.9"]  # policy/calib; uv sync --group calib
 sim = ["imageio-ffmpeg>=0.5", "mujoco==3.14.0", "pillow>=10", "pyarrow>=15"]  # policy/sim; uv sync --group sim
 gpu = [  # policy/sim/teacher_mjx.py; uv sync --group gpu
