@@ -90,7 +90,12 @@ def main():
     policy = SmolVLAPolicy.from_pretrained(model_dir)
     stored = sorted({str(p.dtype) for p in policy.parameters()})
     policy = policy.float().to("cpu").eval()
-    pre, post = make_pre_post_processors(policy.config, pretrained_path=model_dir)
+    pre, post = make_pre_post_processors(
+        policy.config,
+        pretrained_path=model_dir,
+        preprocessor_overrides={"device_processor": {"device": "cpu"}},
+        postprocessor_overrides={"device_processor": {"device": "cpu"}},
+    )
     eng = Engine(out / "layers")
     n_linear = 0
     for name, mod in policy.named_modules():
