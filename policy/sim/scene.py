@@ -194,6 +194,15 @@ def build(p: SceneParams) -> mujoco.MjModel:
             friction=fr,
             rgba=[0.7, 0.75, 0.9, 1],
         )
+    sensor = spec.add_sensor(
+        name="bottle_touch",
+        type=mujoco.mjtSensor.mjSENS_CONTACT,
+        objtype=mujoco.mjtObj.mjOBJ_BODY,
+        objname="bottle",
+        reftype=mujoco.mjtObj.mjOBJ_XBODY,
+        refname="base",
+    )
+    sensor.intprm[:3] = [1, 1, 1]  # contacts found between the bottle and the robot's subtree
     return spec.compile()
 
 
