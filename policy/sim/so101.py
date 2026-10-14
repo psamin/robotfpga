@@ -92,3 +92,9 @@ def jaw_gap(model: mujoco.MjModel, angle: float) -> float:
     mujoco.mj_forward(model, data)
     pads = [(model.geom(a).id, model.geom(b).id) for a in FIXED_PADS for b in MOVING_PADS]
     return min(mujoco.mj_geomDistance(model, data, a, b, 0.5, np.zeros(6)) for a, b in pads)
+
+
+def sim_to_lerobot(qpos) -> np.ndarray:
+    """Sim joints (5 body joints + gripper, rad) -> LeRobot units (degrees, gripper reading 0-100)."""
+    q = np.asarray(qpos, dtype=np.float64)
+    return np.concatenate([np.degrees(q[..., :5]), np.atleast_1d(sim_to_gripper(q[..., 5]))], axis=-1)
