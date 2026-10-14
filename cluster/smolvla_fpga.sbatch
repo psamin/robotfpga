@@ -16,5 +16,11 @@ VLA=$SCR/vla
 "$UV" venv -q --python 3.12 "$VLA"
 "$UV" pip install -q -p "$VLA" "lerobot[smolvla,dataset] @ git+https://github.com/psamin/lerobot@e624f3f7"
 OUT=$(fix "$HOME/robotfpga-work/runs/smolvla-fpga")
-"$VLA/bin/python" policy/smolvla_fpga.py --model "$(fix "$MODEL")" --out "$OUT" --frames "${FRAMES:-5}"
+"$VLA/bin/python" policy/smolvla_fpga.py --model "$(fix "$MODEL")" --out "$OUT" --frames "${FRAMES:-5}" \
+  --runtime layout --dump-batches
 for d in "$OUT"/layers/*/; do fpga/hls/build/tb_float "$d"; done
+# The board-side scripts, run here with the host C core: engine check on every case, then the
+# fine-tuned SmolVLA replaying the dumped frames through fpga/board/run_smolvla.py.
+"$VLA/bin/python" fpga/board/check_engine.py --mock layout build/stream/float
+"$VLA/bin/python" fpga/board/check_engine.py --mock layout "$OUT/layers"
+"$VLA/bin/python" fpga/board/run_smolvla.py --mock layout --model "$(fix "$MODEL")" --batches "$OUT/batches"

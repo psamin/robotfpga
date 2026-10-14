@@ -43,7 +43,10 @@ Rules 15–18 and 22 of the reference table are int8-specific and don't apply at
 | `fpga/hls/pack_float.py` | BF16 conversion, port packing, test cases, ctypes loader |
 | `fpga/hls/latency.py` | latency model per action chunk |
 | `policy/smolvla_fpga.py`, `cluster/smolvla_fpga.sbatch` | the fine-tuned SmolVLA with every linear layer computed by the engine code, vs plain PyTorch FP32 |
-| `fpga/board/runtime.py` | KR260 runtime: `fpga_linears(policy, Engine("float.bit"))` swaps every `nn.Linear` |
+| `fpga/hls/build_bd.tcl` | Vivado block design + bitstream: 4 × 128-bit HP ports + HPC0, 300 MHz (untested) |
+| `fpga/board/runtime.py` | KR260 runtime: `fpga_linears(policy, Engine("float.bit"))` swaps every `nn.Linear`, frees the PyTorch copy of each weight; `Engine(mock="layout")` runs the board's exact per-chunk DDR layout on the host |
+| `fpga/board/check_engine.py` | every engine test case through the runtime; reports bandwidth on the board |
+| `fpga/board/run_smolvla.py` | the fine-tuned SmolVLA on the board, replaying real frames dumped on the cluster |
 
 ## Verification
 
