@@ -46,6 +46,7 @@ ranges, to revisit after the first teacher runs:
 | Bottle height | 7 to 15 cm | taller than about 6.5 cm: the cap is grasped 4 to 6 cm up |
 | Bottle body diameter | 3 to 5 cm | about 3.5 cm from the gripper reading while holding the body (#176) |
 | Cap diameter | 2 to 3.2 cm | about 2.7 cm from the front video, 2.1 cm from the gripper reading |
+| Cap height | 1.5 to 2.5 cm | not estimated |
 | Bottle mass | 20 to 200 g | not estimated; a wide range |
 | Plate outer diameter / flat inner diameter | 16 to 22 cm / 10 to 14 cm | about 19 / 12 cm from the front video |
 | Plate rim height | 1 to 3 cm | not estimated |
@@ -53,8 +54,18 @@ ranges, to revisit after the first teacher runs:
 | Bottle and plate positions | anywhere in the arm's reachable area of the desk, with a minimum separation; a share of episodes at the demo layout | psamin: generalize across the desk; the demo spots must stay in the distribution |
 | Visuals | table and object colors, lighting, camera pose and FOV jitter | for the SmolVLA student (step 9) |
 
-The reachable area is found with the arm's IK when the scene is built. Generalizing beyond the taped
-spot is new for SmolVLA (its demos never left it); whether it transfers shows only in real trials.
+The reachable area comes from the arm's IK (`policy/sim/scene.py`, #179): desk points in front of the
+base (x of at least 0.10 m; the front video shows the table starting at the base) where the gripper
+reaches both 3 cm and 12 cm up, tilted at most 85 deg from straight down. About 0.29 m², including
+both demo spots. The demos do not grasp top-down: the gripper is tilted 33 to 77 deg from vertical at
+grasp (mean 50) and 48 to 85 deg at release, so the scripted expert and the reset families use
+angled grasps. Generalizing beyond the taped spot is new for SmolVLA (its demos never left it);
+whether it transfers shows only in real trials.
+
+**When measurements still matter.** Not to build the scene, but (1) before DAgger, an on-arm gripper
+check (Q16), because a wrong gripper conversion biases every label, and (2) before real trials, a
+ruler and scale check that the real bottle and plate fall inside the ranges above. Both fit into the
+camera photo session (step 7).
 
 **Success.** The bottle rests on the plate (center inside the plate's flat inner diameter, upright
 within a tolerance) and the gripper no longer touches it. Thresholds scale with each episode's sizes.
@@ -139,13 +150,14 @@ mass, the plate's rim height, and the gripper reading to opening width mapping.
 1. This plan.
 2. Restore the task-independent code (SGS NumPy + JAX, PPO, calibration tools) into `policy/rl/`
    and `policy/calib/` with its tests and the optional dependency group.
-3. Randomized pick-and-place scene (ranges above, reachable area from IK); scripted expert as a
-   sanity check.
+3. Randomized pick-and-place scene (ranges above, reachable area from IK; #179), then a scripted
+   angled-grasp expert as a sanity check.
 4. Reset families, buffer, CPU teacher env with the pick-and-place success and reward.
 5. MJX/Warp teacher env with parity tests; batched SGS env; training, eval, comparison jobs.
 6. GPU benchmark on the new scene, then the first teacher runs (SGS vs uniform). Each run needs
    psamin's go-ahead on #156.
-7. Camera calibration photo session; `front` and `wrist` cameras in the scene.
+7. Camera calibration photo session, plus the gripper check and a ruler/scale check of the bottle and
+   plate; `front` and `wrist` cameras in the scene.
 8. SmolVLA in sim (needs Q16): baseline of `-9604` in sim.
 9. Online DAgger into a new checkpoint; held-out sim evaluation.
 10. Post results on #156, then real-arm trials only after psamin agrees.
