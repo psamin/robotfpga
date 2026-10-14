@@ -29,12 +29,14 @@ linear layers on the FPGA). Cube-sorting work removed; preserved at tag `archive
 |---|---|---|---|---|
 | Q12 | psamin | FPGA (@athithan-elamaran1, @Dhyey234) | In `fpga/hls/`: `vitis_hls -f run_float_hls.tcl` then `vivado -mode batch -source build_bd.tcl` (writes `build/float.bit` + `.hwh`; untested). Report timing, II of the reduction loop, DSP/BRAM/URAM use, then the measured GEMM bandwidth on the board | [docs/smolvla-fpga.md](docs/smolvla-fpga.md) |
 | Q13 | psamin | psamin | Speed vs precision: FP32 math gives ~3–4 s per chunk. Options are BF16 multiplies with FP32 accumulation (several times more MACs per DSP), running the vision encoder less often, or accepting a slower control rate | [docs/smolvla-fpga.md](docs/smolvla-fpga.md) §Verification |
-| Q14 | psamin | @m-alan08 | The SGS pipeline was removed with the cube-sorting sim (recoverable at `archive/cube-sorting`). RL post-training of SmolVLA would need a pick-and-place sim, would start from the `-9604` checkpoint, and would write a new checkpoint. Any training run needs psamin's approval first | [CONTRIBUTING.md](CONTRIBUTING.md) |
+| Q15 | m-alan08 | psamin or whoever is at the arm | Measure the bottle (height, diameter, mass, cap shape) and the plate (diameter, height, rim), and the start positions of both relative to the robot base, plus how much they varied across the demos. Not measured yet | [docs/smolvla-post-training.md](docs/smolvla-post-training.md) |
+| Q16 | m-alan08 | psamin | Sim joint radians to LeRobot units per joint: sign, zero offset, and the sim gripper angle to the 0 to 100 gripper scale. SETUP.md gives the LeRobot side; the sim side is not measured | [docs/smolvla-post-training.md](docs/smolvla-post-training.md) |
 
 ## Answered
 
 | # | Question | Answer | Date | Evidence |
 |---|---|---|---|---|
+| A-6 | Q14: plan for RL post-training of SmolVLA on pick and place? | Teacher (PPO + SGS) in a new pick-and-place sim, then online DAgger into a new checkpoint from `-9604`; task-independent code restored from `archive/cube-sorting`. Scene blocked on Q15 | 2026-10-14 | [docs/smolvla-post-training.md](docs/smolvla-post-training.md), #158 |
 | A-1 | KR260 boot, versions, endpoint | Ubuntu 22.04.4 (kernel 5.15.0-1027-xilinx-zynqmp), Python 3.10.12, PYNQ 3.0.1; private Ethernet link behind the controller laptop, SSH user `ubuntu` | 2026-10-09 | [#87](https://github.com/psamin/robotfpga/issues/87#issuecomment-6075687430) |
 | A-2 | Full precision or int8? | Full precision: BF16 weights, FP32 math; linear layers on the FPGA, the rest on the ARM; int8 retired | 2026-10-13 | owner decision, [#151](https://github.com/psamin/robotfpga/pull/151) |
 | A-3 | Which task and policy? | Only the medicine-bottle pick-and-place, with the SmolVLA fine-tuned on our demos; cube sorting removed | 2026-10-14 | owner decision |
