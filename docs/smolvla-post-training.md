@@ -79,6 +79,12 @@ and `wrist` on the gripper body, rendered at the real sizes (640x480, 480x640). 
 fills it in: `policy.calib.camera intrinsics` and `pose` for each camera, then `wrist` turns the
 wrist camera's world pose and the arm's joint readings at capture into a pose relative to the gripper.
 
+**SmolVLA in sim (#199).** `policy/sim/smolvla_sim.py` feeds the unchanged checkpoint exactly the
+inputs it was trained on (front and wrist renders at the dataset's shapes, joints in LeRobot units,
+the task text) and turns its action chunks back into sim joint targets at 30 Hz. The scripted expert,
+re-expressed in LeRobot units, succeeds through the same adapter, so the conversions round-trip.
+`cluster/smolvla_sim.sbatch` runs the baseline once the calibrated cameras JSON exists.
+
 **When measurements still matter.** Not to build the scene, but (1) before DAgger, an on-arm gripper
 check (Q16), because a wrong gripper conversion biases every label, and (2) before real trials, a
 ruler and scale check that the real bottle and plate fall inside the ranges above. Both fit into the
