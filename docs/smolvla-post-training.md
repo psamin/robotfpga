@@ -70,12 +70,36 @@ directly to SmolVLA's action space.
 calibrated cameras. Its sim success is the baseline, and a very low number measures the sim-to-real
 gap that visual randomization has to close.
 
+## Layout estimated from the demos (#171)
+
+`policy/sim/demo_layout.py` runs the dataset's joint states through the SO-101 model and finds where
+the gripper closes (approximately the bottle) and opens (approximately the plate). 13 training
+episodes (11 and 14 excluded, SETUP.md §3). Robot base frame: origin at the base on the table, +x
+forward, +y to the robot's left, z up. **Estimates, not measurements**, under the joint conversion
+assumed in `policy/sim/so101.py`.
+
+| Quantity | Mean | Std | Range |
+|---|---|---|---|
+| Gripper closes (bottle) x, y | 0.249, +0.092 m | 0.027, 0.021 m | x 0.189 to 0.300, y +0.059 to +0.125 |
+| Gripper closes, height above table | 0.031 m | 0.018 m | 0.014 to 0.063 |
+| Gripper opens (plate) x, y | 0.320, -0.209 m | 0.014, 0.014 m | x 0.297 to 0.349, y -0.230 to -0.180 |
+| Gripper opens, height | 0.034 m | 0.020 m | 0.000 to 0.064 |
+| Highest point while carrying | 0.152 m | 0.020 m | 0.119 to 0.179 |
+| Gripper reading while holding (0 to 100) | 17.1 | 3.7 | two groups: about 11.5 when grasped at 4 to 6 cm, about 19.5 at 1 to 3 cm |
+
+Read as: the bottle starts about 25 cm out and 9 cm to the left; the plate sits about 32 cm out and
+21 cm to the right, and moves less than the bottle. The two grip groups suggest a narrower part
+higher up (likely the cap) and a wider body, not yet confirmed. Checks behind the assumption: no grasp
+or release lands below the table. Not settled by this data: the sign of shoulder_pan (flipping it
+mirrors the layout left/right), bottle height and mass, plate size, and the gripper reading to
+opening width mapping.
+
 ## Unknowns (blocking)
 
 | Unknown | Needed for | Question |
 |---|---|---|
 | Bottle size, mass, cap shape; plate diameter, height, rim | scene, success | Q15 |
-| Table layout: where the bottle and plate start, and how much that varies across demos | Rest family, randomization ranges | Q15 |
+| Table layout | Rest family, randomization ranges | Estimated from the demos above; left/right needs the pan sign (Q16) |
 | Sim radians to LeRobot units per joint (sign, zero offset, gripper 0 to 100 vs the sim gripper angle) | every SmolVLA input and label | Q16 |
 | Front and wrist camera poses and intrinsics | rendering SmolVLA's inputs | photo session with `calib/camera.py` |
 
