@@ -9,13 +9,18 @@ if you asked, answered, or changed something the other side needs to know.
 - Keep **Current state** short and true. Replace stale lines instead of appending.
 - Long discussions belong in an issue; link the issue here.
 
-## Current state (2026-10-13)
+## Current state (2026-10-14)
+
+**Project standard (decided 2026-10-13):** the fine-tuned SmolVLA, full precision (BF16 weights in DDR,
+FP32 math), linear layers on the FPGA, everything else on the ARM. Int8 is retired. No new policy is
+trained without the repo owner's approval. Plan: [plans/smolvla-fpga.md](plans/smolvla-fpga.md).
 
 Full setup reference: [SETUP.md](SETUP.md).
 
 | Area | State | Where |
 |---|---|---|
-| Trained policy | TinyPolicy int8 v3r2, sim only. Int8: Stage B 91%, Stage C 90%. Float: 100% / 98% | [handoff/v3r2/README.md](handoff/v3r2/README.md) |
+| SmolVLA on FPGA (full precision) | Engine `hls/stream/float_linear.h` (4 HP ports, BF16 weights streamed from DDR, FP32 math) passes C simulation on SmolVLA-shaped layers; whole-model run with every linear in the engine code: see plans/smolvla-fpga.md. Not synthesized yet (Q12) | [plans/smolvla-fpga.md](plans/smolvla-fpga.md), #148 |
+| Retired int8 policy | TinyPolicy int8 v3r2, sim only. Int8: Stage B 91%, Stage C 90%. Float: 100% / 98% | [handoff/v3r2/README.md](handoff/v3r2/README.md) |
 | Policy code | Sim, expert, DAgger, training, QAT, eval merged to `main` | [armlab/](armlab/), [plans/tiny-policy-log.md](plans/tiny-policy-log.md) |
 | SGS teacher pipeline | Owner m-alan08. Merged to `main` (#112–#139): SGS sampler, reset families, MJX/Warp teacher env, PPO, train/eval/compare jobs. Camera calibration tools merged (#141). Nothing run on a GPU yet (Q9, Q10); camera photo session not done | [plans/sgs-post-training.md](plans/sgs-post-training.md) |
 | FPGA handoff | Weights + 100 golden vectors pass the HLS C model (100/100) | [README.md](README.md), [board/demo/README.md](board/demo/README.md) |
@@ -29,12 +34,9 @@ Full setup reference: [SETUP.md](SETUP.md).
 | # | Asked by | For | Question | Link |
 |---|---|---|---|---|
 | Q5 | psamin | Software (psamin) | Verify LeRobot degrees → sim radians per joint (sign and zero offset; formula in SETUP.md §4.1) | [SETUP.md](SETUP.md) §4.1 |
-| Q6 | athithan-elamaran1 | Software (psamin) | Train TinyPolicy-L, the largest network the FPGA holds on chip (1,812,528 params, 3.2× v3r2, ~26 ms)? Exact layer table, quantization rules and handoff steps in plans/fpga-capacity.md; adopting it changes the shared `LAYERS` contract, so ack in the issue first | [plans/fpga-capacity.md](plans/fpga-capacity.md) |
-| Q7 | m-alan08 | Software (psamin) | Which Futurama GPUs, CUDA version and job time limits can SmolVLA post-training jobs use? Unknown so far | [plans/sgs-post-training.md](plans/sgs-post-training.md) |
 | Q8 | m-alan08 | Software (psamin) | Can m-alan08 take Q5 (degrees ↔ radians), since SmolVLA sim-to-real depends on it? | [plans/sgs-post-training.md](plans/sgs-post-training.md) |
-| Q9 | m-alan08 | Software (psamin) | Please run one GPU job from `main`: `sbatch cluster/bench_sim.sbatch` (L40, under 1 h). It decides MJX JAX vs MuJoCo Warp for the teacher. Post the JSON from `~/robotfpga-work/runs/` and any `overflow` lines from the log on #125 | [#125](https://github.com/psamin/robotfpga/pull/125) |
-| Q10 | m-alan08 | Software (psamin) | After Q9 looks sane, from `main`: `sbatch --export=ALL,STRATEGY=sgs,SEED=0,ARGS="--envs 1024 --iters 300" cluster/train_teacher.sbatch` as a short first teacher run, and send `metrics.jsonl` from `~/robotfpga-work/runs/` | [#135](https://github.com/psamin/robotfpga/pull/135) |
 | Q11 | m-alan08 | FPGA (athithan-elamaran1) | CI fails on `main` and every PR from four Ruff B905 errors in `ref/intref.py` (143, 183) and `ref/make_standin.py` (68, 105). OK to add `strict=False` to those four `zip()` calls? It is Python's default, so behavior is unchanged: tried locally, every CI step passes (ruff, 24 ref tests, csim and sanitize 100/100) and the stand-in weights, manifest and vectors are byte-identical. `ref/intref.py` is a shared contract file, so it needs your ack | [#115](https://github.com/psamin/robotfpga/issues/115) |
+| Q12 | psamin | FPGA (@athithan-elamaran1, @Dhyey234) | Synthesize `hls/stream/float_top.cpp` (`run_float_hls.tcl`, 300 MHz) and build the block design: bundles `hp0..hp3` → S_AXI_HP0–3_FPD, `io` → S_AXI_HPC0_FPD. Report timing, II of the reduction loop, DSP/BRAM/URAM, then the measured GEMM bandwidth on the board | [plans/smolvla-fpga.md](plans/smolvla-fpga.md) |
 
 ## Answered
 
@@ -46,3 +48,6 @@ Full setup reference: [SETUP.md](SETUP.md).
 | A4 | Q2: M0/M1 results | M0: boot, PYNQ and custom overlay load pass. `board/m0/` inventory not run. M1 DMA loopback not run (the built design uses `m_axi`, no DMA) | 2026-10-09 | [#87](https://github.com/psamin/robotfpga/issues/87#issuecomment-6075687430) |
 | A5 | Q3: matching `policy.bit` / `policy.hwh`? | Yes, for the board owner's 16-lane layer engine (source not in git yet, #98). Vitis HLS / Vivado 2022.2, 100 MHz, WNS +2.371 ns; 100/100 v3r2 vectors on hardware, 8.03 ms | 2026-10-09 | [#87](https://github.com/psamin/robotfpga/issues/87#issuecomment-6075687430), #15 |
 | A-Q4 | Bridge split | Agreed by software: software owns `armlab/backends/remote_backend.py` + SO-101 controller adapter; FPGA side owns the board TCP service and overlays. Athithan to contribute his `PolicyBackend` client as the starting PR | 2026-10-09 | [#87](https://github.com/psamin/robotfpga/issues/87#issuecomment-6075858540) |
+| A-Q6 | TinyPolicy-L | Superseded: int8 TinyPolicy retired on 2026-10-13; the target is the fine-tuned SmolVLA in full precision | 2026-10-14 | [plans/smolvla-fpga.md](plans/smolvla-fpga.md) |
+| A-Q7 | Futurama GPUs for SmolVLA jobs | `general` partition (1-day limit; `techfee` 3 days): H100 80 GB (`nvidia-h100`, back online, driver 595.84), H200 141 GB ×4, L40S 48 GB ×4, L4 24 GB ×4; L40 node down on 2026-10-13. CPU-only nodes failed "user env retrieval" for psamin, so use GPU nodes even for CPU work. Accounting DB is down, so no QOS info | 2026-10-14 | `sinfo`, job logs 9973/10005 |
+| A-Q9/Q10 | SGS benchmark and teacher runs | Not run: the owner decided on 2026-10-13 not to train a new sim policy without approval. Jobs 9973/9974 were cancelled before the teacher started | 2026-10-14 | this file |

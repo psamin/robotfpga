@@ -3,6 +3,17 @@
 Two groups work in this repo at the same time: software (sim, training, quantization, eval) and
 FPGA (HLS/RTL, board bring-up). These rules keep us from doing the same work twice.
 
+## Project standard (2026-10-13)
+
+The deployed model is the **fine-tuned SmolVLA** (trained on our SO-101 demos), running in **full
+precision: BF16 weights in DDR, FP32 math**. Its linear layers run on the KR260 FPGA; everything
+else runs on the board's ARM cores. The plan is [plans/smolvla-fpga.md](plans/smolvla-fpga.md).
+
+- The int8 TinyPolicy path (`ref/intref.py`, `handoff/v3r2/`, the int8 HLS engines) is **retired**:
+  keep it as reference, don't build new work on it.
+- **Don't train a new policy (sim or real) without the repo owner's approval.** Evaluation,
+  conversion and FPGA work on the existing SmolVLA are fine.
+
 ## Check QUESTIONS.md after every pull
 
 [QUESTIONS.md](QUESTIONS.md) holds open questions between the software and FPGA sides and a short
@@ -31,11 +42,12 @@ If a feature is big, split it into a chain of PRs that each work and pass tests 
 These files are the agreement between software and FPGA. Changing them needs an issue and a review
 from someone on **each** side:
 
-- `ref/intref.py` (the bit-exact int8 reference)
-- the `manifest.json` / `weights.bin` / test-vector formats
-- the TinyPolicy architecture table in [plans/build-spec.md](plans/build-spec.md)
+- the full-precision engine interface: weight packing layout and call signature
+  (`hls/stream/float_linear.h`, `hls/stream/pack_float.py`)
+- the SmolVLA checkpoint the project deploys
 
-If the hardware and `intref.py` disagree, `intref.py` is right until both sides agree otherwise.
+If the hardware and the C model (`hls/stream/tb_float.cpp` against PyTorch FP32) disagree, the C
+model is right until both sides agree otherwise.
 
 ## Don't commit
 

@@ -1,21 +1,18 @@
 # robotfpga
 
-A 566K-parameter vision policy that drives an SO-101 robot arm, quantized to int8 and run on an
-AMD Kria KR260 FPGA. The policy sees a 96×96 camera image, the joint angles and one of 4
-instructions ("red/blue cube → left/right bin"), and outputs the next 8 joint targets at 30 Hz.
+Runs a fine-tuned **SmolVLA** robot policy for an SO-101 arm on an AMD Kria **KR260** FPGA, in full
+precision. The ~450M-parameter model's weights stay in the board's DDR as BF16 and stream into an
+FPGA matrix engine that computes in FP32; the ARM cores run everything nonlinear.
+Plan and design rules: [plans/smolvla-fpga.md](plans/smolvla-fpga.md).
 
-## Results
+## Status
 
-| | Value |
+| | |
 |---|---|
-| Sim success, float (Stage B / Stage C, n = 200) | 100% / 98% |
-| Sim success, int8 (Stage B / Stage C, n = 200) | 91% / 90% |
-| FPGA inference, KR260 at 100 MHz | 8.03 ms (vs 70.8 ms on the board's ARM CPU) |
-| FPGA vs bit-exact reference | 100/100 golden vectors byte-for-byte |
-| Sim closed loop with the FPGA computing every action | 92.5% (37/40) |
-| FPGA resources | 1.7% DSP, 31% UltraRAM, 24% BRAM |
-
-How it was built, with citations: [plans/tiny-policy-log.md](plans/tiny-policy-log.md).
+| FPGA engine (`hls/stream/float_linear.h`) | 4 DDR ports, BF16 weights, FP32 math; passes C simulation on SmolVLA layer shapes |
+| Whole SmolVLA with every linear layer in the engine code | see [plans/smolvla-fpga.md](plans/smolvla-fpga.md) § Verification |
+| Synthesis, bitstream, board run | next (QUESTIONS.md Q12) |
+| Earlier milestone, retired | int8 TinyPolicy: 8.03 ms on the KR260, 100/100 golden vectors, sim success 91% ([handoff/v3r2/](handoff/v3r2/README.md)) |
 
 ## Repository
 
@@ -24,7 +21,8 @@ How it was built, with citations: [plans/tiny-policy-log.md](plans/tiny-policy-l
 | `armlab/` | Python package: MuJoCo sim, scripted expert, data collection, training (BC + DAgger), int8 QAT, eval, RL teacher (`rl/`), camera calibration (`calib/`) |
 | `ref/` | Bit-exact int8 reference (`intref.py`) and golden-vector generator: the contract the FPGA must match |
 | `handoff/v3r2/` | Trained int8 weights, manifest, 100 golden vectors, eval results, checkpoints |
-| `hls/`, `board/` | FPGA: HLS kernel, RTL blocks, KR260 board scripts and runbook |
+| `hls/stream/`, `board/stream/` | Full-precision SmolVLA engine (HLS), C model, packing, latency model, KR260 runtime |
+| `hls/`, `board/` | Earlier int8 FPGA work: HLS kernel, RTL blocks, KR260 board scripts and runbook |
 | `hardware/so101/` | Real-arm calibration, teleop / recording / rollout toolkit, wrist camera mount |
 | `cluster/` | Slurm jobs for collection, training, DAgger, QAT and eval |
 | `plans/` | Spec, plans, engineering log, references |

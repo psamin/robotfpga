@@ -1,5 +1,10 @@
 # Build spec: tiny robot policy on an FPGA (software side)
 
+> **Superseded on 2026-10-13.** The project now deploys the fine-tuned SmolVLA in full precision
+> (BF16 weights, FP32 math) with its linear layers on the FPGA; the int8 TinyPolicy contract below is
+> retired and kept for reference. Current plan: [smolvla-fpga.md](smolvla-fpga.md).
+
+
 Paste this whole file into Claude Code as the first message in an empty repo.
 
 ## 0. What we are building
