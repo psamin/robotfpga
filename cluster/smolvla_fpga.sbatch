@@ -14,7 +14,7 @@ export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
 make -C hls/stream test PY="$UV run --no-sync python"
 VLA=$SCR/vla
 "$UV" venv -q --python 3.12 "$VLA"
-"$UV" pip install -q -p "$VLA" "lerobot[smolvla] @ git+https://github.com/psamin/lerobot@e624f3f7"
+"$UV" pip install -q -p "$VLA" "lerobot[smolvla,dataset] @ git+https://github.com/psamin/lerobot@e624f3f7"
 OUT=$(fix "$HOME/robotfpga-work/runs/smolvla-fpga")
 "$VLA/bin/python" scripts/smolvla_fpga.py --model "$(fix "$MODEL")" --out "$OUT" --frames "${FRAMES:-5}"
 for d in "$OUT"/layers/*/; do hls/stream/build/tb_float "$d"; done
