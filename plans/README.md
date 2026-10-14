@@ -2,6 +2,8 @@
 
 | File | What it is |
 |---|---|
+| [smolvla-fpga.md](smolvla-fpga.md) | **Current plan:** fine-tuned SmolVLA on the KR260 in full precision (BF16 weights, FP32 math) |
+| [fpga-ddr-streaming-references.md](fpga-ddr-streaming-references.md) | Verified papers and design rules for streaming weights from DDR |
 | [build-spec.md](build-spec.md) | The original project spec: task, interfaces, int8 math, phases |
 | [software-kickoff.md](software-kickoff.md) | Software-side plan: decisions, spec gaps, order of work |
 | [fpga.md](fpga.md) | FPGA-side plan: decisions, accelerator interface, milestones, how `hls-v0.1` lands |
