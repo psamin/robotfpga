@@ -39,6 +39,8 @@ RANGES = {  # metres, kilograms; see the plan's table for the basis of each rang
 DEMO_BOTTLE, DEMO_PLATE = (0.25, 0.09), (0.33, -0.19)  # estimated from the demos (#172, #174)
 DEMO_JITTER = 0.02
 DEMO_START = (-97.0, -103.0, 96.0, 54.0, 0.0, 2.0)  # LeRobot units, the demos' typical first frame
+# The folded start pose overlaps these bodies' simplified collision boxes; the real arm folds freely.
+SELF_EXCLUDE = (("shoulder", "lower_arm"), ("shoulder", "wrist"))
 
 
 @dataclass(frozen=True)
@@ -123,6 +125,8 @@ def _quat(axis, angle):
 def build(p: SceneParams) -> mujoco.MjModel:
     spec = mujoco.MjSpec.from_file(str(model_dir() / "so101.xml"))
     spec.option.timestep = TIMESTEP
+    for a, b in SELF_EXCLUDE:
+        spec.add_exclude(bodyname1=a, bodyname2=b)
     w = spec.worldbody
     w.add_light(
         name="key",
