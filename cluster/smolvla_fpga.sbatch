@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -J armlab-smolvla-fpga
+#SBATCH -J robotfpga-smolvla-fpga
 #SBATCH -p general
 #SBATCH -c 64
 #SBATCH -w nvidia-l4   # CPU-only nodes fail "user env retrieval"; the GPU nodes load it fine
@@ -11,10 +11,10 @@
 #   sbatch --export=ALL,MODEL=$HOME/models/smolvla-<run> cluster/smolvla_fpga.sbatch
 source cluster/env.sh
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
-make -C hls/stream test PY="$UV run --no-sync python"
+make -C fpga/hls test PY="$UV run --no-sync python"
 VLA=$SCR/vla
 "$UV" venv -q --python 3.12 "$VLA"
 "$UV" pip install -q -p "$VLA" "lerobot[smolvla,dataset] @ git+https://github.com/psamin/lerobot@e624f3f7"
 OUT=$(fix "$HOME/robotfpga-work/runs/smolvla-fpga")
-"$VLA/bin/python" scripts/smolvla_fpga.py --model "$(fix "$MODEL")" --out "$OUT" --frames "${FRAMES:-5}"
-for d in "$OUT"/layers/*/; do hls/stream/build/tb_float "$d"; done
+"$VLA/bin/python" policy/smolvla_fpga.py --model "$(fix "$MODEL")" --out "$OUT" --frames "${FRAMES:-5}"
+for d in "$OUT"/layers/*/; do fpga/hls/build/tb_float "$d"; done

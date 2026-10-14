@@ -1,53 +1,42 @@
 # Questions and context
 
-The shared board for both teams. **Read this after every pull. Update it before every push**
-if you asked, answered, or changed something the other side needs to know.
+The shared board for both teams. **Read this after every pull. Update it before every push** if you
+asked, answered, or changed something the other side needs to know.
 
-- Add a question under **Open** with who it is for. Answer it in place, then move it to
-  **Answered** with the date and a link to the evidence (file, PR, log).
+- Add a question under **Open** with who it is for. When answered, move it to **Answered** with the date
+  and a link to the evidence.
 - Write "unknown" or "not ready" rather than guessing. Say whether something was run or only planned.
-- Keep **Current state** short and true. Replace stale lines instead of appending.
-- Long discussions belong in an issue; link the issue here.
+- Keep **Current state** short and true; replace stale lines instead of appending.
 
 ## Current state (2026-10-14)
 
-**Project standard (decided 2026-10-13):** the fine-tuned SmolVLA, full precision (BF16 weights in DDR,
-FP32 math), linear layers on the FPGA, everything else on the ARM. Int8 is retired. No new policy is
-trained without the repo owner's approval. Plan: [plans/smolvla-fpga.md](plans/smolvla-fpga.md).
-
-Full setup reference: [SETUP.md](SETUP.md).
+The task is the real one: SO-101 picks up a medicine bottle and places it on a plate, using the SmolVLA
+fine-tuned on our demos. Goal: run it on the KR260 in full precision (BF16 weights in DDR, FP32 math,
+linear layers on the FPGA). Cube-sorting work removed; preserved at tag `archive/cube-sorting`.
 
 | Area | State | Where |
 |---|---|---|
-| SmolVLA on FPGA (full precision) | Engine `hls/stream/float_linear.h` (4 HP ports, BF16 weights streamed from DDR, FP32 math) passes C simulation on SmolVLA-shaped layers; whole-model run with every linear in the engine code: see plans/smolvla-fpga.md. Not synthesized yet (Q12) | [plans/smolvla-fpga.md](plans/smolvla-fpga.md), #148 |
-| Retired int8 policy | TinyPolicy int8 v3r2, sim only. Int8: Stage B 91%, Stage C 90%. Float: 100% / 98% | [handoff/v3r2/README.md](handoff/v3r2/README.md) |
-| Policy code | Sim, expert, DAgger, training, QAT, eval merged to `main` | [armlab/](armlab/), [plans/tiny-policy-log.md](plans/tiny-policy-log.md) |
-| SGS teacher pipeline | Owner m-alan08. Merged to `main` (#112–#139): SGS sampler, reset families, MJX/Warp teacher env, PPO, train/eval/compare jobs. Camera calibration tools merged (#141). Nothing run on a GPU yet (Q9, Q10); camera photo session not done | [plans/sgs-post-training.md](plans/sgs-post-training.md) |
-| FPGA handoff | Weights + 100 golden vectors pass the HLS C model (100/100) | [README.md](README.md), [board/demo/README.md](board/demo/README.md) |
-| Bitstream | Board owner's 16-lane layer engine: `policy.bit` / `policy.hwh` built (Vivado 2022.2, 100 MHz, WNS +2.371 ns), not in git yet (#98). #82's DMA design: not built | [#87](https://github.com/psamin/robotfpga/issues/87#issuecomment-6075687430), #98 |
-| Board (KR260) | Ubuntu 22.04.4 + PYNQ 3.0.1. **M4 passed:** v3r2 100/100 golden vectors on hardware, 8.03 ms p50 (ARM A53 numpy 70.8 ms). Sim Stage B with the FPGA in the loop: 37/40 | [#87](https://github.com/psamin/robotfpga/issues/87#issuecomment-6075687430), #15 |
-| Real SO-101 arm | Follower + leader connected and calibrated (LeRobot); working teleop/record/SmolVLA rollout stack in psamin/roboticsexp. TinyPolicy not wired to it | [SETUP.md](SETUP.md) §2 |
-| Laptop ↔ board bridge | Board TCP service (§5.6 contract, port 5555) and a laptop `PolicyBackend` client run outside git: 100/100 over Ethernet, 8.8 ms round trip. Ownership still Q4 | [#87](https://github.com/psamin/robotfpga/issues/87#issuecomment-6075687430) |
+| Policy | Fine-tuned SmolVLA, checkpoint `smolvla-so101_medicine_bottle_pickplace-9604` on the cluster | [SETUP.md](SETUP.md) §3 |
+| Real arm | Follower + leader calibrated; teleop / record / rollout toolkit works | [robot/](robot/README.md) |
+| FPGA engine | `fpga/hls/` passes C simulation on real SmolVLA layers; whole SmolVLA through the engine code matches PyTorch FP32 to ~0.01° mean. Not synthesized | [docs/smolvla-fpga.md](docs/smolvla-fpga.md) |
+| Estimated FPGA speed | ~3–4 s per 50-action chunk, compute-bound | [docs/smolvla-fpga.md](docs/smolvla-fpga.md) §Verification |
+| KR260 | Ubuntu 22.04.4 + PYNQ 3.0.1, reachable over the laptop's Ethernet link | [SETUP.md](SETUP.md) §6 |
+| Laptop ↔ board link | A board TCP service and laptop client exist from the earlier int8 work (outside git); the full-precision runtime is `fpga/board/runtime.py` | A-4 |
 
 ## Open
 
 | # | Asked by | For | Question | Link |
 |---|---|---|---|---|
-| Q5 | psamin | Software (psamin) | Verify LeRobot degrees → sim radians per joint (sign and zero offset; formula in SETUP.md §4.1) | [SETUP.md](SETUP.md) §4.1 |
-| Q8 | m-alan08 | Software (psamin) | Can m-alan08 take Q5 (degrees ↔ radians), since SmolVLA sim-to-real depends on it? | [plans/sgs-post-training.md](plans/sgs-post-training.md) |
-| Q11 | m-alan08 | FPGA (athithan-elamaran1) | CI fails on `main` and every PR from four Ruff B905 errors in `ref/intref.py` (143, 183) and `ref/make_standin.py` (68, 105). OK to add `strict=False` to those four `zip()` calls? It is Python's default, so behavior is unchanged: tried locally, every CI step passes (ruff, 24 ref tests, csim and sanitize 100/100) and the stand-in weights, manifest and vectors are byte-identical. `ref/intref.py` is a shared contract file, so it needs your ack | [#115](https://github.com/psamin/robotfpga/issues/115) |
-| Q12 | psamin | FPGA (@athithan-elamaran1, @Dhyey234) | Synthesize `hls/stream/float_top.cpp` (`run_float_hls.tcl`, 300 MHz) and build the block design: bundles `hp0..hp3` → S_AXI_HP0–3_FPD, `io` → S_AXI_HPC0_FPD. Report timing, II of the reduction loop, DSP/BRAM/URAM, then the measured GEMM bandwidth on the board | [plans/smolvla-fpga.md](plans/smolvla-fpga.md) |
+| Q12 | psamin | FPGA (@athithan-elamaran1, @Dhyey234) | Synthesize `fpga/hls/float_top.cpp` (`run_float_hls.tcl`, 300 MHz) and build the block design: bundles `hp0..hp3` → S_AXI_HP0–3_FPD, `io` → S_AXI_HPC0_FPD. Report timing, II of the reduction loop, DSP/BRAM/URAM use, then the measured GEMM bandwidth on the board | [docs/smolvla-fpga.md](docs/smolvla-fpga.md) |
+| Q13 | psamin | psamin | Speed vs precision: FP32 math gives ~3–4 s per chunk. Options are BF16 multiplies with FP32 accumulation (several times more MACs per DSP), running the vision encoder less often, or accepting a slower control rate | [docs/smolvla-fpga.md](docs/smolvla-fpga.md) §Verification |
+| Q14 | psamin | @m-alan08 | The SGS pipeline was removed with the cube-sorting sim (recoverable at `archive/cube-sorting`). RL post-training of SmolVLA would need a pick-and-place sim, would start from the `-9604` checkpoint, and would write a new checkpoint. Any training run needs psamin's approval first | [CONTRIBUTING.md](CONTRIBUTING.md) |
 
 ## Answered
 
 | # | Question | Answer | Date | Evidence |
 |---|---|---|---|---|
-| A1 | Real-arm launch command, model, joint order/units, camera/preprocessing | Real-arm stack exists in psamin/roboticsexp `so101/` (SmolVLA, different task); TinyPolicy v3r2 not wired to it. Units, ports, cameras, calibration in SETUP.md §2 and §4.1 | 2026-10-09 | [#87 correction](https://github.com/psamin/robotfpga/issues/87#issuecomment-6075239385), [SETUP.md](SETUP.md) |
-| A2 | Software-side review of the golden-vector generator (#6) | Approved from software; used for the v3r2 vectors, HLS C model 100/100 | 2026-10-09 | [#6 comment](https://github.com/psamin/robotfpga/pull/6#issuecomment-6075156540) |
-| A3 | Q1: KR260 boot, versions, endpoint, SSH user | Boots Ubuntu 22.04.4 (kernel 5.15.0-1027-xilinx-zynqmp), Python 3.10.12, PYNQ 3.0.1. Private LAN a private ICS address behind the controller laptop, SSH user `ubuntu` | 2026-10-09 | [#87](https://github.com/psamin/robotfpga/issues/87#issuecomment-6075687430) |
-| A4 | Q2: M0/M1 results | M0: boot, PYNQ and custom overlay load pass. `board/m0/` inventory not run. M1 DMA loopback not run (the built design uses `m_axi`, no DMA) | 2026-10-09 | [#87](https://github.com/psamin/robotfpga/issues/87#issuecomment-6075687430) |
-| A5 | Q3: matching `policy.bit` / `policy.hwh`? | Yes, for the board owner's 16-lane layer engine (source not in git yet, #98). Vitis HLS / Vivado 2022.2, 100 MHz, WNS +2.371 ns; 100/100 v3r2 vectors on hardware, 8.03 ms | 2026-10-09 | [#87](https://github.com/psamin/robotfpga/issues/87#issuecomment-6075687430), #15 |
-| A-Q4 | Bridge split | Agreed by software: software owns `armlab/backends/remote_backend.py` + SO-101 controller adapter; FPGA side owns the board TCP service and overlays. Athithan to contribute his `PolicyBackend` client as the starting PR | 2026-10-09 | [#87](https://github.com/psamin/robotfpga/issues/87#issuecomment-6075858540) |
-| A-Q6 | TinyPolicy-L | Superseded: int8 TinyPolicy retired on 2026-10-13; the target is the fine-tuned SmolVLA in full precision | 2026-10-14 | [plans/smolvla-fpga.md](plans/smolvla-fpga.md) |
-| A-Q7 | Futurama GPUs for SmolVLA jobs | `general` partition (1-day limit; `techfee` 3 days): H100 80 GB (`nvidia-h100`, back online, driver 595.84), H200 141 GB ×4, L40S 48 GB ×4, L4 24 GB ×4; L40 node down on 2026-10-13. CPU-only nodes failed "user env retrieval" for psamin, so use GPU nodes even for CPU work. Accounting DB is down, so no QOS info | 2026-10-14 | `sinfo`, job logs 9973/10005 |
-| A-Q9/Q10 | SGS benchmark and teacher runs | Not run: the owner decided on 2026-10-13 not to train a new sim policy without approval. Jobs 9973/9974 were cancelled before the teacher started | 2026-10-14 | this file |
+| A-1 | KR260 boot, versions, endpoint | Ubuntu 22.04.4 (kernel 5.15.0-1027-xilinx-zynqmp), Python 3.10.12, PYNQ 3.0.1; private Ethernet link behind the controller laptop, SSH user `ubuntu` | 2026-10-09 | [#87](https://github.com/psamin/robotfpga/issues/87#issuecomment-6075687430) |
+| A-2 | Full precision or int8? | Full precision: BF16 weights, FP32 math; linear layers on the FPGA, the rest on the ARM; int8 retired | 2026-10-13 | owner decision, [#151](https://github.com/psamin/robotfpga/pull/151) |
+| A-3 | Which task and policy? | Only the medicine-bottle pick-and-place, with the SmolVLA fine-tuned on our demos; cube sorting removed | 2026-10-14 | owner decision |
+| A-4 | Bridge split | Software owns the laptop client and the arm controller; FPGA owns the board service and overlays | 2026-10-09 | [#87](https://github.com/psamin/robotfpga/issues/87#issuecomment-6075858540) |
+| A-5 | Cluster GPUs | `general` (1-day limit): H100 80 GB, H200 141 GB ×4, L40S 48 GB ×4, L4 24 GB ×4; `techfee` 3 days. Use GPU nodes even for CPU-only jobs | 2026-10-14 | `sinfo`, job logs |
