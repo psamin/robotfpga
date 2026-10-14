@@ -22,7 +22,7 @@ SEPARATION = 0.03  # m between the bottle and the plate rim at the start
 MIN_X = 0.10  # objects start in front of the base: the front video shows the table starting at the base
 
 RANGES = {  # metres, kilograms; see the plan's table for the basis of each range
-    "bottle_height": (0.07, 0.15),
+    "bottle_height": (0.065, 0.11),
     "body_radius": (0.015, 0.025),
     "cap_radius": (0.010, 0.016),
     "cap_height": (0.015, 0.025),
@@ -34,6 +34,7 @@ RANGES = {  # metres, kilograms; see the plan's table for the basis of each rang
 }
 DEMO_BOTTLE, DEMO_PLATE = (0.25, 0.09), (0.33, -0.19)  # estimated from the demos (#172, #174)
 DEMO_JITTER = 0.02
+DEMO_START = (-97.0, -103.0, 96.0, 54.0, 0.0, 2.0)  # LeRobot units, the demos' typical first frame
 
 
 @dataclass(frozen=True)
@@ -173,3 +174,23 @@ def reachable_grid(step: float = 0.02, heights=(0.03, 0.12), tol: float = 0.003,
     path.parent.mkdir(parents=True, exist_ok=True)
     np.save(path, grid)
     return grid
+
+
+def touching(model: mujoco.MjModel, data: mujoco.MjData, body: str, others: set[int]) -> bool:
+    b = model.body(body).id
+    for c in data.contact[: data.ncon]:
+        pair = {model.geom_bodyid[c.geom1], model.geom_bodyid[c.geom2]}
+        if b in pair and pair - {b} <= others and pair - {b}:
+            return True
+    return False
+
+
+def success(model: mujoco.MjModel, data: mujoco.MjData, p: SceneParams) -> bool:
+    """The bottle rests upright inside the plate's flat area and the arm no longer touches it."""
+    bottle = data.body("bottle")
+    q = bottle.xquat
+    upright = 1 - 2 * (q[1] ** 2 + q[2] ** 2) > 0.95
+    inside = np.linalg.norm(bottle.xpos[:2] - np.asarray(p.plate_xy)) < p.plate_inner_radius
+    resting = bottle.xpos[2] < 0.012
+    arm = {i for i in range(1, model.nbody) if model.body(i).name not in ("bottle", "plate")}
+    return bool(upright and inside and resting and not touching(model, data, "bottle", arm))

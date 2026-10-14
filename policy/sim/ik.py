@@ -99,6 +99,22 @@ class TopDownIK:
                 best = (q, ep)
         return best
 
+    def solve_oriented(self, pos, approach, q0, iters: int = 150, w: float = 0.05, damping: float = 1e-4):
+        """Reach pos with the approach axis near `approach` and the jaws closing horizontally (the site's
+        z axis level), both soft (weight w) so the position wins: the arm has 5 joints."""
+        q = np.array(q0, dtype=float)[:ARM]
+        approach = np.asarray(approach, dtype=float)
+        for _ in range(iters):
+            p, r = self._fk(q)
+            jaw = r[:, 2]
+            e = np.concatenate(
+                [pos - p, w * (np.cross(r[:, 0], approach) + np.cross(jaw, jaw - [0, 0, jaw[2]]))]
+            )
+            mujoco.mj_jacSite(self.m, self.d, self._jp, self._jr, self.site)
+            J = np.vstack([self._jp[:, :ARM], w * self._jr[:, :ARM]])
+            q = np.clip(q + J.T @ np.linalg.solve(J @ J.T + damping * np.eye(6), e), self.lo, self.hi)
+        return q, float(np.linalg.norm(pos - self._fk(q)[0]))
+
     def tilt(self, q: np.ndarray) -> float:
         """Angle (rad) between the gripper's approach axis and straight down."""
         _, r = self._fk(np.asarray(q)[:ARM])

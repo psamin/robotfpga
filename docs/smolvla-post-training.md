@@ -43,7 +43,7 @@ ranges, to revisit after the first teacher runs:
 
 | Parameter | Range | Basis |
 |---|---|---|
-| Bottle height | 7 to 15 cm | taller than about 6.5 cm: the cap is grasped 4 to 6 cm up |
+| Bottle height | 6.5 to 11 cm | the cap is grasped 4 to 6 cm up and sits on top, so the real bottle is probably about 7 cm; taller bottles hit the gripper's palm at the demos' grasp angles (#181) |
 | Bottle body diameter | 3 to 5 cm | about 3.5 cm from the gripper reading while holding the body (#176) |
 | Cap diameter | 2 to 3.2 cm | about 2.7 cm from the front video, 2.1 cm from the gripper reading |
 | Cap height | 1.5 to 2.5 cm | not estimated |
@@ -61,6 +61,13 @@ both demo spots. The demos do not grasp top-down: the gripper is tilted 33 to 77
 grasp (mean 50) and 48 to 85 deg at release, so the scripted expert and the reset families use
 angled grasps. Generalizing beyond the taped spot is new for SmolVLA (its demos never left it);
 whether it transfers shows only in real trials.
+
+**Scripted expert (#181).** `policy/sim/expert.py` grasps like the demos (tilted approach chosen per
+target, jaws closing horizontally on the upper body, close until the gripper stops, lift, carry,
+lower, release) as a check that the scene is solvable in physics. It solves the demo scene (195 steps,
+6.5 s) and 24 of 30 random scenes (seed 0); the failures cluster with the bottle or plate within
+about 15 cm of the base, where angled grasps are cramped and the demos never went, plus one at the
+far edge. These stay in the distribution: whether the RL teacher solves them is part of the result.
 
 **When measurements still matter.** Not to build the scene, but (1) before DAgger, an on-arm gripper
 check (Q16), because a wrong gripper conversion biases every label, and (2) before real trials, a
@@ -151,7 +158,7 @@ mass, the plate's rim height, and the gripper reading to opening width mapping.
 2. Restore the task-independent code (SGS NumPy + JAX, PPO, calibration tools) into `policy/rl/`
    and `policy/calib/` with its tests and the optional dependency group.
 3. Randomized pick-and-place scene (ranges above, reachable area from IK; #179), then a scripted
-   angled-grasp expert as a sanity check.
+   angled-grasp expert as a sanity check (#181).
 4. Reset families, buffer, CPU teacher env with the pick-and-place success and reward.
 5. MJX/Warp teacher env with parity tests; batched SGS env; training, eval, comparison jobs.
 6. GPU benchmark on the new scene, then the first teacher runs (SGS vs uniform). Each run needs

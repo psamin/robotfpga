@@ -17,7 +17,7 @@ linear layers on the FPGA). Cube-sorting work removed; preserved at tag `archive
 | Area | State | Where |
 |---|---|---|
 | Policy | Fine-tuned SmolVLA, checkpoint `smolvla-so101_medicine_bottle_pickplace-9604` on the cluster | [SETUP.md](SETUP.md) §3 |
-| Post-training (Alan) | Approved in #156. SGS, PPO and camera calibration restored (#162, #164). Layout estimated from the demos and front video, gripper mapping derived, scene to be randomized (#172, #174, #176, #177; open PRs). Scene not built; no training run yet | [docs/smolvla-post-training.md](docs/smolvla-post-training.md) |
+| Post-training (Alan) | Approved in #156. SGS, PPO and camera calibration restored (#162, #164). Layout estimated from the demos and front video, gripper mapping derived (#172, #174, #176). Randomized pick-and-place scene and a scripted angled-grasp expert built (#178, #180, #181; open PRs): the expert solves the demo scene and 24/30 random scenes. No training run yet | [docs/smolvla-post-training.md](docs/smolvla-post-training.md) |
 | Real arm | Follower + leader calibrated; teleop / record / rollout toolkit works | [robot/](robot/README.md) |
 | FPGA engine | `fpga/hls/` passes C simulation on real SmolVLA layers; whole SmolVLA through the engine code matches PyTorch FP32 to ~0.01° mean. Not synthesized | [docs/smolvla-fpga.md](docs/smolvla-fpga.md) |
 | Estimated FPGA speed | ~3–4 s per 50-action chunk, compute-bound | [docs/smolvla-fpga.md](docs/smolvla-fpga.md) §Verification |
