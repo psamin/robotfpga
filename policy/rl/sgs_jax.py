@@ -89,3 +89,12 @@ def sample(state: SGSState, key: jax.Array, shape=(), params: SGSParams = DEFAUL
     cdf = jnp.cumsum(probabilities(state, params))
     u = jax.random.uniform(key, shape, cdf.dtype) * cdf[-1]
     return jnp.minimum(jnp.searchsorted(cdf, u, side="right"), cdf.size - 1)
+
+
+def sample_block(
+    state: SGSState, key: jax.Array, start: int, size: int, shape=(), params: SGSParams = DEFAULTS
+):
+    """IID IDs from rows [start, start + size) only, with SGS weights renormalized inside the block."""
+    cdf = jnp.cumsum(jax.nn.softmax(jax.lax.dynamic_slice(logits(state, params), (start,), (size,))))
+    u = jax.random.uniform(key, shape, cdf.dtype) * cdf[-1]
+    return start + jnp.minimum(jnp.searchsorted(cdf, u, side="right"), size - 1)
