@@ -11,7 +11,7 @@ is `"Pick up the medicine bottle and place it on the plate"`.
 
 | Item | Value |
 |---|---|
-| Bottle, plate: size, position, table layout | **Not measured.** Positions estimated from the demo joint data (bottle about 25 cm out, 9 cm left of the base; plate about 32 cm out, 21 cm right): [docs/smolvla-post-training.md](docs/smolvla-post-training.md). Sizes and mass unknown |
+| Bottle, plate: size, position, table layout | **Not measured.** Positions estimated from the demo joint data (bottle about 25 cm out, 9 cm left of the base; plate about 32 cm out, 21 cm right): [docs/smolvla-post-training.md](docs/smolvla-post-training.md). Plate about 19 cm across (12 cm inside the patterned rim), cap about 2.7 cm, from the front video. Bottle height, body diameter and mass unknown |
 | Episode length | up to 20 s (`EPISODE_S` in `robot/toolkit/env.sh`) |
 
 ## 2. Hardware
