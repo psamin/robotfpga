@@ -4,6 +4,7 @@
 // PASS if every output is within 1e-5 * sum_k |x_k w_k| of the float64 reference: FP32 rounding of
 // a few hundred chained adds stays far inside that, while any indexing or packing bug is O(1).
 #include <math.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
