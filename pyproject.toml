@@ -8,6 +8,7 @@ dependencies = ["numpy>=2.0"]
 [dependency-groups]
 dev = ["pytest>=8", "ruff>=0.6"]
 rl = ["jax>=0.7"]  # SGS post-training (docs/smolvla-post-training.md); uv sync --group rl
+calib = ["mujoco==3.14.0", "opencv-python-headless>=4.9"]  # policy/calib; uv sync --group calib
 
 [tool.uv]
 package = false  # scripts and tools, not an installable package; SmolVLA runs in its own LeRobot env
