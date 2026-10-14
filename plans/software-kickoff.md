@@ -1,5 +1,10 @@
 # Software kickoff plan
 
+> **Superseded on 2026-10-13.** The project now deploys the fine-tuned SmolVLA in full precision
+> (BF16 weights, FP32 math) with its linear layers on the FPGA; the int8 TinyPolicy contract below is
+> retired and kept for reference. Current plan: [smolvla-fpga.md](smolvla-fpga.md).
+
+
 How the software side (sim, data, training, quantization, eval, board bridge) gets started from
 [build-spec.md](build-spec.md). Status as of 2026-10-01.
 

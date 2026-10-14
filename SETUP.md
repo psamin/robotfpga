@@ -1,5 +1,10 @@
 # Setup: the complete physical and software setup
 
+> **Superseded on 2026-10-13.** The project now deploys the fine-tuned SmolVLA in full precision
+> (BF16 weights, FP32 math) with its linear layers on the FPGA; the int8 TinyPolicy contract below is
+> retired and kept for reference. Current plan: [smolvla-fpga.md](plans/smolvla-fpga.md).
+
+
 This is the single reference for how everything is set up: the physical scene, the robot interface,
 the policy, the training pipeline, the FPGA build and the board. Every number comes from a file on
 `main` (the source is named next to it). Anything not built or not measured is marked **NOT BUILT**

@@ -1,5 +1,10 @@
 # FPGA capacity: the largest quantized policy the KR260 can run
 
+> **Superseded on 2026-10-13.** The project now deploys the fine-tuned SmolVLA in full precision
+> (BF16 weights, FP32 math) with its linear layers on the FPGA; the int8 TinyPolicy contract below is
+> retired and kept for reference. Current plan: [smolvla-fpga.md](smolvla-fpga.md).
+
+
 For whoever trains the next policy. It gives the exact network to train so it runs on the board's
 FPGA, and the limits behind it. Numbers come from the built 16-lane layer engine (#98): Vivado
 post-route reports, the HLS report, and on-board timing. Check any other design with
