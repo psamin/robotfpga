@@ -2,7 +2,7 @@
 #SBATCH -J armlab-smolvla-fpga
 #SBATCH -p general
 #SBATCH -c 64
-#SBATCH -C x86_64
+#SBATCH -w nvidia-l4   # CPU-only nodes fail "user env retrieval"; the GPU nodes load it fine
 #SBATCH --mem=128G
 #SBATCH -t 06:00:00
 #SBATCH -o logs/%x-%j.out
