@@ -116,7 +116,7 @@ def main():
 
     rows, chunk_stats = [], None
     g = torch.Generator().manual_seed(0)
-    for fi, i in enumerate(picks):
+    for i in picks:
         item = ds[i]
         noise = torch.randn((1, policy.config.chunk_size, policy.config.max_action_dim), generator=g)
         eng.fpga, eng.stats = False, {}

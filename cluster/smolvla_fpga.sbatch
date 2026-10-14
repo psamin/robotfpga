@@ -2,6 +2,7 @@
 #SBATCH -J armlab-smolvla-fpga
 #SBATCH -p general
 #SBATCH -c 64
+#SBATCH -C x86_64
 #SBATCH --mem=128G
 #SBATCH -t 06:00:00
 #SBATCH -o logs/%x-%j.out
