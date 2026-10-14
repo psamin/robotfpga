@@ -100,8 +100,15 @@ Reported by the board owner, 2026-10-08/09:
    KR260 preset, wires `hp0..hp3` to S_AXI_HP0..HP3_FPD and `io` to S_AXI_HPC0_FPD (all 128-bit), sets the
    PL clock to 300 MHz, and writes `build/float.bit` + `build/float.hwh` plus timing and utilization
    reports. The script is untested (no Vivado was available when it was written).
-4. On the board: `from fpga.board.runtime import Engine, fpga_linears`, then
-   `fpga_linears(policy, Engine("float.bit"))` on a `SmolVLAPolicy` loaded in FP32. Compare actions
-   with PyTorch before driving the arm.
+4. On the board, from the repo root (copy `float.bit` + `float.hwh` next to each other):
+   - `python3 fpga/board/check_engine.py --bit float.bit build/stream/float`: every engine test case vs the
+     float64 reference, plus the achieved weight bandwidth (target 16.2 GB/s).
+   - `python3 fpga/board/run_smolvla.py --bit float.bit --model <checkpoint dir> --batches <frames dir>`:
+     the fine-tuned SmolVLA with every linear layer on the FPGA, replaying real frames that
+     `cluster/smolvla_fpga.sbatch` dumps to `runs/smolvla-fpga/batches/`. It prints the difference from the
+     PyTorch FP32 reference and the time per 50-action chunk. The arm is not touched.
+   - The board needs PyTorch and the LeRobot fork for SmolVLA (aarch64). Weights are packed into DDR via
+     PYNQ's CMA; check `grep Cma /proc/meminfo` and raise the `cma=` boot argument if allocation fails
+     (needed size UNKNOWN until measured; SmolVLA's linear weights are 0.71 GB as BF16).
 
 Design, verification and the latency model: [docs/smolvla-fpga.md](docs/smolvla-fpga.md).

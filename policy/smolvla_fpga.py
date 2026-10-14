@@ -77,6 +77,17 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--frames", type=int, default=5)
     ap.add_argument("--exclude", type=int, nargs="*", default=[11, 14])
+    ap.add_argument(
+        "--runtime",
+        choices=["shim", "layout"],
+        default=None,
+        help="also run a second copy through fpga/board/runtime.py (mock engine), weights freed",
+    )
+    ap.add_argument(
+        "--dump-batches",
+        action="store_true",
+        help="save preprocessed inputs, noise and reference chunks for fpga/board/run_smolvla.py",
+    )
     args = ap.parse_args()
     out = Path(args.out).expanduser()
     out.mkdir(parents=True, exist_ok=True)
@@ -104,19 +115,40 @@ def main():
             n_linear += 1
     n_params = sum(p.numel() for p in policy.parameters())
     print(f"loaded: {n_params:,} params (stored {stored}), {n_linear} linear layers", flush=True)
+    rt_policy = rt_eng = None
+    if args.runtime:  # the code the board runs, on a second copy whose PyTorch weights get freed
+        import sys
+
+        sys.path.insert(0, str(ROOT))
+        from fpga.board.runtime import Engine as RtEngine
+        from fpga.board.runtime import fpga_linears
+
+        rt_policy = SmolVLAPolicy.from_pretrained(model_dir).float().to("cpu").eval()
+        rt_eng = RtEngine(mock=args.runtime)
+        swapped = fpga_linears(rt_policy, rt_eng)
+        left = sum(p.numel() for p in rt_policy.parameters())
+        print(
+            f"runtime ({args.runtime}): {swapped} linears on the engine, {left:,} params left in PyTorch",
+            flush=True,
+        )
 
     ds = LeRobotDataset(args.dataset)
     ep = np.asarray(ds.hf_dataset["episode_index"])
     idx = [i for i in range(len(ds)) if int(ep[i]) not in args.exclude]
     picks = [idx[j] for j in np.linspace(0, len(idx) - 1, args.frames).astype(int)]
 
-    def run(item, noise):
+    def prepare(item):
         batch = {RENAME.get(k, k): v for k, v in item.items() if k.startswith("observation.")}
         batch["task"] = item["task"]
-        batch = pre(batch)
-        policy.reset()
+        return pre(batch)
+
+    def run(pol, batch, noise, raw=False):
+        batch = {k: (v.clone() if torch.is_tensor(v) else v) for k, v in batch.items()}
+        pol.reset()
         with torch.no_grad():
-            chunk = policy.predict_action_chunk(batch, noise=noise)
+            chunk = pol.predict_action_chunk(batch, noise=noise)
+        if raw:
+            return chunk
         return post(chunk).float().cpu().numpy().reshape(-1, chunk.shape[-1])[:, :6]
 
     rows, chunk_stats = [], None
@@ -124,16 +156,30 @@ def main():
     for i in picks:
         item = ds[i]
         noise = torch.randn((1, policy.config.chunk_size, policy.config.max_action_dim), generator=g)
+        batch = prepare(item)
         eng.fpga, eng.stats = False, {}
         t0 = time.perf_counter()
-        a_ref = run(item, noise)
+        a_ref = run(policy, batch, noise)
         t_ref = time.perf_counter() - t0
+        if args.dump_batches:
+            (out / "batches").mkdir(exist_ok=True)
+            torch.save(
+                {
+                    "frame": int(i),
+                    "batch": batch,
+                    "noise": noise,
+                    "ref_chunk_raw": run(policy, batch, noise, raw=True),
+                    "ref_actions_deg": a_ref,
+                },
+                out / "batches" / f"frame_{i:05d}.pt",
+            )
         if chunk_stats is None:
             chunk_stats = json.loads(json.dumps(eng.stats))
         eng.fpga = True
         t0 = time.perf_counter()
-        a_fpga = run(item, noise)
+        a_fpga = run(policy, batch, noise)
         t_fpga = time.perf_counter() - t0
+        eng.fpga = False
         gt = item["action"].float().numpy()[:6]
         rows.append(
             {
@@ -146,6 +192,10 @@ def main():
                 "cpu_seconds_fpga_code": round(t_fpga, 2),
             }
         )
+        if rt_policy is not None:
+            a_rt = run(rt_policy, batch, noise)
+            rows[-1]["runtime_max_abs_diff_deg"] = float(np.abs(a_rt - a_ref).max())
+            rows[-1]["runtime_vs_engine_code_max_abs_diff_deg"] = float(np.abs(a_rt - a_fpga).max())
         print(json.dumps(rows[-1]), flush=True)
 
     layers = [{"name": k, **v} for k, v in chunk_stats.items()]
