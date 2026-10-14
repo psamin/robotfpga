@@ -122,6 +122,26 @@ def project_mujoco(point, pos, quat, fovy: float, size) -> np.ndarray:
     return np.array([w / 2 + f * p[0] / -p[2], h / 2 - f * p[1] / -p[2]])
 
 
+def wrist_relative(pos, quat, joints, body: str = "gripper") -> dict:
+    """Camera pose relative to `body`, from its world pose and the arm's LeRobot joint readings (degrees)."""
+    from policy.sim.so101 import lerobot_to_sim, load_model
+
+    m = load_model()
+    d = mujoco.MjData(m)
+    d.qpos[:5] = lerobot_to_sim(joints)
+    mujoco.mj_kinematics(m, d)
+    rb, pb = d.body(body).xmat.reshape(3, 3), d.body(body).xpos
+    rc = np.zeros(9)
+    mujoco.mju_quat2Mat(rc, np.asarray(quat, float))
+    q = np.zeros(4)
+    mujoco.mju_mat2Quat(q, (rb.T @ rc.reshape(3, 3)).ravel())
+    return {
+        "body": body,
+        "pos": (rb.T @ (np.asarray(pos) - pb)).round(5).tolist(),
+        "quat": q.round(6).tolist(),
+    }
+
+
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -139,7 +159,17 @@ def main(argv=None) -> None:
     b.add_argument("--tag-id", type=int)
     b.add_argument("--name", default="front")
     b.add_argument("--out")
+    c = sub.add_parser("wrist", help="wrist camera pose relative to the gripper, from a pose JSON and joints")
+    c.add_argument("--pose", required=True, help="JSON from the pose command on a wrist photo of the tag")
+    c.add_argument("--joints", type=float, nargs=5, required=True, help="LeRobot readings at capture (deg)")
+    c.add_argument("--out", required=True)
     args = ap.parse_args(argv)
+    if args.cmd == "wrist":
+        cam = json.loads(Path(args.pose).read_text())
+        rel = {**wrist_relative(cam["pos"], cam["quat"], args.joints), "fovy": cam["fovy"]}
+        Path(args.out).write_text(json.dumps(rel, indent=2) + "\n")
+        print(f"wrist camera relative to {rel['body']}: pos {rel['pos']} quat {rel['quat']} -> {args.out}")
+        return
     if args.cmd == "intrinsics":
         cols, rows = map(int, args.board.lower().split("x"))
         res = calibrate_intrinsics([cv2.imread(p) for p in args.images], (cols, rows), args.square)
