@@ -113,7 +113,7 @@ mass, the plate's rim height, and the gripper reading to opening width mapping.
 |---|---|---|
 | Bottle height, body diameter and mass; plate rim height (plate and cap diameters are estimated above) | scene, success | Q15 |
 | Table layout | Rest family, randomization ranges | Estimated from the demos and checked against the front video (above) |
-| Sim radians to LeRobot units per joint (sign, zero offset, gripper 0 to 100 vs the sim gripper angle) | every SmolVLA input and label | Q16 |
+| Sim radians to LeRobot units per joint | every SmolVLA input and label | Derived and checked against the demos (`policy/sim/so101.py`, #175); Q16 asks for an on-arm check |
 | Front and wrist camera poses and intrinsics | rendering SmolVLA's inputs | photo session with `calib/camera.py` |
 
 ## Order of work (one issue and PR each, about 200 lines)

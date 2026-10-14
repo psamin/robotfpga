@@ -1,5 +1,3 @@
-import subprocess
-
 import numpy as np
 import pytest
 
@@ -10,8 +8,7 @@ import pyarrow.parquet as pq  # noqa: E402
 from policy.sim import so101  # noqa: E402
 from policy.sim.demo_layout import estimate, grip_events, gripper_positions  # noqa: E402
 
-HAS_TAG = subprocess.run(["git", "rev-parse", "-q", "--verify", so101.TAG], cwd=so101.REPO).returncode == 0
-needs_tag = pytest.mark.skipif(not HAS_TAG, reason=f"git tag {so101.TAG} not fetched")
+needs_tag = pytest.mark.skipif(not so101.tag_available(), reason=f"git tag {so101.TAG} not fetched")
 
 
 def trace(held=19.0):
