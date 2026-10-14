@@ -5,6 +5,7 @@ import pytest
 
 jax = pytest.importorskip("jax")
 pytest.importorskip("mujoco")
+pytest.importorskip("mujoco_warp")  # eval_teacher -> train_teacher -> teacher_mjx needs the gpu group
 
 from policy.rl import ppo  # noqa: E402
 from policy.rl.eval_teacher import main  # noqa: E402
