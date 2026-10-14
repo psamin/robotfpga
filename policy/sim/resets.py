@@ -18,11 +18,11 @@ import mujoco
 import numpy as np
 
 from policy.sim.expert import choose_approach, grasp_height, grasp_site
+from policy.sim.families import FAMILIES
 from policy.sim.ik import TopDownIK
 from policy.sim.scene import DEMO_START, SUBSTEPS, SceneParams, build, place, sample_positions, success
 from policy.sim.so101 import gripper_to_sim, lerobot_to_sim
 
-FAMILIES = ("rest", "reaching", "stable_grasp", "near_goal")
 REST_JITTER_DEG = 3.0
 LIFT = (0.06, 0.12)  # m, bottle bottom while carried
 NEAR_GOAL_TOP, NEAR_GOAL_FRAC = 0.04, (0.0, 1.1)
