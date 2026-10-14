@@ -7,6 +7,7 @@ dependencies = ["numpy>=2.0"]
 
 [dependency-groups]
 dev = ["pytest>=8", "ruff>=0.6"]
+rl = ["jax>=0.7"]  # SGS post-training (docs/smolvla-post-training.md); uv sync --group rl
 
 [tool.uv]
 package = false  # scripts and tools, not an installable package; SmolVLA runs in its own LeRobot env
@@ -18,3 +19,7 @@ extend-exclude = ["robot/toolkit"]  # verbatim copy of psamin/roboticsexp so101/
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]  # not an installable package; tests import policy.* from the repo root
+testpaths = ["tests"]
