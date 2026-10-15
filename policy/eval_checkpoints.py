@@ -174,6 +174,12 @@ def main():
     results = {}
     for spec in args.ckpt:
         name, path = spec.split("=", 1)
+        missing = [
+            q for q in (path.split("@")[1:3] if path.startswith("merge@") else [path]) if not Path(q).exists()
+        ]
+        if missing:  # a run that failed: keep evaluating the rest
+            print(f"skip {name}: missing {missing}", flush=True)
+            continue
         policy, proc_path, tagged = load(path, SmolVLAPolicy)
         policy = policy.to("cuda").eval()
         pre, _ = make_pre_post_processors(policy.config, pretrained_path=proc_path)
