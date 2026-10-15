@@ -117,9 +117,9 @@ def main():
     args = ap.parse_args()
 
     from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
-    from lerobot.datasets.transforms import ImageTransforms, ImageTransformsConfig
     from lerobot.policies.factory import make_pre_post_processors
     from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+    from lerobot.transforms import ImageTransforms, ImageTransformsConfig
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
