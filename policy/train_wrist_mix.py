@@ -158,7 +158,10 @@ def main():
     ap.add_argument("--exclude", type=int, nargs="*", default=[11, 14])
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--aug", choices=["default", "light"], default="default", help="image augmentation set")
+    ap.add_argument(
+        "--aug", choices=["default", "light", "shadow20"], default="default", help="image augmentation set"
+    )
+    ap.add_argument("--shadow-p", type=float, default=0.2, help="shadow20: fraction of frames given a shadow")
     ap.add_argument("--save-every", type=int, default=500, help="intermediate checkpoints (~0.9 GB each)")
     ap.add_argument(
         "--norm",
@@ -186,7 +189,13 @@ def main():
         else ImageTransformsConfig(enable=True)
     )
     aug = ImageTransforms(aug_cfg)
-    print(f"augmentation {args.aug}: {sorted(aug.transforms)}", flush=True)
+    if args.aug == "shadow20":
+        # default set, plus a random shadow band on --shadow-p of frames (arXiv 2101.05361)
+        from lerobot.transforms.transforms import RandomShadow
+        from torchvision.transforms import v2
+
+        aug = v2.Compose([aug, v2.RandomApply([RandomShadow(opacity=(0.3, 0.6))], p=args.shadow_p)])
+    print(f"augmentation {args.aug}: {aug}", flush=True)
 
     def dataset(repo, episodes=None):
         meta = LeRobotDatasetMetadata(repo)
