@@ -179,6 +179,10 @@ def main():
     ap.add_argument("--dedup-tasks", action="store_true", help="skip community datasets repeating a task set")
     ap.add_argument("--holdout", default=None, help="regex: skip community datasets with a matching task")
     ap.add_argument(
+        "--retrieved", default=None, help="strap_retrieve.py output: segments sampled as a source"
+    )
+    ap.add_argument("--p-retrieved", type=float, default=0.0, help="share of steps drawn from --retrieved")
+    ap.add_argument(
         "--l2sp", type=float, default=0.0, help="weight of sum (w - w_base)^2 over trained params"
     )
     ap.add_argument(
@@ -259,6 +263,24 @@ def main():
         flush=True,
     )
     sources = {"ours": forever(lambda: loader(ours_v, args.batch, args.workers))}
+    if args.retrieved:  # STRAP sub-trajectories, indexed in datasets loaded with the same episodes as here
+        segs = json.load(open(args.retrieved))["segments"]
+        subsets = []
+        for repo in sorted({g["repo"] for g in segs}):
+            r, meta = usable_row(args.usable, repo), LeRobotDatasetMetadata(repo)
+            ds, _ = dataset(repo, list(range(min(args.community_episodes, meta.total_episodes))))
+            view = View(
+                ds,
+                {r["wrist"][0]: CAM2},
+                shapes,
+                stats_remap(meta.stats, ours_meta.stats),
+                tag_for(repo) if args.tag_prompt else "",
+            )
+            idx = sorted({i for g in segs if g["repo"] == repo for i in range(g["start"], g["end"])})
+            subsets.append(torch.utils.data.Subset(view, idx))
+            print(f"retrieved {repo}: {len(idx)} frames", flush=True)
+        retrieved = ConcatDataset(subsets)
+        sources["retrieved"] = forever(lambda: loader(retrieved, args.batch, args.workers))
     if parts:
         sources["community"] = forever(lambda: loader(comm, args.batch, args.workers))
     else:
@@ -296,7 +318,13 @@ def main():
     log = open(out / "metrics.jsonl", "w")
     t0 = time.time()
     for step in range(args.steps):
-        src = "ours" if random.random() < args.p_ours else "community"
+        u = random.random()
+        if u < args.p_ours:
+            src = "ours"
+        elif u < args.p_ours + args.p_retrieved and "retrieved" in sources:
+            src = "retrieved"
+        else:
+            src = "community"
         batch = next(sources[src])
         dropped = src == "ours" and random.random() < args.p_drop_front
         if dropped:
