@@ -36,6 +36,15 @@ CAM1, CAM2 = "observation.images.camera1", "observation.images.camera2"
 SKIP = re.compile(r"sim|aug|gen|test|pi0", re.I)  # synthetic, augmented, or scratch datasets
 
 
+def tag_for(repo: str) -> str:
+    """Dataset tag prefixed to the task text with --tag-prompt; ours gets a fixed robot tag."""
+    return "[so101-psamin] " if repo == OURS else f"[{repo}] "
+
+
+def usable_row(usable_json: str, repo: str) -> dict:
+    return next(r for r in json.load(open(usable_json))["all"] if r["id"] == repo)
+
+
 def pick_community(usable_json: str, n: int) -> list[dict]:
     rows = json.load(open(usable_json))["usable"]
     rows = [
@@ -84,9 +93,9 @@ class View(torch.utils.data.Dataset):
     remap: {key: (a, b)} applies x -> a * x + b to state/action, used to move a community dataset's
     joints into our normalization statistics (per-dataset normalization)."""
 
-    def __init__(self, ds, cams: dict[str, str], shapes: dict[str, tuple[int, int]], remap=None):
+    def __init__(self, ds, cams: dict[str, str], shapes: dict[str, tuple[int, int]], remap=None, tag=""):
         self.ds, self.cams, self.shapes = ds, cams, shapes  # cams: source key -> policy key
-        self.remap = remap or {}
+        self.remap, self.tag = remap or {}, tag
 
     def __len__(self):
         return len(self.ds)
@@ -103,6 +112,7 @@ class View(torch.utils.data.Dataset):
     def _get(self, i):
         it = self.ds[i]
         out = {k: it[k] for k in ("observation.state", "action", "action_is_pad", "task") if k in it}
+        out["task"] = self.tag + out["task"]
         for k, (a, b) in self.remap.items():
             out[k] = out[k] * a + b
         for src, dst in self.cams.items():

@@ -7,7 +7,13 @@ comparable). Conditions on our demos:
   wrist_only  front camera removed (SmolVLA skips missing cameras)
   gamma_0.5 / gamma_2.0      exposure: brighter / darker (img ** gamma)
   warm_3000K / cool_10000K   color temperature, approximate black-body white balance vs 6500 K
+  shadow      one random shadow band per image (RandomShadow, opacity 0.3-0.6, fixed seed)
 Community: held-out episodes (index >= --community-episodes, never used in training), wrist only.
+--eval-repos picks the community datasets; a dataset whose whole task family a run held out tests new tasks.
+
+Checkpoints: name=<dir>, or name=merge@<dir A>@<dir B>@<alpha> for the weight interpolation
+(1 - alpha) * A + alpha * B (RETAIN, arXiv 2512.08333; WiSE-FT). A run's dataset tags (--tag-prompt) are read
+from its runmeta.json and applied to the task text, so tagged checkpoints are evaluated as trained.
 
 Our frames come from the demos every checkpoint was trained on, so "both" measures fit, not generalization;
 the camera, lighting and community conditions are inputs no checkpoint was trained on. Closed-loop trials
@@ -24,7 +30,24 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from train_wrist_mix import CAM1, CAM2, OURS, RENAME, View, pick_community, stats_remap  # noqa: E402
+from train_wrist_mix import (  # noqa: E402
+    CAM1,
+    CAM2,
+    OURS,
+    RENAME,
+    View,
+    stats_remap,
+    tag_for,
+    usable_row,
+)
+
+EVAL_REPOS = [
+    "DmitryStrog/so101_pnp_merged_500",
+    "nbirukov/so101_pnp_merged2",
+    "tttonyalpha/so101_pick_cube_300_task1",
+    "tttonyalpha/so101_pick_cube_300_task3",  # "Remember the color ..." family (held out by --holdout)
+    "avanturist/so101_rgb_cube_300_task2",  # same family
+]
 
 # sRGB of a black body relative to 6500 K white, rounded (standard Planckian-locus tables)
 WHITE = {"warm_3000K": (1.00, 0.69, 0.43), "cool_10000K": (0.79, 0.85, 1.00)}
@@ -37,7 +60,35 @@ def lighting(name: str):
     if name in WHITE:
         w = torch.tensor(WHITE[name]).view(3, 1, 1)
         return lambda img: (img * w.to(img.device)).clamp(0, 1)
+    if name == "shadow":
+        from lerobot.transforms.transforms import RandomShadow
+
+        sh = RandomShadow(opacity=(0.3, 0.6))
+        return lambda img: sh(img)
     return lambda img: img
+
+
+def runmeta(path: str) -> dict:
+    """The training run's runmeta.json above a pretrained_model dir (final or checkpoints/<step>/), or {}."""
+    p = Path(path)
+    for d in (p.parent, p.parent.parent.parent):
+        if (d / "runmeta.json").exists():
+            return json.loads((d / "runmeta.json").read_text())
+    return {}
+
+
+def load(spec: str, SmolVLAPolicy):
+    """(policy, processor path, tag mode) for name=<dir> or name=merge@A@B@alpha."""
+    if spec.startswith("merge@"):
+        _, a, b, alpha = spec.split("@")
+        alpha = float(alpha)
+        pa = SmolVLAPolicy.from_pretrained(a)
+        sb = SmolVLAPolicy.from_pretrained(b).state_dict()
+        sa = pa.state_dict()
+        merged = {k: (1 - alpha) * v + alpha * sb[k] if v.is_floating_point() else v for k, v in sa.items()}
+        pa.load_state_dict(merged)
+        return pa, a, runmeta(b).get("args", {}).get("tag_prompt", False)
+    return SmolVLAPolicy.from_pretrained(spec), spec, runmeta(spec).get("args", {}).get("tag_prompt", False)
 
 
 def frames(lo: int, hi: int, n: int, seed: int) -> list[int]:
@@ -56,6 +107,7 @@ def score(policy, pre, view, idx, cond: str, batch: int, seed: int):
         b = torch.utils.data.default_collate(items)
         if cond == "wrist_only":
             b.pop(CAM1, None)
+        torch.manual_seed(seed + s)  # same shadows for every checkpoint
         for k in (CAM1, CAM2):
             if k in b:
                 b[k] = torch.stack([light(im) for im in b[k]])
@@ -83,9 +135,8 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--frames", type=int, default=64)
     ap.add_argument("--community-frames", type=int, default=32)
-    ap.add_argument("--n-community", type=int, default=10)
+    ap.add_argument("--eval-repos", nargs="*", default=EVAL_REPOS)
     ap.add_argument("--community-episodes", type=int, default=100, help="training used episodes below this")
-    ap.add_argument("--eval-datasets", type=int, default=4)
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -103,7 +154,8 @@ def main():
 
     ours = View(dataset(OURS, ours_meta), dict(RENAME), shapes)
     sets = {"ours": (ours, 0, len(ours))}  # (view, first frame, end frame)
-    for r in pick_community(args.usable, args.n_community)[: args.eval_datasets]:
+    for repo in args.eval_repos:
+        r = usable_row(args.usable, repo)
         meta = LeRobotDatasetMetadata(r["id"])
         if meta.total_episodes <= args.community_episodes:
             continue
@@ -118,14 +170,16 @@ def main():
         sets[r["id"]] = (view, lo, hi)
         print(f"held-out {r['id']}: frames {lo}..{hi} (episodes from {args.community_episodes})", flush=True)
 
-    conds = ["both", "wrist_only", "gamma_0.5", "gamma_2.0", "warm_3000K", "cool_10000K"]
+    conds = ["both", "wrist_only", "gamma_0.5", "gamma_2.0", "warm_3000K", "cool_10000K", "shadow"]
     results = {}
     for spec in args.ckpt:
         name, path = spec.split("=", 1)
-        policy = SmolVLAPolicy.from_pretrained(path).to("cuda").eval()
-        pre, _ = make_pre_post_processors(policy.config, pretrained_path=path)
+        policy, proc_path, tagged = load(path, SmolVLAPolicy)
+        policy = policy.to("cuda").eval()
+        pre, _ = make_pre_post_processors(policy.config, pretrained_path=proc_path)
         res = {}
         for sname, (view, lo, hi) in sets.items():
+            view.tag = tag_for(OURS if sname == "ours" else sname) if tagged else ""
             n = args.frames if sname == "ours" else args.community_frames
             idx = frames(lo, hi, n, args.seed)
             for cond in conds if sname == "ours" else ["wrist_only"]:
