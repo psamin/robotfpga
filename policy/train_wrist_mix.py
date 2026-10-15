@@ -61,10 +61,14 @@ def resize_pad(img: torch.Tensor, h: int, w: int) -> torch.Tensor:
 
 
 class View(torch.utils.data.Dataset):
-    """Maps one LeRobotDataset's items to the policy's keys and fixed image shapes."""
+    """Maps one LeRobotDataset's items to the policy's keys and fixed image shapes.
 
-    def __init__(self, ds, cams: dict[str, str], shapes: dict[str, tuple[int, int]]):
+    remap: {key: (a, b)} applies x -> a * x + b to state/action, used to move a community dataset's
+    joints into our normalization statistics (per-dataset normalization)."""
+
+    def __init__(self, ds, cams: dict[str, str], shapes: dict[str, tuple[int, int]], remap=None):
         self.ds, self.cams, self.shapes = ds, cams, shapes  # cams: source key -> policy key
+        self.remap = remap or {}
 
     def __len__(self):
         return len(self.ds)
@@ -72,9 +76,22 @@ class View(torch.utils.data.Dataset):
     def __getitem__(self, i):
         it = self.ds[i]
         out = {k: it[k] for k in ("observation.state", "action", "action_is_pad", "task") if k in it}
+        for k, (a, b) in self.remap.items():
+            out[k] = out[k] * a + b
         for src, dst in self.cams.items():
             out[dst] = resize_pad(it[src], *self.shapes[dst])
         return out
+
+
+def stats_remap(src_stats, dst_stats) -> dict:
+    """(x - mu_src) / sd_src * sd_dst + mu_dst for state and action, as x -> a * x + b."""
+    out = {}
+    for k in ("observation.state", "action"):
+        mu_s, sd_s = (torch.as_tensor(src_stats[k][q], dtype=torch.float32) for q in ("mean", "std"))
+        mu_d, sd_d = (torch.as_tensor(dst_stats[k][q], dtype=torch.float32) for q in ("mean", "std"))
+        a = sd_d / sd_s.clamp_min(1e-6)
+        out[k] = (a, mu_d - mu_s * a)
+    return out
 
 
 def loader(ds, batch, workers):
@@ -114,6 +131,12 @@ def main():
     ap.add_argument("--exclude", type=int, nargs="*", default=[11, 14])
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument(
+        "--norm",
+        choices=["ours", "per-dataset"],
+        default="per-dataset",
+        help="normalize community state/action with our stats, or with each dataset's own",
+    )
     args = ap.parse_args()
 
     from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
@@ -148,7 +171,8 @@ def main():
         meta = LeRobotDatasetMetadata(r["id"])
         eps = list(range(min(args.community_episodes, meta.total_episodes)))
         ds, _ = dataset(r["id"], eps)
-        parts.append(View(ds, {r["wrist"][0]: CAM2}, shapes))
+        remap = stats_remap(meta.stats, ours_meta.stats) if args.norm == "per-dataset" else None
+        parts.append(View(ds, {r["wrist"][0]: CAM2}, shapes, remap))
         print(
             f"community {r['id']}: {len(eps)} episodes, {len(ds)} frames, wrist={r['wrist'][0]}", flush=True
         )
