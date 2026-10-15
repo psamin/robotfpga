@@ -51,6 +51,24 @@ def pick_community(usable_json: str, n: int) -> list[dict]:
     return out[:n]
 
 
+def light_aug_config(ImageTransformsConfig, ImageTransformConfig):
+    """LeRobot's default augmentation plus lighting transforms, for robustness to room lighting.
+
+    Wider brightness/contrast jitter is the usual baseline (arXiv 2508.01442 compares against it);
+    gamma models exposure; Planckian jitter re-illuminates with black-body light sources of 3000-15000 K
+    (arXiv 2202.07993); shadows and Gaussian brightness patches model uneven indoor light.
+    """
+    cfg = ImageTransformsConfig(enable=True, max_num_transforms=4)
+    tc = ImageTransformConfig
+    cfg.tfs["brightness"] = tc(type="ColorJitter", kwargs={"brightness": (0.5, 1.5)})
+    cfg.tfs["contrast"] = tc(type="ColorJitter", kwargs={"contrast": (0.6, 1.4)})
+    cfg.tfs["gamma"] = tc(type="GammaCorrection", kwargs={"gamma": (0.6, 1.7)})
+    cfg.tfs["planckian"] = tc(type="PlanckianJitter", kwargs={"temperature": (3000, 15000)})
+    cfg.tfs["shadow"] = tc(weight=0.5, type="RandomShadow", kwargs={"opacity": (0.3, 0.6)})
+    cfg.tfs["patches"] = tc(weight=0.5, type="GaussianPatchBrightness", kwargs={"factor_range": (0.5, 1.5)})
+    return cfg
+
+
 def resize_pad(img: torch.Tensor, h: int, w: int) -> torch.Tensor:
     """CHW image to h x w, keeping aspect ratio, zero padding (so batches from mixed cameras stack)."""
     _, ih, iw = img.shape
@@ -74,6 +92,15 @@ class View(torch.utils.data.Dataset):
         return len(self.ds)
 
     def __getitem__(self, i):
+        for _ in range(10):  # some community videos have bad timestamps (FrameTimestampError): skip the item
+            try:
+                return self._get(i)
+            except Exception as e:  # noqa: BLE001
+                print(f"skip item {i}: {type(e).__name__}", flush=True)
+                i = random.randrange(len(self.ds))
+        return self._get(i)
+
+    def _get(self, i):
         it = self.ds[i]
         out = {k: it[k] for k in ("observation.state", "action", "action_is_pad", "task") if k in it}
         for k, (a, b) in self.remap.items():
@@ -131,6 +158,8 @@ def main():
     ap.add_argument("--exclude", type=int, nargs="*", default=[11, 14])
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--aug", choices=["default", "light"], default="default", help="image augmentation set")
+    ap.add_argument("--save-every", type=int, default=500, help="intermediate checkpoints (~0.9 GB each)")
     ap.add_argument(
         "--norm",
         choices=["ours", "per-dataset"],
@@ -142,7 +171,7 @@ def main():
     from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
     from lerobot.policies.factory import make_pre_post_processors
     from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
-    from lerobot.transforms import ImageTransforms, ImageTransformsConfig
+    from lerobot.transforms import ImageTransformConfig, ImageTransforms, ImageTransformsConfig
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -151,7 +180,13 @@ def main():
     policy = SmolVLAPolicy.from_pretrained(args.base).to("cuda").train()
     cfg = policy.config
     pre, post = make_pre_post_processors(cfg, pretrained_path=args.base)
-    aug = ImageTransforms(ImageTransformsConfig(enable=True))
+    aug_cfg = (
+        light_aug_config(ImageTransformsConfig, ImageTransformConfig)
+        if args.aug == "light"
+        else ImageTransformsConfig(enable=True)
+    )
+    aug = ImageTransforms(aug_cfg)
+    print(f"augmentation {args.aug}: {sorted(aug.transforms)}", flush=True)
 
     def dataset(repo, episodes=None):
         meta = LeRobotDatasetMetadata(repo)
@@ -207,6 +242,17 @@ def main():
         p = (s - warm) / max(1, args.steps - warm)
         return floor + (peak - floor) * 0.5 * (1 + math.cos(math.pi * p))
 
+    def save(ck: Path):
+        policy.save_pretrained(ck)
+        pre.save_pretrained(ck)
+        post.save_pretrained(ck)
+        json.dump(
+            {"base": args.base, "args": vars(args), "community": [r["id"] for r in picked]},
+            open(out / "runmeta.json", "w"),
+            indent=1,
+        )
+        print(f"saved {ck}", flush=True)
+
     log = open(out / "metrics.jsonl", "w")
     t0 = time.time()
     for step in range(args.steps):
@@ -236,17 +282,10 @@ def main():
         if (step + 1) % 100 == 0:
             log.flush()
             print(json.dumps(row), flush=True)
+        if (step + 1) % args.save_every == 0 and step + 1 < args.steps:
+            save(out / "checkpoints" / f"{step + 1:06d}" / "pretrained_model")
 
-    ck = out / "pretrained_model"
-    policy.save_pretrained(ck)
-    pre.save_pretrained(ck)
-    post.save_pretrained(ck)
-    json.dump(
-        {"base": args.base, "args": vars(args), "community": [r["id"] for r in picked]},
-        open(out / "runmeta.json", "w"),
-        indent=1,
-    )
-    print(f"saved {ck}", flush=True)
+    save(out / "pretrained_model")
 
 
 if __name__ == "__main__":
