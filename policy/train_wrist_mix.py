@@ -173,6 +173,14 @@ def main():
     )
     ap.add_argument("--shadow-p", type=float, default=0.2, help="shadow20: fraction of frames given a shadow")
     ap.add_argument("--save-every", type=int, default=500, help="intermediate checkpoints (~0.9 GB each)")
+    ap.add_argument("--lr", type=float, default=None, help="peak learning rate (default: checkpoint preset)")
+    ap.add_argument("--warmup", type=int, default=None, help="warmup steps (default: min(preset, steps/2))")
+    ap.add_argument("--tag-prompt", action="store_true", help="prefix each task with its dataset tag")
+    ap.add_argument("--dedup-tasks", action="store_true", help="skip community datasets repeating a task set")
+    ap.add_argument("--holdout", default=None, help="regex: skip community datasets with a matching task")
+    ap.add_argument(
+        "--l2sp", type=float, default=0.0, help="weight of sum (w - w_base)^2 over trained params"
+    )
     ap.add_argument(
         "--norm",
         choices=["ours", "per-dataset"],
@@ -218,30 +226,46 @@ def main():
     ours_eps = [e for e in range(ours_meta.total_episodes) if e not in args.exclude]
     ours, _ = dataset(OURS, ours_eps)
     shapes = {RENAME[k]: tuple(ours_meta.features[k]["shape"][:2]) for k in RENAME}  # (h, w) per camera
-    ours_v = View(ours, {k: v for k, v in RENAME.items()}, shapes)
+    ours_v = View(ours, dict(RENAME), shapes, tag=tag_for(OURS) if args.tag_prompt else "")
 
-    picked, parts = pick_community(args.usable, args.n_community), []
-    for r in picked:
+    picked, parts, seen_tasks = [], [], set()
+    holdout = re.compile(args.holdout, re.I) if args.holdout else None
+    for r in pick_community(args.usable, 10**6):
+        if len(picked) >= args.n_community:
+            break
         meta = LeRobotDatasetMetadata(r["id"])
+        tasks = frozenset(map(str, meta.tasks.index))
+        if holdout and any(holdout.search(t) for t in tasks):
+            print(f"held out (task family) {r['id']}: {sorted(tasks)}", flush=True)
+            continue
+        if args.dedup_tasks and tasks in seen_tasks:
+            print(f"skipped (same tasks as an earlier dataset) {r['id']}", flush=True)
+            continue
+        seen_tasks.add(tasks)
+        picked.append(r)
         eps = list(range(min(args.community_episodes, meta.total_episodes)))
         ds, _ = dataset(r["id"], eps)
         remap = stats_remap(meta.stats, ours_meta.stats) if args.norm == "per-dataset" else None
-        parts.append(View(ds, {r["wrist"][0]: CAM2}, shapes, remap))
+        parts.append(
+            View(ds, {r["wrist"][0]: CAM2}, shapes, remap, tag_for(r["id"]) if args.tag_prompt else "")
+        )
         print(
             f"community {r['id']}: {len(eps)} episodes, {len(ds)} frames, wrist={r['wrist'][0]}", flush=True
         )
-    comm = ConcatDataset(parts)
+    comm = ConcatDataset(parts) if parts else []
     print(
         f"ours: {len(ours_eps)} episodes, {len(ours)} frames; "
         f"community: {len(parts)} datasets, {len(comm)} frames",
         flush=True,
     )
-    sources = {
-        "ours": forever(lambda: loader(ours_v, args.batch, args.workers)),
-        "community": forever(lambda: loader(comm, args.batch, args.workers)),
-    }
+    sources = {"ours": forever(lambda: loader(ours_v, args.batch, args.workers))}
+    if parts:
+        sources["community"] = forever(lambda: loader(comm, args.batch, args.workers))
+    else:
+        args.p_ours = 1.0  # ours only (e.g. specializing a co-trained checkpoint)
 
     params = [p for p in policy.parameters() if p.requires_grad]
+    anchor = [p.detach().clone() for p in params] if args.l2sp > 0 else None  # L2-SP (Li et al., 2018)
     opt = torch.optim.AdamW(
         params,
         lr=cfg.optimizer_lr,
@@ -249,11 +273,8 @@ def main():
         eps=cfg.optimizer_eps,
         weight_decay=cfg.optimizer_weight_decay,
     )
-    warm, peak, floor = (
-        min(cfg.scheduler_warmup_steps, args.steps // 2),
-        cfg.optimizer_lr,
-        cfg.scheduler_decay_lr,
-    )
+    warm = args.warmup if args.warmup is not None else min(cfg.scheduler_warmup_steps, args.steps // 2)
+    peak, floor = args.lr or cfg.optimizer_lr, cfg.scheduler_decay_lr
 
     def lr_at(s):
         if s < warm:
@@ -284,6 +305,9 @@ def main():
         for g in opt.param_groups:
             g["lr"] = lr_at(step)
         loss, info = policy.forward(batch)
+        l2 = sum(((p - a) ** 2).sum() for p, a in zip(params, anchor, strict=True)) if anchor else None
+        if l2 is not None:
+            loss = loss + args.l2sp * l2
         opt.zero_grad(set_to_none=True)
         loss.backward()
         gn = torch.nn.utils.clip_grad_norm_(params, cfg.optimizer_grad_clip_norm)
@@ -293,6 +317,7 @@ def main():
             "src": src,
             "front": not dropped and src == "ours",
             "loss": info["loss"],
+            "l2sp_dist": float(l2) if l2 is not None else None,
             "grad_norm": float(gn),
             "lr": lr_at(step),
             "s": round(time.time() - t0, 1),
