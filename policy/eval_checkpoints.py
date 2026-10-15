@@ -40,9 +40,10 @@ def lighting(name: str):
     return lambda img: img
 
 
-def frames(view: View, n: int, seed: int) -> list[int]:
+def frames(lo: int, hi: int, n: int, seed: int) -> list[int]:
+    """n fixed random frame indices in [lo, hi)."""
     g = torch.Generator().manual_seed(seed)
-    return torch.randperm(len(view), generator=g)[:n].tolist()
+    return (lo + torch.randperm(hi - lo, generator=g)[:n]).tolist()
 
 
 @torch.no_grad()
@@ -100,15 +101,22 @@ def main():
         dt = {"action": [i / meta.fps for i in range(50)]}
         return LeRobotDataset(repo, episodes=episodes, delta_timestamps=dt, video_backend="pyav")
 
-    sets = {"ours": (View(dataset(OURS, ours_meta), dict(RENAME), shapes), None)}
+    ours = View(dataset(OURS, ours_meta), dict(RENAME), shapes)
+    sets = {"ours": (ours, 0, len(ours))}  # (view, first frame, end frame)
     for r in pick_community(args.usable, args.n_community)[: args.eval_datasets]:
         meta = LeRobotDatasetMetadata(r["id"])
-        held = list(range(args.community_episodes, meta.total_episodes))
-        if not held:
+        if meta.total_episodes <= args.community_episodes:
             continue
-        ds = dataset(r["id"], meta, held[:20])
-        sets[r["id"]] = (View(ds, {r["wrist"][0]: CAM2}, shapes, stats_remap(meta.stats, ours_meta.stats)), r)
-        print(f"held-out {r['id']}: episodes {held[0]}..{held[:20][-1]}, {len(ds)} frames", flush=True)
+        # Loading an episode subset that starts mid-dataset found no parquet files (job 10241), so load the
+        # whole dataset and sample frames of the held-out episodes by their global index range.
+        lengths = list(meta.episodes["length"])
+        lo = sum(lengths[: args.community_episodes])
+        hi = lo + sum(lengths[args.community_episodes : args.community_episodes + 20])
+        view = View(
+            dataset(r["id"], meta), {r["wrist"][0]: CAM2}, shapes, stats_remap(meta.stats, ours_meta.stats)
+        )
+        sets[r["id"]] = (view, lo, hi)
+        print(f"held-out {r['id']}: frames {lo}..{hi} (episodes from {args.community_episodes})", flush=True)
 
     conds = ["both", "wrist_only", "gamma_0.5", "gamma_2.0", "warm_3000K", "cool_10000K"]
     results = {}
@@ -117,9 +125,9 @@ def main():
         policy = SmolVLAPolicy.from_pretrained(path).to("cuda").eval()
         pre, _ = make_pre_post_processors(policy.config, pretrained_path=path)
         res = {}
-        for sname, (view, _) in sets.items():
+        for sname, (view, lo, hi) in sets.items():
             n = args.frames if sname == "ours" else args.community_frames
-            idx = frames(view, n, args.seed)
+            idx = frames(lo, hi, n, args.seed)
             for cond in conds if sname == "ours" else ["wrist_only"]:
                 res[f"{sname}|{cond}"] = score(policy, pre, view, idx, cond, args.batch, args.seed)
                 print(f"{name} {sname} {cond}: {res[f'{sname}|{cond}']['mae_norm']:.4f}", flush=True)
