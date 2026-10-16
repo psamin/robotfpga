@@ -57,7 +57,7 @@ def chunk_layout(mp: int, k: int) -> list[tuple[int, int, int]]:
 class Engine:
     """PYNQ driver for float_top, or a host-side mock running the identical C core."""
 
-    def __init__(self, bitfile: str | None = None, mock: str | bool = False):
+    def __init__(self, bitfile: str | None = None, mock: str | bool = False, clock_mhz: float | None = None):
         self.pf = _pack_float()
         self.mock = {True: "shim"}.get(mock, mock) or None
         self.calls, self.fpga_s = 0, 0.0
@@ -68,6 +68,10 @@ class Engine:
 
         self.allocate = allocate
         self.ol = Overlay(bitfile)
+        if clock_mhz:  # the bitstream is built for 300 MHz; run slower if timing did not close there
+            from pynq.ps import Clocks
+
+            Clocks.fclk0_mhz = clock_mhz
         self.ip = self.ol.float_top_0
         self.regs = self.ip.register_map
         self._bx = self._by = None
