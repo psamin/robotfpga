@@ -83,6 +83,8 @@ explains each script and the problems already solved.
 
 ## 6. KR260
 
+To run the policy on the board: [docs/run-smolvla-on-kr260.md](docs/run-smolvla-on-kr260.md).
+
 Reported by the board owner, 2026-10-08/09:
 
 | Item | Value |
