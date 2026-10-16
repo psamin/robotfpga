@@ -68,7 +68,7 @@ def kernel(kid=None):
     return kid
 
 
-async def execute(kid, code, timeout, quiet=False):
+async def execute(kid, code, timeout, quiet=False, sink=None):
     cookie = "; ".join(f"{c.name}={c.value}" for c in jar)
     url = f"ws://{HOST}/api/kernels/{kid}/channels?session_id={uuid.uuid4().hex}"
     async with websockets.connect(
@@ -105,9 +105,12 @@ async def execute(kid, code, timeout, quiet=False):
             if m.get("parent_header", {}).get("msg_id") != mid:
                 continue
             t, c = m["msg_type"], m["content"]
-            if t == "stream" and not quiet:
-                sys.stdout.write(c["text"])
-                sys.stdout.flush()
+            if t == "stream":
+                if sink is not None:
+                    sink.append(c["text"])
+                if not quiet:
+                    sys.stdout.write(c["text"])
+                    sys.stdout.flush()
             elif t in ("execute_result", "display_data") and not quiet:
                 print(c["data"].get("text/plain", ""))
             elif t == "error":
@@ -117,9 +120,9 @@ async def execute(kid, code, timeout, quiet=False):
                 return ok
 
 
-def run(code, timeout=600, quiet=False):
-    """Run Python code on the board's kernel; True if it raised nothing."""
-    return asyncio.run(execute(kernel(), code, timeout, quiet))
+def run(code, timeout=600, quiet=False, sink=None):
+    """Run Python code on the board's kernel; True if it raised nothing. `sink` collects its stdout."""
+    return asyncio.run(execute(kernel(), code, timeout, quiet, sink))
 
 
 def mkdir(remote):

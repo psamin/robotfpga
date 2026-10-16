@@ -1,20 +1,21 @@
 """The pick-and-place SmolVLA on the KR260 FPGA, from the laptop, through the board's Jupyter (root kernel).
 
     # LeRobot venv on the laptop (torch, lerobot[smolvla], websockets); repo root
-    python fpga/board/deploy_smolvla.py --setup           # once: Python 3.12 + LeRobot on the board
-    python fpga/board/deploy_smolvla.py --bit fpga/hls/build/float_tp4.bit \
+    python fpga/board/deploy_smolvla.py --setup           # once: Python 3.12 + LeRobot on the board, SSH key
+    python fpga/board/deploy_smolvla.py --bit fpga/hls/build/float_tp4.bit --clock-mhz 250 \
         --model build/ckpt/smolvla-9604/smolvla-so101_medicine_bottle_pickplace-9604 \
-        --batches build/ckpt/smolvla-9604/batches                    # push, engine check, selftest, serve
+        --batches build/ckpt/smolvla-9604/batches [--serve]   # push, engine check, selftest, serve
 
-What it does on the board (docs/run-smolvla-on-kr260.md §1–3), everything under <remote>/ in the
-Jupyter root (/root/jupyter_notebooks):
+What it does on the board (docs/run-smolvla-on-kr260.md §1–3). Uploads land in the Jupyter root
+(/root/jupyter_notebooks/<remote>/) and are mirrored to /home/<user>/smolvla/, owned by <user>, because the
+policy server must run as that user while PYNQ needs root:
   push      fpga/ code, the bitstream (.bit + .hwh), the checkpoint, the replay batches, engine test cases
-  engine    fpga/board/check_engine.py with the bitstream: every case PASS + weight bandwidth
-  servers   engine_server.py (PYNQ's Python, root) in the background, socket handed to the policy user;
-            serve_policy_fpga.py --selftest in the 3.12 venv: max |chunk - PyTorch| and seconds per chunk
-  serve     with --serve: serve_policy_fpga.py --port 8080 in the background (left running); the laptop
-            then starts the robot client through an SSH tunnel (guide §4)
-Logs land in <remote>/logs/ on the board; the selftest rows in build/deploy/<name>/board_selftest.json.
+  engine    fpga/board/check_engine.py with the bitstream (root): every case PASS + weight bandwidth
+  servers   engine_server.py (PYNQ's Python, root) in the background, socket handed to <user>;
+            serve_policy_fpga.py --selftest as <user> (3.12 venv): max |chunk - PyTorch|, seconds per chunk
+  serve     with --serve: serve_policy_fpga.py --port 8080 as <user> in the background (left running); then
+            run fpga/board/laptop_client.ps1 on the laptop (SSH tunnel + robot client, guide §4)
+Logs: /home/<user>/smolvla/logs/ on the board; selftest rows in build/deploy/<name>/board_selftest.json.
 """
 
 import argparse
@@ -42,8 +43,8 @@ JUP = "/root/jupyter_notebooks"
 PYNQ_PY = "/usr/local/share/pynq-venv/bin/python3"
 
 
-def shell(folder: str, cmd: str, log: str, timeout: int = 1800, background: bool = False) -> bool:
-    """Run a shell command on the board from `folder`; stream it here and into logs/<log>."""
+def shell(folder: str, cmd: str, log: str, timeout: int = 1800, background: bool = False, sink=None) -> bool:
+    """Run a shell command on the board from `folder`; stream it here and into <folder>/logs/<log>."""
     code = f"""
 import os, subprocess
 os.chdir({folder!r}); os.makedirs("logs", exist_ok=True)
@@ -63,20 +64,21 @@ else:
     if rc:
         raise SystemExit(rc)
 """
-    return jb.run(code, timeout=timeout)
+    return jb.run(code, timeout=timeout, sink=sink)
 
 
 def wait_for(folder: str, log: str, marker: str, seconds: int) -> bool:
     code = f"""
 import time
 path = {folder!r} + "/logs/" + {log!r}
+text = ""
 for _ in range({seconds}):
     try:
         text = open(path).read()
         if {marker!r} in text or "Error" in text or "Traceback" in text:
             break
     except FileNotFoundError:
-        text = ""
+        pass
     time.sleep(1)
 print(text)
 if {marker!r} not in text:
@@ -104,6 +106,41 @@ def push(rem: str, bit: Path, hwh: Path, model: Path, name: str, frames: list[Pa
             jb.put(str(p), f"{rem}/build/stream/float/{d.name}/{p.name}")
 
 
+def mirror(src: str, home: str, user: str) -> bool:
+    """Copy the Jupyter upload folder to the user's home (only newer files) and give it to the user."""
+    return jb.run(
+        f"""
+import subprocess
+subprocess.run(["mkdir", "-p", {home!r}], check=True)
+subprocess.run(["cp", "-ru", {src!r} + "/.", {home!r} + "/"], check=True)
+subprocess.run(["chown", "-R", {user!r} + ":" + {user!r}, {home!r}], check=True)
+print("mirrored to", {home!r}, flush=True)
+""",
+        timeout=1800,
+    )
+
+
+def install_ssh_key(user: str) -> None:
+    pub = next(iter(sorted(Path.home().glob(".ssh/id_*.pub"))), None)
+    if pub is None:
+        print("no ~/.ssh/id_*.pub on the laptop; skipping the SSH key (ssh-keygen -t ed25519)")
+        return
+    key = pub.read_text().strip()
+    jb.run(
+        f"""
+import os, pwd, subprocess
+pw = pwd.getpwnam({user!r}); d = os.path.join(pw.pw_dir, ".ssh"); f = os.path.join(d, "authorized_keys")
+os.makedirs(d, mode=0o700, exist_ok=True)
+have = open(f).read() if os.path.exists(f) else ""
+if {key!r} not in have:
+    open(f, "a").write({key!r} + "\\n")
+os.chmod(f, 0o600); subprocess.run(["chown", "-R", {user!r} + ":" + {user!r}, d], check=True)
+print("ssh key installed for", {user!r}, flush=True)
+""",
+        timeout=60,
+    )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bit", help="float_*.bit from build_bd.tcl (.hwh beside it)")
@@ -124,11 +161,15 @@ def main():
     jb.login()
     rem = args.remote.strip("/")
     jroot = jb.api("GET", "contents/")["path"] or ""
-    folder = f"{JUP}/{jroot}{rem}".rstrip("/")
+    upload = f"{JUP}/{jroot}{rem}".rstrip("/")
+    home = f"/home/{args.user}/smolvla"
     venv_py = f"/home/{args.user}/lerobot-venv/bin/python"
 
     if args.setup:
-        print("== setup: Python 3.12 + LeRobot on the board (offline kit from build/board_py312)", flush=True)
+        print(
+            "== setup: Python 3.12 + LeRobot on the board (offline kit build/board_py312), SSH key",
+            flush=True,
+        )
         kit = ROOT / "build" / "board_py312"
         jb.put(str(ROOT / "fpga/board/setup_board.sh"), f"{rem}/fpga/board/setup_board.sh")
         for p in sorted(kit.glob("cpython-3.12.*aarch64*.tar.gz")):
@@ -137,9 +178,10 @@ def main():
             for p in sorted((kit / sub).glob("*")):
                 if p.is_file():
                     jb.put(str(p), f"{rem}/offline/{sub}/{p.name}")
+        install_ssh_key(args.user)
         shell(
-            folder,
-            f"SUDO_USER={args.user} bash fpga/board/setup_board.sh {folder}/offline",
+            upload,
+            f"SUDO_USER={args.user} bash fpga/board/setup_board.sh {upload}/offline",
             "setup.log",
             7200,
         )
@@ -160,46 +202,49 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
 
     if not args.skip_push:
-        print(f"== push to {folder}", flush=True)
+        print(f"== push to {upload}, mirror to {home}", flush=True)
         t0 = time.time()
         push(rem, bit, hwh, model, name, frames)
+        if not mirror(upload, home, args.user):
+            sys.exit("mirror failed")
         print(f"   {time.time() - t0:.0f} s", flush=True)
 
     jb.api("POST", f"kernels/{jb.kernel()}/restart")  # releases an overlay or server a previous run left
     time.sleep(3)
-    shell(
-        folder, "pkill -f engine_server.py; pkill -f serve_policy_fpga.py; sleep 1; true", "cleanup.log", 60
-    )
+    shell(home, "pkill -f engine_server.py; pkill -f serve_policy_fpga.py; sleep 1; true", "cleanup.log", 60)
     clock = f" --clock-mhz {args.clock_mhz}" if args.clock_mhz else ""
 
     if not args.skip_engine_check:
         print("== engine check (PYNQ Python): every case + bandwidth", flush=True)
         shell(
-            folder,
+            home,
             f"{PYNQ_PY} fpga/board/check_engine.py --bit {bit.name}{clock} build/stream/float",
             "check_engine.log",
         )
 
     print("== engine server (background, root) + policy selftest (LeRobot venv)", flush=True)
-    shell(folder, f"SUDO_USER={args.user} {PYNQ_PY} fpga/board/engine_server.py --bit {bit.name}{clock}",
+    shell(home, f"SUDO_USER={args.user} {PYNQ_PY} fpga/board/engine_server.py --bit {bit.name}{clock}",
           "engine_server.log", 60, background=True)  # fmt: skip
-    if not wait_for(folder, "engine_server.log", "engine ready", 180):
+    if not wait_for(home, "engine_server.log", "engine ready", 180):
         sys.exit("engine server failed")
     if not args.skip_selftest:
         cmd = f"sudo -u {args.user} {venv_py} fpga/board/serve_policy_fpga.py"
         cmd += f" --selftest ckpt/{name} --batches batches"
-        shell(folder, cmd, "selftest.log", 3600)
-        log = jb.api("GET", f"contents/{rem}/logs/selftest.log?type=file&format=text")["content"]
+        sink: list[str] = []
+        ok = shell(home, cmd, "selftest.log", 3600, sink=sink)
+        log = "".join(sink)
         rows = [json.loads(ln) for ln in log.splitlines() if ln.startswith("{")]
-        (out / "board_selftest.json").write_text(json.dumps({"rows": rows, "log": log}, indent=1))
+        (out / "board_selftest.json").write_text(json.dumps({"ok": ok, "rows": rows, "log": log}, indent=1))
         print(f"saved {out / 'board_selftest.json'}")
+        if not ok:
+            sys.exit("selftest failed")
 
     if args.serve:
-        shell(folder, f"sudo -u {args.user} {venv_py} fpga/board/serve_policy_fpga.py --port 8080",
+        shell(home, f"sudo -u {args.user} {venv_py} fpga/board/serve_policy_fpga.py --port 8080",
               "policy_server.log", 60, background=True)  # fmt: skip
         print(
-            "policy server starting on the board's 127.0.0.1:8080. Laptop: ssh -N -L 8080:127.0.0.1:8080 "
-            f"{args.user}@192.168.137.35, then the robot client (docs/run-smolvla-on-kr260.md §4)"
+            f"policy server starting on the board's 127.0.0.1:8080 (checkpoint {home}/ckpt/{name}).\n"
+            "Laptop: fpga/board/laptop_client.ps1 opens the tunnel and starts the robot client (guide §4)."
         )
 
 
