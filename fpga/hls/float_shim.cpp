@@ -19,7 +19,7 @@ using namespace fstream;
 static const int GBLOCK = 4;  // output groups (of 32 channels) per task
 
 extern "C" int linear_bf16(const uint16_t* w_packed, const float* x, float* y, int M, int K, int N) {
-  if (M % LANES) return 1;
+  if (M % LANES || K % F4) return 1;
   const int chunks = (K + K_MAX - 1) / K_MAX;
   const int groups = M / LANES;
   memset(y, 0, sizeof(float) * (size_t)N * M);
@@ -37,8 +37,7 @@ extern "C" int linear_bf16(const uint16_t* w_packed, const float* x, float* y, i
     const int tiles = (N + NT - 1) / NT, gblocks = (groups + GBLOCK - 1) / GBLOCK;
 #pragma omp parallel
     {
-      float(*xbuf)[K_MAX] = (float(*)[K_MAX])malloc(sizeof(float) * NT * K_MAX);
-      WordBF(*tile)[PORTS][K_MAX] = (WordBF(*)[PORTS][K_MAX])malloc(sizeof(WordBF) * 2 * PORTS * K_MAX);
+      float(*xbuf)[NB][K_MAX] = (float(*)[NB][K_MAX])malloc(sizeof(float) * TP * NB * K_MAX);
       std::vector<float> yt((size_t)NT * GBLOCK * LANES);
 #pragma omp for schedule(dynamic) collapse(2)
       for (int t = 0; t < tiles; t++) {
@@ -47,15 +46,14 @@ extern "C" int linear_bf16(const uint16_t* w_packed, const float* x, float* y, i
           const int g0 = b * GBLOCK, gn = (groups - g0) < GBLOCK ? (groups - g0) : GBLOCK;
           const size_t woff = (size_t)g0 * kc;
           const int ms = gn * LANES;
-          int st = linear_bf16_core(wp[0] + woff, wp[1] + woff, wp[2] + woff, wp[3] + woff, &xc[(size_t)n0 * kc],
-                                    yt.data(), ms, kc, nt, xbuf, tile);
+          int st = linear_bf16_core(wp[0] + woff, wp[1] + woff, wp[2] + woff, wp[3] + woff,
+                                    (const WordF4*)&xc[(size_t)n0 * kc], (WordF4*)yt.data(), ms, kc, nt, xbuf);
           if (st) status = st;
           for (int n = 0; n < nt; n++)
             for (int m = 0; m < ms; m++) y[(size_t)(n0 + n) * M + g0 * LANES + m] += yt[(size_t)n * ms + m];
         }
       }
       free(xbuf);
-      free(tile);
     }
   }
   return status;

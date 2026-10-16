@@ -89,8 +89,9 @@ def main():
     args = ap.parse_args()
     rng = np.random.default_rng(0)
     out = Path(args.tests)
-    # SmolVLA-like shapes: VLM 960/2560, expert 720 (padded to 736), connector K = 12288 (3 chunks)
-    for m, k, n in [(960, 960, 1), (2560, 960, 50), (720, 960, 137), (960, 12288, 64), (32, 7, 3)]:
+    # SmolVLA-like shapes: VLM 960/2560, expert 720 (padded to 736), connector K = 12288 (3 chunks).
+    # K must be a multiple of 4 (128-bit activation words on the io port).
+    for m, k, n in [(960, 960, 1), (2560, 960, 50), (720, 960, 137), (960, 12288, 64), (32, 8, 3)]:
         w = to_bf16_bits(rng.normal(0, 0.05, (m, k)).astype(np.float32))
         x = rng.normal(0, 1, (n, k)).astype(np.float32)
         write_case(out / f"case_{m}x{k}x{n}", w, x)
