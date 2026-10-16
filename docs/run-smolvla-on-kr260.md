@@ -5,8 +5,11 @@ The best policy for "Pick up the medicine bottle and place it on the plate" (`-9
 the KR260: every linear layer on the FPGA (BF16 weights streamed from DDR, FP32 math), everything else in
 FP32 on the board's ARM cores. The laptop drives the arm and cameras exactly as with the cluster.
 
-Status: the whole software stack below runs on x86 with the host C core in place of the FPGA (`cluster/kr260_mock_test.sbatch`).
-**Nothing here has run on the board yet**: it needs the bitstream (Q12) and the board.
+Status: the whole software stack below runs on x86 with the host C core in place of the FPGA (the same core HLS
+synthesizes, called with the board's DDR word offsets): `cluster/kr260_mock_test.sbatch`, job 10279. The selftest
+passed (max difference from PyTorch FP32 0.0043, normalized units, on 3 real frames). Through the real gRPC policy
+server, `robot/toolkit/test_policy_server.py` got 50 actions for a recorded frame, the first within 1.08° mean (1.77° max)
+of the recorded action. **Nothing here has run on the board yet**: it needs the bitstream (Q12) and the board.
 
 ## What runs where
 
