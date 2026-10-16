@@ -24,12 +24,12 @@ extern "C" int linear_bf16(const uint16_t* w_packed, const float* x, float* y, i
   const int groups = M / LANES;
   memset(y, 0, sizeof(float) * (size_t)N * M);
   int status = 0;
-  const WordBF* base = (const WordBF*)w_packed;
+  const WPort* base = (const WPort*)w_packed;
   size_t off = 0;
   for (int c = 0; c < chunks; c++) {
     const int k0 = c * K_MAX, kc = (K - k0) < K_MAX ? (K - k0) : K_MAX;
     const size_t port_words = (size_t)groups * kc;
-    const WordBF* wp[PORTS];
+    const WPort* wp[PORTS];
     for (int p = 0; p < PORTS; p++) wp[p] = base + off + p * port_words;
     off += PORTS * port_words;
     std::vector<float> xc((size_t)N * kc);
@@ -47,7 +47,7 @@ extern "C" int linear_bf16(const uint16_t* w_packed, const float* x, float* y, i
           const size_t woff = (size_t)g0 * kc;
           const int ms = gn * LANES;
           int st = linear_bf16_core(wp[0] + woff, wp[1] + woff, wp[2] + woff, wp[3] + woff,
-                                    (const WordF4*)&xc[(size_t)n0 * kc], (WordF4*)yt.data(), ms, kc, nt, xbuf);
+                                    (const IoWord*)&xc[(size_t)n0 * kc], (IoWord*)yt.data(), ms, kc, nt, xbuf);
           if (st) status = st;
           for (int n = 0; n < nt; n++)
             for (int m = 0; m < ms; m++) y[(size_t)(n0 + n) * M + g0 * LANES + m] += yt[(size_t)n * ms + m];

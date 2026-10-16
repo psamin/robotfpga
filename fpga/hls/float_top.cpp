@@ -5,8 +5,8 @@
 
 using namespace fstream;
 
-int float_top(const WordBF* w0, const WordBF* w1, const WordBF* w2, const WordBF* w3, const WordF4* xmem,
-              WordF4* ymem, int M, int K, int N) {
+int float_top(const WPort* w0, const WPort* w1, const WPort* w2, const WPort* w3, const IoWord* xmem,
+              IoWord* ymem, int M, int K, int N) {
 #pragma HLS INTERFACE mode = m_axi port = w0 offset = slave bundle = hp0 max_read_burst_length = 256 num_read_outstanding = 16 depth = 1048576
 #pragma HLS INTERFACE mode = m_axi port = w1 offset = slave bundle = hp1 max_read_burst_length = 256 num_read_outstanding = 16 depth = 1048576
 #pragma HLS INTERFACE mode = m_axi port = w2 offset = slave bundle = hp2 max_read_burst_length = 256 num_read_outstanding = 16 depth = 1048576

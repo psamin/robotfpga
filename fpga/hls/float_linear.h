@@ -12,12 +12,16 @@
 //  - Ping-pong tiles: the group loop is an HLS DATAFLOW region, so the next 32-channel group streams
 //    in while the current one computes [Zhang2015-Roofline]. NT tokens of X stay on chip, so each
 //    weight is reused NT times.
-//  - FP32 adds take several cycles: every (token, lane) keeps PS interleaved partial sums (k mod PS).
-//    The reduction loop steps PS values of k per iteration (II = PS, one weight word per port per
-//    cycle) so each partial sum has a fixed index; a runtime k % PS index made Vitis HLS mux the
-//    registers and serialize the adds (II = 7, 515 adders at TP = 2). Summation order is fixed
-//    (partials in k order, then partials 0..PS-1), so results are deterministic.
+//  - FP32 adds take several cycles, so consecutive iterations of the MAC loop must not touch the same
+//    sum. The loop runs over (k, token block) with the block innermost: every (token, lane) keeps
+//    its partial sums in a small RAM indexed by block and k mod PS, and the same entry comes back
+//    only after NB * PS >= 16 cycles. No register muxes, no duplicated adders (a runtime k % PS index
+//    into partitioned registers cost II = 7 and 515 adders; unrolling k by PS made HLS build 8x the
+//    units). Summation order is fixed (partial p sums k = p mod PS in k order, then partials in
+//    order), so results are deterministic.
 //  - X and Y move over the io port as 128-bit words (4 FP32), so K must be a multiple of 4.
+//  - Under Vitis HLS the DDR words are ap_uint<128> (its burst inference needs that); the host
+//    build uses plain structs with the same bit layout.
 // Bias, softmax, norms, activations and RoPE stay on the ARM. Reductions longer than K_MAX are split
 // by the host into K_MAX chunks whose outputs it adds; output widths are padded to 32 by the host.
 //
@@ -29,6 +33,9 @@
 
 #ifdef NT
 #undef NT  // Vitis HLS C simulation on Windows passes -DNT to the compiler (csim.mk)
+#endif
+#ifdef __VITIS_HLS__
+#include <ap_int.h>
 #endif
 
 namespace fstream {
@@ -43,18 +50,45 @@ constexpr int NT = 32;              // tokens kept on chip per pass
 #endif
 constexpr int TP = FSTREAM_TP;      // tokens computed in parallel (TP * LANES FP32 MACs per cycle), power of 2
 constexpr int NB = NT / TP;         // token blocks per pass
-constexpr int PS = 8;               // interleaved partial sums, covers the FP32 add latency
+constexpr int PS = NB >= 8 ? 2 : 16 / NB;  // partial sums per (token, lane): NB * PS >= 16 cycles apart
+constexpr int ACC_DIST = NB * PS;   // iterations between two updates of the same partial sum
 constexpr int F4 = 4;               // FP32 values per 128-bit io word
 
 static_assert(TP > 0 && (TP & (TP - 1)) == 0 && NT % TP == 0, "TP must be a power of 2 dividing NT");
+static_assert(ACC_DIST >= 16, "partial sums must be revisited after the FP32 add latency");
 
-struct WordBF {  // one 128-bit DDR word on one weight port
+#ifdef __VITIS_HLS__
+typedef ap_uint<128> WPort;   // one 128-bit word on a weight port: 8 BF16, lane l in bits [16l+15:16l]
+typedef ap_uint<128> IoWord;  // one 128-bit word on the io port: 4 FP32, value j in bits [32j+31:32j]
+
+static inline uint16_t w_lane(const WPort& w, int l) {
+#pragma HLS INLINE
+  return (uint16_t)w.range(16 * l + 15, 16 * l);
+}
+static inline float io_lane(const IoWord& w, int j) {
+#pragma HLS INLINE
+  uint32_t u = w.range(32 * j + 31, 32 * j);
+  float f;
+  memcpy(&f, &u, sizeof f);
+  return f;
+}
+static inline void io_set(IoWord& w, int j, float f) {
+#pragma HLS INLINE
+  uint32_t u;
+  memcpy(&u, &f, sizeof u);
+  w.range(32 * j + 31, 32 * j) = u;
+}
+#else
+struct WPort {  // same bit layout as the HLS word (little-endian lanes)
   uint16_t v[FL];
 };
-
-struct WordF4 {  // one 128-bit word on the io port: 4 FP32 activations
+struct IoWord {
   float v[F4];
 };
+static inline uint16_t w_lane(const WPort& w, int l) { return w.v[l]; }
+static inline float io_lane(const IoWord& w, int j) { return w.v[j]; }
+static inline void io_set(IoWord& w, int j, float f) { w.v[j] = f; }
+#endif
 
 static inline float bf16_to_f32(uint16_t b) {
 #pragma HLS INLINE
@@ -66,8 +100,8 @@ static inline float bf16_to_f32(uint16_t b) {
 
 // One group of 32 output channels: K words per port at flat increasing addresses, the four ports in
 // one loop so the four bursts run at once.
-static void load_group(const WordBF* w0, const WordBF* w1, const WordBF* w2, const WordBF* w3, int g, int k_len,
-                       WordBF tile[PORTS][K_MAX]) {
+static void load_group(const WPort* w0, const WPort* w1, const WPort* w2, const WPort* w3, int g, int k_len,
+                       WPort tile[PORTS][K_MAX]) {
   const size_t off = (size_t)g * k_len;
 load:
   for (int k = 0; k < k_len; k++) {
@@ -80,68 +114,88 @@ load:
 }
 
 // One group against the NT tokens on chip. xbuf[a][b][k] holds token b * TP + a, so the TP tokens of
-// a block sit in TP different memories (one read each per cycle).
-static void compute_group(const WordBF tile[PORTS][K_MAX], const float xbuf[TP][NB][K_MAX], WordF4* ymem,
-                          int n0, int nt, int g, int K, int M) {
-token_blocks:
-  for (int b = 0; b * TP < nt; b++) {
-    float acc[TP][LANES][PS];
-#pragma HLS ARRAY_PARTITION variable = acc complete dim = 0
-    for (int a = 0; a < TP; a++)
-      for (int l = 0; l < LANES; l++)
-        for (int p = 0; p < PS; p++) acc[a][l][p] = 0.0f;
-  red:
-    for (int k0 = 0; k0 < K; k0 += PS) {
-#pragma HLS PIPELINE II = PS
-      for (int p = 0; p < PS; p++) {
+// a block sit in TP different memories (one read each per cycle). All NB blocks are always computed
+// (padding rows are zero) so the partial-sum spacing never shrinks.
+static void compute_group(const WPort tile[PORTS][K_MAX], const float xbuf[TP][NB][K_MAX], IoWord* ymem, int n0,
+                          int nt, int g, int K, int M) {
+  float acc[TP][LANES][ACC_DIST];
+#pragma HLS ARRAY_PARTITION variable = acc complete dim = 1
+#pragma HLS ARRAY_PARTITION variable = acc complete dim = 2
+#pragma HLS BIND_STORAGE variable = acc type = ram_2p impl = lutram
+  int k = 0, b = 0;
+mac:
+  for (int it = 0; it < K * NB; it++) {
+#pragma HLS PIPELINE II = 1
+#pragma HLS DEPENDENCE variable = acc inter distance = ACC_DIST true
+    float w[LANES];
+    for (int q = 0; q < PORTS; q++) {
 #pragma HLS UNROLL
-        const int k = k0 + p;
-        if (k < K) {
-          float w[LANES];
-          for (int q = 0; q < PORTS; q++) {
+      const WPort word = tile[q][k];
+      for (int l = 0; l < FL; l++) {
 #pragma HLS UNROLL
-            const WordBF word = tile[q][k];
-            for (int l = 0; l < FL; l++) {
-#pragma HLS UNROLL
-              w[q * FL + l] = bf16_to_f32(word.v[l]);
-            }
-          }
-          for (int a = 0; a < TP; a++) {
-#pragma HLS UNROLL
-            const float x = xbuf[a][b][k];
-            for (int l = 0; l < LANES; l++) {
-#pragma HLS UNROLL
-              acc[a][l][p] += x * w[l];
-            }
-          }
-        }
+        w[q * FL + l] = bf16_to_f32(w_lane(word, l));
       }
     }
-  store:
+    const int idx = b * PS + (k & (PS - 1));
+    const bool first = k < PS;  // first visit of this partial sum: start from zero
     for (int a = 0; a < TP; a++) {
-      if (b * TP + a < nt) {
+#pragma HLS UNROLL
+      const float x = xbuf[a][b][k];
+      for (int l = 0; l < LANES; l++) {
+#pragma HLS UNROLL
+        const float cur = first ? 0.0f : acc[a][l][idx];
+        acc[a][l][idx] = cur + x * w[l];
+      }
+    }
+    if (b == NB - 1) {
+      b = 0;
+      k++;
+    } else {
+      b++;
+    }
+  }
+store:
+  for (int bb = 0; bb < NB; bb++) {
+    for (int a = 0; a < TP; a++) {
+      if (bb * TP + a < nt) {
       store_row:
         for (int l4 = 0; l4 < LANES / F4; l4++) {
 #pragma HLS PIPELINE II = 1
-          WordF4 o;
+          IoWord o;
           for (int j = 0; j < F4; j++) {
 #pragma HLS UNROLL
-            float s = 0.0f;
-            for (int p = 0; p < PS; p++) s += acc[a][l4 * F4 + j][p];
-            o.v[j] = s;
+            float s = acc[a][l4 * F4 + j][bb * PS];
+            for (int p = 1; p < PS; p++) s += acc[a][l4 * F4 + j][bb * PS + p];
+            io_set(o, j, s);
           }
-          ymem[(size_t)(n0 + b * TP + a) * (M / F4) + g * (LANES / F4) + l4] = o;
+          ymem[(size_t)(n0 + bb * TP + a) * (M / F4) + g * (LANES / F4) + l4] = o;
         }
       }
     }
   }
 }
 
+// All groups against one pass of tokens. The loop is a DATAFLOW region: HLS double-buffers `tile`
+// and loads group g + 1 while group g computes. Its bound and the scalars it uses are arguments,
+// as Vitis HLS requires for a dataflow loop.
+static void run_tile(const WPort* w0, const WPort* w1, const WPort* w2, const WPort* w3, IoWord* ymem,
+                     const float xbuf[TP][NB][K_MAX], int groups, int n0, int nt, int K, int M) {
+groups_loop:
+  for (int g = 0; g < groups; g++) {
+#pragma HLS DATAFLOW
+    WPort tile[PORTS][K_MAX];
+#pragma HLS ARRAY_PARTITION variable = tile complete dim = 1
+#pragma HLS BIND_STORAGE variable = tile type = ram_2p impl = uram
+    load_group(w0, w1, w2, w3, g, K, tile);
+    compute_group(tile, xbuf, ymem, n0, nt, g, K, M);
+  }
+}
+
 // Core with a caller-owned X buffer (static in the HLS top, per-thread in the shim).
 // w0..w3: the four port arrays, each [M / LANES groups][K] words. xmem: N x K FP32, ymem: N x M FP32,
 // both as 128-bit words (K and M multiples of 4; M a multiple of 32).
-static int linear_bf16_core(const WordBF* w0, const WordBF* w1, const WordBF* w2, const WordBF* w3,
-                            const WordF4* xmem, WordF4* ymem, int M, int K, int N, float xbuf[TP][NB][K_MAX]) {
+static int linear_bf16_core(const WPort* w0, const WPort* w1, const WPort* w2, const WPort* w3, const IoWord* xmem,
+                            IoWord* ymem, int M, int K, int N, float xbuf[TP][NB][K_MAX]) {
   if (M % LANES || K < 1 || K > K_MAX || K % F4 || N < 1) return 1;
   const int groups = M / LANES;
   const int k4 = K / F4;
@@ -152,27 +206,19 @@ tiles:
     for (int n = 0; n < NT; n++) {
       for (int i = 0; i < k4; i++) {
 #pragma HLS PIPELINE II = 1
-        WordF4 wx;
+        IoWord wx;
         if (n < nt) {
           wx = xmem[(size_t)(n0 + n) * k4 + i];
         } else {
-          for (int j = 0; j < F4; j++) wx.v[j] = 0.0f;  // pad the last pass with zero tokens
+          for (int j = 0; j < F4; j++) io_set(wx, j, 0.0f);  // pad the last pass with zero tokens
         }
         for (int j = 0; j < F4; j++) {
 #pragma HLS UNROLL
-          xbuf[n % TP][n / TP][i * F4 + j] = wx.v[j];
+          xbuf[n % TP][n / TP][i * F4 + j] = io_lane(wx, j);
         }
       }
     }
-  groups_loop:
-    for (int g = 0; g < groups; g++) {
-#pragma HLS DATAFLOW
-      WordBF tile[PORTS][K_MAX];
-#pragma HLS AGGREGATE compact = bit variable = tile
-#pragma HLS ARRAY_PARTITION variable = tile complete dim = 1
-      load_group(w0, w1, w2, w3, g, K, tile);
-      compute_group(tile, xbuf, ymem, n0, nt, g, K, M);
-    }
+    run_tile(w0, w1, w2, w3, ymem, xbuf, groups, n0, nt, K, M);
   }
   return 0;
 }
