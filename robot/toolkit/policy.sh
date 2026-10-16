@@ -29,15 +29,19 @@ LOG=$SO101/logs/policy-$(date +%Y%m%d-%H%M%S).log
 # them in training: front -> camera1, wrist -> camera2. Same devices and settings as recording.
 POLICY_CAMERAS="{ camera1: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30, warmup_s: 3}, camera2: {type: opencv, index_or_path: 1, width: 480, height: 640, fps: 30, rotation: 90, warmup_s: 3}}"
 
-MODEL=${MODEL:-$(ssh -o BatchMode=yes $LOGIN 'ls -td /nethome/pi34/models/smolvla-* 2>/dev/null | head -1' 2>/dev/null | sed 's|^/nethome/|/nethome-instruction/|')}
-[ -n "$MODEL" ] || { echo "No trained model found in ~/models on the cluster." >&2; exit 1; }
+# Default: the best policy for this task (release policy-smolvla-9604). Not "the newest model": ~/models
+# also holds experimental checkpoints (smolvla-wristmix-*) that are worse on this task.
+MODEL=${MODEL:-/nethome-instruction/pi34/models/smolvla-so101_medicine_bottle_pickplace-9604}
 echo "Model: $MODEL"
 
-# 1. Policy server (1x H200, 2 h limit): reuse a running one or start one.
+# 1. Policy server (2 h limit): reuse a running one or start one. SERVE_ARGS picks the GPU node; it must
+# accept SSH logins for the tunnel. Verified 2026-10-15: nvidia-l4 (doop) yes; nvidia-h100 (bender) and
+# nvidia-l40s (zapp) reject them (broken /nethome symlink); nvidia-h200 works but is often full.
+SERVE_ARGS=${SERVE_ARGS:--w nvidia-l4 --gres=gpu:l4:1}
 JOB=$(ssh -o BatchMode=yes $LOGIN "squeue -u pi34 -n smolvla-serve -h -o %i | head -1" 2>/dev/null)
 if [ -z "$JOB" ]; then
-  JOB=$(ssh -o BatchMode=yes $LOGIN "MODEL=$MODEL sbatch --parsable ~/serve_policy.sbatch" 2>/dev/null | tail -1)
-  echo "Started policy server job $JOB (1x H200)."
+  JOB=$(ssh -o BatchMode=yes $LOGIN "MODEL=$MODEL sbatch --parsable $SERVE_ARGS ~/serve_policy.sbatch" 2>/dev/null | tail -1)
+  echo "Started policy server job $JOB ($SERVE_ARGS)."
 fi
 echo "Waiting for the policy server (job $JOB) ..."
 for _ in $(seq 90); do
