@@ -147,14 +147,14 @@ def _recv(sock) -> tuple[dict, bytes]:
     import json
     import struct
 
-    def exact(n: int) -> bytes:
+    def exact(n: int) -> bytearray:  # writable: torch.from_numpy warns on read-only arrays
         buf = bytearray()
         while len(buf) < n:
             part = sock.recv(min(n - len(buf), 1 << 22))
             if not part:
                 raise ConnectionError("engine socket closed")
             buf += part
-        return bytes(buf)
+        return buf
 
     hn, pn = struct.unpack("<QQ", exact(16))
     return json.loads(exact(hn)), exact(pn)

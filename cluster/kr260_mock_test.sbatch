@@ -27,7 +27,7 @@ UV=$HOME_DIR/.local/bin/uv
 echo "job $SLURM_JOB_ID on $(hostname) repo=$REPO git=$(git -C "$REPO" rev-parse --short HEAD)"
 git clone -q https://github.com/psamin/lerobot.git "$WORK/lerobot"
 cd "$WORK/lerobot" && git checkout -q "$LEROBOT_REV"
-"$UV" sync -q --locked --extra smolvla --extra async --extra dataset --python 3.12
+"$UV" sync -q --locked --extra smolvla --extra async --extra dataset --extra feetech --python 3.12
 PY="$UV run --no-sync python"
 make -C "$REPO/fpga/hls" lib >/dev/null
 
