@@ -176,7 +176,7 @@ def main():
         print("== engine check (PYNQ Python): every case + bandwidth", flush=True)
         shell(
             folder,
-            f"{PYNQ_PY} fpga/board/check_engine.py --bit {bit.name} build/stream/float",
+            f"{PYNQ_PY} fpga/board/check_engine.py --bit {bit.name}{clock} build/stream/float",
             "check_engine.log",
         )
 
