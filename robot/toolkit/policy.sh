@@ -7,7 +7,9 @@
 #   ./policy.sh stop    (or Ctrl-C in the start terminal) stop the policy: the arm glides back to
 #                       the pose it started from, the motors turn off, the server job is cancelled.
 #
-# Needs GT VPN. MODEL=<dir> overrides the model, KEEP_SERVER=1 keeps the server running after a stop,
+# BOARD=ubuntu@<kr260 address> runs the policy on the KR260 instead of the cluster (FPGA linears;
+# docs/run-smolvla-on-kr260.md): the board's serve_policy_fpga.py must already be running.
+# Needs GT VPN (cluster mode). MODEL=<dir> overrides the model, KEEP_SERVER=1 keeps the server running after a stop,
 # MAX_STEP=<deg> caps each joint's move per control step (default 10). Smoothing: SMOOTH_ALPHA (command
 # low-pass, default 0.7), P_GAIN / I_GAIN / D_GAIN (servo PID, default 16 / 0 / 32).
 set -uo pipefail
@@ -29,15 +31,33 @@ LOG=$SO101/logs/policy-$(date +%Y%m%d-%H%M%S).log
 # them in training: front -> camera1, wrist -> camera2. Same devices and settings as recording.
 POLICY_CAMERAS="{ camera1: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30, warmup_s: 3}, camera2: {type: opencv, index_or_path: 1, width: 480, height: 640, fps: 30, rotation: 90, warmup_s: 3}}"
 
-MODEL=${MODEL:-$(ssh -o BatchMode=yes $LOGIN 'ls -td /nethome/pi34/models/smolvla-* 2>/dev/null | head -1' 2>/dev/null | sed 's|^/nethome/|/nethome-instruction/|')}
-[ -n "$MODEL" ] || { echo "No trained model found in ~/models on the cluster." >&2; exit 1; }
+# Default: the best policy for this task (release policy-smolvla-9604). Not "the newest model": ~/models
+# also holds experimental checkpoints (smolvla-wristmix-*) that are worse on this task.
+if [ -n "${BOARD:-}" ]; then
+  MODEL=${MODEL:-/home/ubuntu/models/smolvla-so101_medicine_bottle_pickplace-9604}  # path on the board
+  DEVICE=cpu
+else
+  MODEL=${MODEL:-/nethome-instruction/pi34/models/smolvla-so101_medicine_bottle_pickplace-9604}
+  DEVICE=cuda
+fi
 echo "Model: $MODEL"
+JOB=""
+if [ -n "${BOARD:-}" ]; then
+  # KR260: its server listens on its localhost only; forward this Mac's port to it.
+  ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -L $PORT:127.0.0.1:$PORT "$BOARD" &
+  TUNNEL=$!
+  sleep 4
+  kill -0 $TUNNEL 2>/dev/null || { echo "SSH tunnel to $BOARD failed." >&2; exit 1; }
+else
 
-# 1. Policy server (1x H200, 2 h limit): reuse a running one or start one.
+# 1. Policy server (2 h limit): reuse a running one or start one. SERVE_ARGS picks the GPU node; it must
+# accept SSH logins for the tunnel. Verified 2026-10-15: nvidia-l4 (doop) yes; nvidia-h100 (bender) and
+# nvidia-l40s (zapp) reject them (broken /nethome symlink); nvidia-h200 works but is often full.
+SERVE_ARGS=${SERVE_ARGS:--w nvidia-l4 --gres=gpu:l4:1}
 JOB=$(ssh -o BatchMode=yes $LOGIN "squeue -u pi34 -n smolvla-serve -h -o %i | head -1" 2>/dev/null)
 if [ -z "$JOB" ]; then
-  JOB=$(ssh -o BatchMode=yes $LOGIN "MODEL=$MODEL sbatch --parsable ~/serve_policy.sbatch" 2>/dev/null | tail -1)
-  echo "Started policy server job $JOB (1x H200)."
+  JOB=$(ssh -o BatchMode=yes $LOGIN "MODEL=$MODEL sbatch --parsable $SERVE_ARGS ~/serve_policy.sbatch" 2>/dev/null | tail -1)
+  echo "Started policy server job $JOB ($SERVE_ARGS)."
 fi
 echo "Waiting for the policy server (job $JOB) ..."
 for _ in $(seq 90); do
@@ -53,6 +73,7 @@ ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -J $LOGIN -L $PORT:127.0.0.1
 TUNNEL=$!
 sleep 4
 kill -0 $TUNNEL 2>/dev/null || { echo "SSH tunnel to $NODE failed." >&2; exit 1; }
+fi
 
 # 3. Remember where the arm starts, and always return there and clean up, however the run ends.
 "$PY" "$SO101/home.py" save || { kill $TUNNEL; exit 1; }
@@ -61,7 +82,7 @@ cleanup() {
   echo "Returning the arm to its start pose ..."
   "$PY" "$SO101/home.py" go
   kill $TUNNEL 2>/dev/null
-  if [ -z "${KEEP_SERVER:-}" ]; then
+  if [ -n "$JOB" ] && [ -z "${KEEP_SERVER:-}" ]; then
     ssh -o BatchMode=yes $LOGIN "scancel $JOB" 2>/dev/null && echo "Policy server job $JOB cancelled."
   fi
 }
@@ -76,6 +97,6 @@ start_camera_lock
   "${FOLLOWER_ARGS[@]}" "--robot.cameras=$POLICY_CAMERAS" --robot.max_relative_target=${MAX_STEP:-10} \
   --robot.disable_torque_on_disconnect=false \
   --robot.position_p_coefficient=${P_GAIN:-16} --robot.position_i_coefficient=${I_GAIN:-0} --robot.position_d_coefficient=${D_GAIN:-32} \
-  --task="$TASK" --policy_type=smolvla --pretrained_name_or_path="$MODEL" --policy_device=cuda \
+  --task="$TASK" --policy_type=smolvla --pretrained_name_or_path="$MODEL" --policy_device=$DEVICE \
   --actions_per_chunk=50 --chunk_size_threshold=0.5 --aggregate_fn_name=weighted_average --fps=30 \
   2>&1 | tee "$LOG"

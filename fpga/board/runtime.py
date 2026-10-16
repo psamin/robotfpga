@@ -11,6 +11,7 @@ FP32 activations to the FPGA engine. The ARM adds the bias and runs everything n
 
 Engine modes:
   Engine("float.bit")     the board (PYNQ)
+  RemoteEngine(sock)      the board when the caller is not the PYNQ Python: talks to engine_server.py
   Engine(mock="shim")     the same C core as a host library, whole layer per call
   Engine(mock="layout")   the same C core, called once per 4096-wide K chunk with exactly the word
                           offsets the board path uses, so the DDR layout is tested without a board
@@ -136,6 +137,73 @@ class Engine:
         self.calls += 1
         self.fpga_s += time.perf_counter() - t0
         return y
+
+
+def _send(sock, header: dict, payload: bytes = b"") -> None:
+    import json
+    import struct
+
+    h = json.dumps(header).encode()
+    sock.sendall(struct.pack("<QQ", len(h), len(payload)) + h + payload)
+
+
+def _recv(sock) -> tuple[dict, bytes]:
+    import json
+    import struct
+
+    def exact(n: int) -> bytearray:  # writable: torch.from_numpy warns on read-only arrays
+        buf = bytearray()
+        while len(buf) < n:
+            part = sock.recv(min(n - len(buf), 1 << 22))
+            if not part:
+                raise ConnectionError("engine socket closed")
+            buf += part
+        return buf
+
+    hn, pn = struct.unpack("<QQ", exact(16))
+    return json.loads(exact(hn)), exact(pn)
+
+
+class RemoteEngine:
+    """Client for fpga/board/engine_server.py over a Unix socket: same upload/gemm interface as Engine.
+
+    On the KR260, LeRobot needs Python >= 3.12 while PYNQ 3.0.1 runs on Python 3.10, so the policy and the
+    FPGA driver live in two processes. Weights are packed here and stored in DDR by the server."""
+
+    def __init__(self, path: str = "/tmp/fpga-engine.sock"):
+        import socket
+        import threading
+
+        self.pf = _pack_float()
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.connect(path)
+        self.lock = threading.Lock()  # the policy server answers gRPC calls from a thread pool
+        self.calls, self.fpga_s = 0, 0.0
+
+    def _call(self, header: dict, payload: bytes = b""):
+        with self.lock:
+            _send(self.sock, header, payload)
+            h, data = _recv(self.sock)
+        if "error" in h:
+            raise RuntimeError(f"engine server: {h['error']}")
+        return h, data
+
+    def upload(self, packed: np.ndarray) -> int:
+        h, _ = self._call(
+            {"op": "upload", "n": int(packed.size)}, np.ascontiguousarray(packed, np.uint16).tobytes()
+        )
+        return h["id"]
+
+    def gemm(self, wbuf: int, layout, mp: int, x: np.ndarray) -> np.ndarray:
+        n, k = x.shape
+        t0 = time.perf_counter()
+        h, data = self._call(
+            {"op": "gemm", "id": wbuf, "mp": mp, "k": k, "n": n},
+            np.ascontiguousarray(x, np.float32).tobytes(),
+        )
+        self.calls += 1
+        self.fpga_s += time.perf_counter() - t0
+        return np.frombuffer(data, np.float32).reshape(n, mp)
 
 
 class FpgaLinear:
