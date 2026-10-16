@@ -98,6 +98,31 @@ synthesis). A chunk covers 1.67 s at 30 Hz, so the arm runs the chunk slower tha
 between chunks. Options, each the owner's call: BF16 multiplies with FP32 accumulation (several times
 more MACs per DSP), running the vision encoder at a lower rate, or fewer camera tokens (a model change).
 
+## FPGA side (2026-10-16, branch `fpga/203-float-engine`, #203)
+
+Synthesis on the FPGA laptop (Vitis HLS 2022.2, Windows) of the engine as committed found four things the C
+simulation could not show, all fixed on the branch with the host cases and the whole model unchanged
+(0.026° max on the base model, 0.0043 normalized on the fine-tuned checkpoint through the board's DDR layout):
+
+| Found in synthesis | Fix |
+|---|---|
+| `red` loop II = 7 and 515 FP32 adders at TP = 2: the runtime `k % PS` index into fully partitioned registers became muxes HLS could not pipeline | MAC loop over (k, token block) with the block innermost at II = 1; partial sums in LUT RAM indexed by block and `k mod PS`, revisited after NB·PS ≥ 16 cycles (`DEPENDENCE` distance); one multiplier and one adder per lane |
+| Weight tile stores II = 4 (8 stores per 128-bit word) and no bursts on the struct-typed `m_axi` pointers (II = 2 per word) | DDR words are `ap_uint<128>` under Vitis (plain structs on the host); the four ports load in one loop (4 bursts at once) |
+| Load/compute overlap not real (sequential calls, #167) | the group loop is a `DATAFLOW` region: `tile` is double-buffered by HLS |
+| X/Y over a 32-bit io port cost 25–35 % at TP = 4 | 128-bit io words (K must be a multiple of 4; SmolVLA's are) |
+
+Results (TP = 4): `mac`, `load`, `load_x`, `store_row` all II = 1; bursts on hp0–hp3 and io; 644 DSP, 83,431 LUT,
+113,161 FF, 48 URAM, 0 BRAM; estimated clock 3.602 ns against the 3.333 ns target (PYNQ can lower `fclk0` at
+runtime, `Engine(clock_mhz=...)`). **TP = 8 does not fit**: an FP32 multiply-add costs ~3 DSP plus a fabric adder,
+so 256 lanes exceed the 1,248 DSPs; TP = 4 (128 MACs/clock, ~6.7 s per chunk by the latency model) is the FP32
+ceiling on this chip. Windows notes: `open_project` must not contain `/`, csim predefines `NT`, and a Windows
+update mid-session broke every Vivado implementation until a reboot (`fpga/hls/resume_impl.tcl` resumes one).
+
+Board chain (`fpga/board/deploy_smolvla.py`): `--setup` installs Python 3.12 + the LeRobot fork offline next to
+PYNQ's 3.10; the default run pushes code, bitstream, checkpoint and batches, runs `check_engine.py`, starts
+`engine_server.py` as root and `serve_policy_fpga.py --selftest`, and with `--serve` leaves the policy server up.
+Board numbers (WNS, GB/s, seconds per chunk): not measured yet.
+
 ## Next steps (FPGA side)
 
 1. `make -C fpga/hls test`, then `vitis_hls -f run_float_hls.tcl` in `fpga/hls/`: C sim, synthesis at
