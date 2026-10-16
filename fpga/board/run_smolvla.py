@@ -30,16 +30,21 @@ def main():
     ap.add_argument("--bit", help="overlay .bit (board)")
     ap.add_argument("--mock", choices=["shim", "layout"])
     ap.add_argument("--threads", type=int, default=4, help="ARM threads for the non-linear ops")
+    ap.add_argument("--clock-mhz", type=float, default=None, help="PL clock to set after loading the overlay")
     args = ap.parse_args()
 
     import torch
     from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 
     torch.set_num_threads(args.threads)
-    eng = Engine(args.bit) if args.bit else Engine(mock=args.mock or "layout")
+    eng = Engine(args.bit, clock_mhz=args.clock_mhz) if args.bit else Engine(mock=args.mock or "layout")
     t0 = time.perf_counter()
-    policy = SmolVLAPolicy.from_pretrained(str(Path(args.model).expanduser())).float().to("cpu").eval()
+    # Keep the checkpoint's BF16 while packing: .float() first would hold a 1.8 GB FP32 copy next to
+    # the 0.71 GB DDR copy on a 4 GB board. Each linear is widened to FP32 only for its own packing and
+    # then freed; the ~0.4 GB that stays in PyTorch (norms, embeddings, patch conv) is widened after.
+    policy = SmolVLAPolicy.from_pretrained(str(Path(args.model).expanduser())).to("cpu").eval()
     n = fpga_linears(policy, eng)
+    policy = policy.float()
     print(f"loaded and packed {n} linear layers in {time.perf_counter() - t0:.1f} s", flush=True)
 
     rows = []

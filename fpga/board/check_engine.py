@@ -40,10 +40,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cases", help="directory of case_* dirs, or one case dir")
     ap.add_argument("--bit", help="overlay .bit (board)")
+    ap.add_argument("--clock-mhz", type=float, default=None, help="PL clock to set after loading the overlay")
     ap.add_argument("--mock", choices=["shim", "layout"], help="host-side C core instead of the board")
     ap.add_argument("--repeat", type=int, default=3)
     args = ap.parse_args()
-    eng = Engine(args.bit) if args.bit else Engine(mock=args.mock or "layout")
+    eng = Engine(args.bit, clock_mhz=args.clock_mhz) if args.bit else Engine(mock=args.mock or "layout")
     root = Path(args.cases)
     dirs = (
         [root]
