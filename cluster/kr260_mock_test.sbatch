@@ -39,6 +39,7 @@ $PY "$REPO/fpga/board/serve_policy_fpga.py" --socket "$SOCK" --selftest "$MODEL"
 echo "== gRPC policy server + test client"
 $PY "$REPO/fpga/board/serve_policy_fpga.py" --socket "$SOCK" --port 8099 > "$WORK/server.log" 2>&1 &
 until grep -q "PolicyServer started" "$WORK/server.log"; do sleep 1; done
-$PY -c "from lerobot.datasets.lerobot_dataset import LeRobotDataset; LeRobotDataset('flyingturtleboop/so101_medicine_bottle_pickplace')" >/dev/null
+DS=flyingturtleboop/so101_medicine_bottle_pickplace  # test_policy_server.py reads $HF_HOME/lerobot/<repo>
+$PY -c "from huggingface_hub import snapshot_download as s; s('$DS', repo_type='dataset', local_dir='$HF_HOME/lerobot/$DS')" >/dev/null
 $PY "$REPO/robot/toolkit/test_policy_server.py" --model "$MODEL" --server 127.0.0.1:8099
 grep -E "linear layers on the FPGA|Time taken" "$WORK/server.log"
