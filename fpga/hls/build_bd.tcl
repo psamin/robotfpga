@@ -37,7 +37,7 @@ foreach {m s} {hp0 S_AXI_HP0_FPD hp1 S_AXI_HP1_FPD hp2 S_AXI_HP2_FPD hp3 S_AXI_H
     Master /float_top_0/m_axi_$m Slave /zynq/$s intc_ip Auto master_apm 0] [get_bd_intf_pins zynq/$s]
 }
 apply_bd_automation -rule xilinx.com:bd_rule:axi4 -config [list Clk_master $clk Clk_slave Auto Clk_xbar Auto \
-  Master /zynq/M_AXI_HPM0_FPD Slave /float_top_0/s_axi_control intc_ip New master_apm 0] \
+  Master /zynq/M_AXI_HPM0_FPD Slave /float_top_0/s_axi_control intc_ip {New AXI Interconnect} master_apm 0] \
   [get_bd_intf_pins float_top_0/s_axi_control]
 assign_bd_address
 validate_bd_design
