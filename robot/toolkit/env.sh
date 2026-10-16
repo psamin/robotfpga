@@ -3,6 +3,7 @@ SO101=$HOME/so101
 LEROBOT=$HOME/Documents/GitHub/lerobot
 BIN=$LEROBOT/.venv/bin
 PY=$BIN/python
+export PATH="$BIN:$PATH"  # lerobot-* and the rerun viewer (VIEW=true) resolve from the LeRobot venv
 export PYTHONUNBUFFERED=1   # logs update live instead of in buffered chunks
 
 FOLLOWER_PORT=/dev/tty.usbmodem5B790811541

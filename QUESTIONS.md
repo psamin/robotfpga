@@ -16,7 +16,7 @@ linear layers on the FPGA). Cube-sorting work removed; preserved at tag `archive
 
 | Area | State | Where |
 |---|---|---|
-| Policy | Fine-tuned SmolVLA, checkpoint `smolvla-so101_medicine_bottle_pickplace-9604` on the cluster | [SETUP.md](SETUP.md) §3 |
+| Policy | Fine-tuned SmolVLA `smolvla-so101_medicine_bottle_pickplace-9604`, the best on this task (offline action error 0.080; every co-trained or augmented variant tried is 0.084–0.121). Download: GitHub release `policy-smolvla-9604` (checkpoint, replay batches, SHA256SUMS) | [robot/README.md](robot/README.md) §Running the best policy |
 | Post-training (Alan) | Approved in #156. Built, all open PRs stacked from #172 to #200: randomized pick-and-place scene, reset families and buffer, CPU and Warp teacher envs, PPO + SGS training job, held-out eval, calibrated-camera rendering, SmolVLA-in-sim baseline runner. Scripted expert: 0.75 on 80 held-out rest starts. Waiting on: the first GPU training run, the camera photo session, then the SmolVLA baseline. No training run yet | [docs/smolvla-post-training.md](docs/smolvla-post-training.md) |
 | Real arm | Follower + leader calibrated; teleop / record / rollout toolkit works | [robot/](robot/README.md) |
 | FPGA engine | `fpga/hls/` passes C simulation on real SmolVLA layers; whole SmolVLA through the engine code matches PyTorch FP32 to ~0.01° mean. Not synthesized | [docs/smolvla-fpga.md](docs/smolvla-fpga.md) |
