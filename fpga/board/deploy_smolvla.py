@@ -87,8 +87,10 @@ def main():
     if not batches:
         sys.exit(f"no batches in {out / 'batches'}")
 
-    jb.login()
     rem = args.remote.strip("/")
+    if args.skip_push and args.skip_run:
+        return
+    jb.login()
     if not args.skip_push:
         print(f"== 2/3 push to the board: {rem}/", flush=True)
         t0 = time.time()
