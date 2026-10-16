@@ -55,6 +55,34 @@ def chunk_layout(mp: int, k: int) -> list[tuple[int, int, int]]:
     return out
 
 
+def set_pl_clock(mhz: float, built_mhz: float = 300.0) -> float:
+    """Set PL clock 0. PYNQ's Clocks first; else scale DIVISOR0 of CRL_APB.PL0_REF_CTRL (ZU+) from the
+    divisor the bitstream's block design programmed for `built_mhz`. Returns the frequency set."""
+    try:
+        from pynq.ps import Clocks
+
+        Clocks.fclk0_mhz = mhz
+        return float(Clocks.fclk0_mhz)
+    except Exception as e:  # noqa: BLE001 - fall back to the register
+        print(f"pynq Clocks failed ({e}); writing PL0_REF_CTRL directly", flush=True)
+    import mmap
+    import os
+
+    PL0_REF_CTRL = 0xFF5E00C0
+    fd = os.open("/dev/mem", os.O_RDWR | os.O_SYNC)
+    try:
+        m = mmap.mmap(fd, 4096, offset=PL0_REF_CTRL & ~0xFFF)
+        off = PL0_REF_CTRL & 0xFFF
+        reg = int.from_bytes(m[off : off + 4], "little")
+        div0 = (reg >> 8) & 0x3F
+        new = max(1, min(63, round(div0 * built_mhz / mhz)))
+        m[off : off + 4] = ((reg & ~(0x3F << 8)) | (new << 8)).to_bytes(4, "little")
+        m.close()
+    finally:
+        os.close(fd)
+    return built_mhz * div0 / new
+
+
 class Engine:
     """PYNQ driver for float_top, or a host-side mock running the identical C core."""
 
@@ -70,9 +98,7 @@ class Engine:
         self.allocate = allocate
         self.ol = Overlay(bitfile)
         if clock_mhz:  # the bitstream is built for 300 MHz; run slower if timing did not close there
-            from pynq.ps import Clocks
-
-            Clocks.fclk0_mhz = clock_mhz
+            set_pl_clock(clock_mhz)
         self.ip = self.ol.float_top_0
         self.regs = self.ip.register_map
         self._bx = self._by = None
