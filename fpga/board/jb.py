@@ -138,9 +138,20 @@ def _file_body(raw):
     return {"type": "file", "format": "base64", "content": base64.b64encode(raw).decode()}
 
 
-def put(local, remote):
-    """Upload a file of any size: chunks through the contents API, joined by the kernel."""
+def remote_size(remote):
+    """Size of a file on the board, or None if it is not there."""
+    try:
+        return api("GET", "contents/" + urllib.parse.quote(remote) + "?content=0").get("size")
+    except Exception:
+        return None
+
+
+def put(local, remote, force=False):
+    """Upload a file of any size: chunks through the contents API, joined by the kernel.
+    Skips the upload when the board already has a file of the same size (unless force)."""
     size = os.path.getsize(local)
+    if not force and remote_size(remote) == size:
+        return size
     mkdir(os.path.dirname(remote))
     if size <= CHUNK:
         raw = open(local, "rb").read()

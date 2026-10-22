@@ -3,19 +3,22 @@
 #   python fpga/board/deploy_smolvla.py --bit ... --model ... --batches ... --serve
 # Then, in PowerShell from the repo root:   .\fpga\board\laptop_client.ps1
 # Arm at rest, bottle + plate placed as in robot/calibration/reference_frames. Ctrl-C stops the client (it
-# does not glide the arm home). Values below are this laptop's: follower COM3, front C920 = OpenCV 2,
-# wrist IMX307 = OpenCV 1 (check with lerobot-find-port / lerobot-find-cameras opencv after replugging).
+# does not glide the arm home). Values below are this laptop's on 2026-10-21: follower COM3, front C920 =
+# OpenCV 0, wrist IMX307 = OpenCV 2 (indexes move when cameras are replugged: check with
+# lerobot-find-cameras opencv). FrontRotation 180: the C920 is mounted turned around relative to
+# robot/calibration/reference_frames/front.jpg (arm base must be at the top of the frame).
 param(
     [string]$Board = "ubuntu@192.168.137.35",
     [string]$Policy = "/home/ubuntu/smolvla/ckpt/smolvla-so101_medicine_bottle_pickplace-9604",
     [string]$Port = "COM3",
-    [int]$Front = 2,
-    [int]$Wrist = 1,
+    [int]$Front = 0,
+    [int]$Wrist = 2,
+    [int]$FrontRotation = 180,
     [int]$MaxStep = 10,
     [string]$Py = "C:\kp\lerobot-venv\Scripts\python.exe"
 )
 $task = "Pick up the medicine bottle and place it on the plate"
-$cams = "{ camera1: {type: opencv, index_or_path: $Front, width: 640, height: 480, fps: 30, warmup_s: 3}, camera2: {type: opencv, index_or_path: $Wrist, width: 480, height: 640, fps: 30, rotation: 90, warmup_s: 3}}"
+$cams = "{ camera1: {type: opencv, index_or_path: $Front, width: 640, height: 480, fps: 30, rotation: $FrontRotation, warmup_s: 3}, camera2: {type: opencv, index_or_path: $Wrist, width: 480, height: 640, fps: 30, rotation: 90, warmup_s: 3}}"
 
 Write-Host "SSH tunnel laptop:8080 -> $Board 127.0.0.1:8080 (close its window to stop)"
 $tunnel = Start-Process ssh -ArgumentList "-N", "-L", "8080:127.0.0.1:8080", "-o", "ExitOnForwardFailure=yes", $Board -PassThru
