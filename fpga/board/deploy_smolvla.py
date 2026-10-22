@@ -35,6 +35,10 @@ CODE = [
     "fpga/board/serve_policy_fpga.py",
     "fpga/board/check_engine.py",
     "fpga/board/run_smolvla.py",
+    "fpga/board/load_overlay.py",
+    "fpga/board/xrtmem.py",
+    "fpga/board/profile_engine.py",
+    "fpga/board/profile_arm.py",
     "fpga/board/setup_board.sh",
     "fpga/hls/pack_float.py",
 ]
@@ -195,6 +199,13 @@ def main():
     ap.add_argument("--skip-selftest", action="store_true")
     ap.add_argument("--serve", action="store_true", help="leave the policy server running on :8080")
     ap.add_argument("--keep-desktop", action="store_true", help="do not stop the board's GNOME desktop")
+    ap.add_argument(
+        "--engine", choices=["xrt", "socket"], default="xrt",
+        help="xrt: the policy process (root) drives the FPGA itself; socket: engine_server.py + Unix socket",
+    )  # fmt: skip
+    ap.add_argument(
+        "--legacy-y", action="store_true", help="bitstream built from float_linear.h v3 (row-major Y)"
+    )
     args = ap.parse_args()
 
     jb.login()
@@ -258,8 +269,11 @@ def main():
     )
     clock = f" --clock-mhz {args.clock_mhz}" if args.clock_mhz else ""
     # the policy process: the user's 3.12 venv, Hugging Face fully offline from the pushed cache
-    hf = f"HF_HOME={home}/hfcache HF_HUB_OFFLINE=1"
-    policy = f"sudo -u {args.user} env {hf} {venv_py} fpga/board/serve_policy_fpga.py"
+    hf = f"HF_HOME={home}/hfcache HF_HUB_OFFLINE=1" + (" FSTREAM_LEGACY_Y=1" if args.legacy_y else "")
+    if args.engine == "xrt":  # root: the engine maps CMA buffers and the IP registers in this process
+        policy = f"env {hf} {venv_py} fpga/board/serve_policy_fpga.py --engine xrt"
+    else:
+        policy = f"sudo -u {args.user} env {hf} {venv_py} fpga/board/serve_policy_fpga.py --engine socket"
     if not args.keep_desktop:  # GNOME holds several hundred MB the model load needs
         shell(
             home,
@@ -270,17 +284,24 @@ def main():
 
     if not args.skip_engine_check:
         print("== engine check (PYNQ Python): every case + bandwidth", flush=True)
+        legacy = "FSTREAM_LEGACY_Y=1 " if args.legacy_y else ""
         shell(
             home,
-            f"{PYNQ_PY} fpga/board/check_engine.py --bit {bit.name}{clock} build/stream/float",
+            f"{legacy}{PYNQ_PY} fpga/board/check_engine.py --bit {bit.name}{clock} build/stream/float",
             "check_engine.log",
         )
 
-    print("== engine server (background, root) + policy selftest (LeRobot venv)", flush=True)
-    shell(home, f"SUDO_USER={args.user} {PYNQ_PY} fpga/board/engine_server.py --bit {bit.name}{clock}",
-          "engine_server.log", 60, background=True)  # fmt: skip
-    if not wait_for(home, "engine_server.log", "engine ready", 180):
-        sys.exit("engine server failed")
+    if args.engine == "xrt":
+        print(
+            "== load the overlay (PYNQ) + policy selftest (LeRobot venv, root, FPGA in-process)", flush=True
+        )
+        shell(home, f"{PYNQ_PY} fpga/board/load_overlay.py --bit {bit.name}{clock}", "load_overlay.log", 180)
+    else:
+        print("== engine server (background, root) + policy selftest (LeRobot venv)", flush=True)
+        shell(home, f"SUDO_USER={args.user} {PYNQ_PY} fpga/board/engine_server.py --bit {bit.name}{clock}",
+              "engine_server.log", 60, background=True)  # fmt: skip
+        if not wait_for(home, "engine_server.log", "engine ready", 180):
+            sys.exit("engine server failed")
     if not args.skip_selftest:
         cmd = f"{policy} --selftest ckpt/{name} --batches batches"
         sink: list[str] = []

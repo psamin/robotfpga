@@ -6,6 +6,8 @@
 set here [file dirname [file normalize [info script]]]
 set sfx ""
 if {[info exists ::env(FSTREAM_TP)]} { set sfx "_tp$::env(FSTREAM_TP)" }
+if {[info exists ::env(FSTREAM_TAG)]} { append sfx "_$::env(FSTREAM_TAG)" }
+if {[info exists ::env(FSTREAM_MHZ)]} { set mhz $::env(FSTREAM_MHZ) } else { set mhz 300 }
 set ip_repo [file normalize "$here/build/float_hls$sfx/sol1/impl/ip"]
 set out [file normalize "$here/build"]
 
@@ -27,7 +29,7 @@ set_property -dict [list \
   CONFIG.PSU__USE__S_AXI_GP3 {1} CONFIG.PSU__SAXIGP3__DATA_WIDTH {128} \
   CONFIG.PSU__USE__S_AXI_GP4 {1} CONFIG.PSU__SAXIGP4__DATA_WIDTH {128} \
   CONFIG.PSU__USE__S_AXI_GP5 {1} CONFIG.PSU__SAXIGP5__DATA_WIDTH {128} \
-  CONFIG.PSU__CRL_APB__PL0_REF_CTRL__FREQMHZ {300} \
+  CONFIG.PSU__CRL_APB__PL0_REF_CTRL__FREQMHZ $mhz \
 ] $ps
 
 set eng [create_bd_cell -type ip -vlnv [lindex [get_ipdefs *float_top*] 0] float_top_0]

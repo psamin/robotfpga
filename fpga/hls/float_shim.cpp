@@ -49,8 +49,11 @@ extern "C" int linear_bf16(const uint16_t* w_packed, const float* x, float* y, i
           int st = linear_bf16_core(wp[0] + woff, wp[1] + woff, wp[2] + woff, wp[3] + woff,
                                     (const IoWord*)&xc[(size_t)n0 * kc], (IoWord*)yt.data(), ms, kc, nt, xbuf);
           if (st) status = st;
-          for (int n = 0; n < nt; n++)
-            for (int m = 0; m < ms; m++) y[(size_t)(n0 + n) * M + g0 * LANES + m] += yt[(size_t)n * ms + m];
+          // yt is Y_tiled[gn][NT][LANES] (one tile): un-tile into the row-major output
+          for (int g = 0; g < gn; g++)
+            for (int n = 0; n < nt; n++)
+              for (int l = 0; l < LANES; l++)
+                y[(size_t)(n0 + n) * M + (g0 + g) * LANES + l] += yt[((size_t)g * NT + n) * LANES + l];
         }
       }
       free(xbuf);
