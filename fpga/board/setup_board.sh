@@ -36,14 +36,19 @@ else
   uv python install 3.12
   PY312=$(uv python find 3.12)
 fi
-"$PY312" -m venv "$VENV"
+[ -x "$VENV/bin/python" ] || "$PY312" -m venv "$VENV"
 PIP="$VENV/bin/python -m pip"
-$PIP install -q --upgrade pip
+# CPU torch only: PyPI's aarch64 torch pulls gigabytes of CUDA libraries the board cannot use
+CONS=$(mktemp); printf 'torch==2.8.0\ntorchvision==0.23.0\n' > "$CONS"
+CPU_IDX="--extra-index-url https://download.pytorch.org/whl/cpu"
 if [ -n "$OFF" ] && [ -d "$OFF/wheels" ]; then
-  $PIP install --no-index --find-links "$OFF/wheels" --find-links "$OFF/lerobot_fork" "lerobot[smolvla,async]" websockets \
-    || $PIP install --find-links "$OFF/wheels" --find-links "$OFF/lerobot_fork" "lerobot[smolvla,async]" websockets
+  $PIP install --no-index --find-links "$OFF/wheels" --find-links "$OFF/lerobot_fork" -c "$CONS" \
+      "lerobot[smolvla,async]" websockets \
+    || $PIP install --find-links "$OFF/wheels" --find-links "$OFF/lerobot_fork" -c "$CONS" $CPU_IDX \
+      "lerobot[smolvla,async]" websockets
 else
-  $PIP install "lerobot[smolvla,async] @ git+https://github.com/psamin/lerobot@e624f3f7f8411ec3a02635d06e79373341e5ef35" websockets
+  $PIP install -c "$CONS" $CPU_IDX websockets \
+    "lerobot[smolvla,async] @ git+https://github.com/psamin/lerobot@e624f3f7f8411ec3a02635d06e79373341e5ef35"
 fi
 chown -R "$USER_NAME" "$VENV" "$HOME_DIR/.python312" 2>/dev/null || true
 "$VENV/bin/python" - <<'EOF'
