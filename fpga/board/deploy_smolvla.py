@@ -40,6 +40,8 @@ CODE = [
 ]
 CKPT = ["config.json", "model.safetensors", "policy_preprocessor.json", "policy_postprocessor.json"]
 JUP = "/root/jupyter_notebooks"
+HF_HUB = Path.home() / ".cache" / "huggingface" / "hub"
+HF_MAX_FILE = 50 << 20  # backbone config/tokenizer files only, never its 2 GB of weights
 PYNQ_PY = "/usr/local/share/pynq-venv/bin/python3"
 
 
@@ -94,10 +96,15 @@ def push(rem: str, bit: Path, hwh: Path, model: Path, name: str, frames: list[Pa
     jb.put(str(hwh), f"{rem}/{hwh.name}")
     for p in frames:
         jb.put(str(p), f"{rem}/batches/{p.name}")
-    ckpt = [model / c for c in CKPT] + sorted(model.glob("policy_*processor*.safetensors"))
+    ckpt = [model / c for c in CKPT if c != "config.json"] + sorted(
+        model.glob("policy_*processor*.safetensors")
+    )
     ckpt += [p for p in [model / "train_config.json"] if p.exists()]
     for p in ckpt:
         jb.put(str(p), f"{rem}/ckpt/{name}/{p.name}")
+    cfg_path, vlm = board_config(model)
+    jb.put(str(cfg_path), f"{rem}/ckpt/{name}/config.json")
+    push_hf_cache(rem, vlm)
     if (model / "tokenizer").is_dir():
         for p in sorted((model / "tokenizer").glob("*")):
             if not p.name.startswith("."):  # skip macOS ._* metadata from tars made on a Mac
@@ -105,6 +112,36 @@ def push(rem: str, bit: Path, hwh: Path, model: Path, name: str, frames: list[Pa
     for d in sorted((ROOT / "build" / "stream" / "float").glob("case_*")):
         for p in sorted(d.glob("*")):
             jb.put(str(p), f"{rem}/build/stream/float/{d.name}/{p.name}")
+
+
+def board_config(model: Path) -> tuple[Path, str]:
+    """The checkpoint's config.json with load_vlm_weights off (written next to the deploy outputs).
+
+    The released config has load_vlm_weights=true: SmolVLAPolicy.from_pretrained then downloads and loads the
+    SmolVLM2 backbone (2 GB FP32) before the checkpoint overwrites every weight. Measured on the laptop:
+    3.19 GB peak RSS vs 2.35 GB with false, identical action chunk (3.6e-7 from the release reference) and no
+    network. The KR260 has ~2.9 GB for Linux once 1 GB is reserved as CMA."""
+    cfg = json.loads((model / "config.json").read_text())
+    cfg["load_vlm_weights"] = False
+    out = ROOT / "build" / "deploy" / f"{model.name}_config.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(cfg, indent=4))
+    return out, cfg.get("vlm_model_name", "")
+
+
+def push_hf_cache(rem: str, repo_id: str) -> None:
+    """The backbone's config/processor/tokenizer from the laptop's HF cache, so the board stays offline."""
+    if not repo_id:
+        return
+    src = HF_HUB / ("models--" + repo_id.replace("/", "--"))
+    if not (src / "refs" / "main").exists():
+        sys.exit(f"{repo_id} is not in {HF_HUB}: run the laptop selftest once online to cache its config")
+    rev = (src / "refs" / "main").read_text().strip()
+    dst = f"{rem}/hfcache/hub/{src.name}"
+    jb.put(str(src / "refs" / "main"), f"{dst}/refs/main")
+    for p in sorted((src / "snapshots" / rev).glob("*")):
+        if p.is_file() and p.stat().st_size <= HF_MAX_FILE:
+            jb.put(str(p), f"{dst}/snapshots/{rev}/{p.name}")
 
 
 def mirror(src: str, home: str, user: str) -> bool:
@@ -157,6 +194,7 @@ def main():
     ap.add_argument("--skip-engine-check", action="store_true")
     ap.add_argument("--skip-selftest", action="store_true")
     ap.add_argument("--serve", action="store_true", help="leave the policy server running on :8080")
+    ap.add_argument("--keep-desktop", action="store_true", help="do not stop the board's GNOME desktop")
     args = ap.parse_args()
 
     jb.login()
@@ -219,6 +257,16 @@ def main():
         60,
     )
     clock = f" --clock-mhz {args.clock_mhz}" if args.clock_mhz else ""
+    # the policy process: the user's 3.12 venv, Hugging Face fully offline from the pushed cache
+    hf = f"HF_HOME={home}/hfcache HF_HUB_OFFLINE=1"
+    policy = f"sudo -u {args.user} env {hf} {venv_py} fpga/board/serve_policy_fpga.py"
+    if not args.keep_desktop:  # GNOME holds several hundred MB the model load needs
+        shell(
+            home,
+            "xmutil desktop_disable || systemctl isolate multi-user.target; free -m | head -2",
+            "desktop.log",
+            120,
+        )
 
     if not args.skip_engine_check:
         print("== engine check (PYNQ Python): every case + bandwidth", flush=True)
@@ -234,8 +282,7 @@ def main():
     if not wait_for(home, "engine_server.log", "engine ready", 180):
         sys.exit("engine server failed")
     if not args.skip_selftest:
-        cmd = f"sudo -u {args.user} {venv_py} fpga/board/serve_policy_fpga.py"
-        cmd += f" --selftest ckpt/{name} --batches batches"
+        cmd = f"{policy} --selftest ckpt/{name} --batches batches"
         sink: list[str] = []
         ok = shell(home, cmd, "selftest.log", 3600, sink=sink)
         log = "".join(sink)
@@ -246,8 +293,7 @@ def main():
             sys.exit("selftest failed")
 
     if args.serve:
-        shell(home, f"sudo -u {args.user} {venv_py} fpga/board/serve_policy_fpga.py --port 8080",
-              "policy_server.log", 60, background=True)  # fmt: skip
+        shell(home, f"{policy} --port 8080", "policy_server.log", 60, background=True)
         print(
             f"policy server starting on the board's 127.0.0.1:8080 (checkpoint {home}/ckpt/{name}).\n"
             "Laptop: fpga/board/laptop_client.ps1 opens the tunnel and starts the robot client (guide §4)."
