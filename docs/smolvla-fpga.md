@@ -166,7 +166,8 @@ What changed, in order of payoff:
 Not taken: a one-DSP BF16×FP32 multiplier (`bf16_mul`: the 8×24-bit product is exact, so rounding it gives the FP32
 product bit for bit; `tb_mul.cpp`, 36.6 M pairs, 0 mismatches) would have let TP = 8 fit the DSPs, but Vitis HLS
 estimates it at ~400 LUT per MAC against ~120 for the multiplier core, and TP = 8 with the core (`fulldsp`) is
-1,032 DSP, 161k LUT and 241k FF estimated — over this part. Attention on the FPGA through an exact three-way BF16
+1,032 DSP, 161k LUT and 241k FF estimated. Built anyway to be sure (16:10): after synthesis 117,462 LUT, 187k FF;
+Vivado's DRC stopped placement at **118,727 LUTs needed of 117,120** — TP = 8 in FP32 does not fit the K26. Attention on the FPGA through an exact three-way BF16
 split of K/V was also costed: the ARM's softmax alone (3.7 s per chunk at ~80 M exp/s) leaves no gain.
 
 6. **A quiet board**: Ubuntu's automatic updater (the board has internet through the laptop) and snapd ran at
