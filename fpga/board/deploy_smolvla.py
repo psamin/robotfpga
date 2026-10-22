@@ -47,6 +47,14 @@ JUP = "/root/jupyter_notebooks"
 HF_HUB = Path.home() / ".cache" / "huggingface" / "hub"
 HF_MAX_FILE = 50 << 20  # backbone config/tokenizer files only, never its 2 GB of weights
 PYNQ_PY = "/usr/local/share/pynq-venv/bin/python3"
+# Ubuntu's automatic updater (the board has internet through the laptop) and snapd run at 100 % of a core
+# for long stretches; one extra runnable task stalls torch's spin-waiting OpenMP barriers and doubled the
+# ARM part of a chunk (22 -> 41 s measured). Stopped and disabled before every run.
+QUIET_BOARD = (
+    "systemctl stop unattended-upgrades apt-daily.timer apt-daily-upgrade.timer snapd.socket snapd.service"
+    " snapd-desktop-integration 2>/dev/null; systemctl disable apt-daily.timer apt-daily-upgrade.timer"
+    " unattended-upgrades snapd.socket snapd.service 2>/dev/null; pkill -f '[u]nattended-upgrade'; true"
+)
 
 
 def shell(folder: str, cmd: str, log: str, timeout: int = 1800, background: bool = False, sink=None) -> bool:
@@ -199,6 +207,10 @@ def main():
     ap.add_argument("--skip-selftest", action="store_true")
     ap.add_argument("--serve", action="store_true", help="leave the policy server running on :8080")
     ap.add_argument("--keep-desktop", action="store_true", help="do not stop the board's GNOME desktop")
+    ap.add_argument("--keep-noise", action="store_true", help="leave unattended-upgrades and snapd running")
+    ap.add_argument(
+        "--threads", type=int, default=3, help="ARM threads for the policy (3 leaves a core free)"
+    )
     ap.add_argument(
         "--engine", choices=["xrt", "socket"], default="xrt",
         help="xrt: the policy process (root) drives the FPGA itself; socket: engine_server.py + Unix socket",
@@ -270,10 +282,15 @@ def main():
     clock = f" --clock-mhz {args.clock_mhz}" if args.clock_mhz else ""
     # the policy process: the user's 3.12 venv, Hugging Face fully offline from the pushed cache
     hf = f"HF_HOME={home}/hfcache HF_HUB_OFFLINE=1" + (" FSTREAM_LEGACY_Y=1" if args.legacy_y else "")
+    threads = f" --threads {args.threads}"
     if args.engine == "xrt":  # root: the engine maps CMA buffers and the IP registers in this process
-        policy = f"env {hf} {venv_py} fpga/board/serve_policy_fpga.py --engine xrt"
+        policy = f"env {hf} {venv_py} fpga/board/serve_policy_fpga.py --engine xrt{threads}"
     else:
-        policy = f"sudo -u {args.user} env {hf} {venv_py} fpga/board/serve_policy_fpga.py --engine socket"
+        policy = (
+            f"sudo -u {args.user} env {hf} {venv_py} fpga/board/serve_policy_fpga.py --engine socket{threads}"
+        )
+    if not args.keep_noise:  # background services that steal cores from the policy's 4 threads
+        shell(home, QUIET_BOARD, "quiet_board.log", 120)
     if not args.keep_desktop:  # GNOME holds several hundred MB the model load needs
         shell(
             home,

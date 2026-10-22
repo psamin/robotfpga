@@ -314,12 +314,14 @@ class Engine:
             by.invalidate(0, ny * 4)
             t4 = time.perf_counter()
             yv = by.array[: ny * 4].view(np.float32)
-            if self.tiled_y:  # Y_tiled[g][npad][32] -> [n][g * 32 + l]
-                yv = yv.reshape(groups, npad, LANES)[:, :n, :]
-                if is_t:
-                    part = torch.from_numpy(yv).permute(1, 0, 2).reshape(n, mp)
+            if self.tiled_y:  # Y_tiled[g][npad][32] -> [n][g * 32 + l], always a copy out of the buffer
+                yv = yv.reshape(groups, npad, LANES)[:, :n, :]  # (reshape of a permuted view with one
+                if is_t:  # group is a view, which the next call would overwrite)
+                    part = torch.empty((n, mp), dtype=torch.float32)
+                    part.view(n, groups, LANES).copy_(torch.from_numpy(yv).permute(1, 0, 2))
                 else:
-                    part = yv.transpose(1, 0, 2).reshape(n, mp)
+                    part = np.empty((n, mp), np.float32)
+                    part.reshape(n, groups, LANES)[...] = yv.transpose(1, 0, 2)
             else:
                 yv = yv.reshape(n, mp)
                 part = torch.from_numpy(yv).clone() if is_t else yv.copy()

@@ -47,6 +47,9 @@ def main():
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--frames", type=int, default=1)
     ap.add_argument("--rows", type=int, default=45)
+    ap.add_argument(
+        "--stack", action="store_true", help="also attribute copies/clones to their Python callers"
+    )
     args = ap.parse_args()
 
     import torch
@@ -77,7 +80,7 @@ def main():
         d = torch.load(f, weights_only=False)
         policy.reset()
         t0 = time.perf_counter()
-        with torch.no_grad(), profile(activities=[ProfilerActivity.CPU]) as prof:
+        with torch.no_grad(), profile(activities=[ProfilerActivity.CPU], with_stack=args.stack) as prof:
             chunk = policy.predict_action_chunk(d["batch"], noise=d["noise"])
         wall = time.perf_counter() - t0
         diff = float((chunk.float() - d["ref_chunk_raw"].float()).abs().max())
@@ -92,6 +95,20 @@ def main():
         for b, s in sorted(buckets.items(), key=lambda kv: -kv[1]):
             print(f"  {b:32s} {s:7.2f} s  ({calls[b]} calls)")
         print(ka.table(sort_by="self_cpu_time_total", row_limit=args.rows))
+        if args.stack:
+            print("\ncopies and clones by caller (self CPU s):")
+            rows = [
+                ev
+                for ev in prof.key_averages(group_by_stack_n=6)
+                if ("copy_" in ev.key or "clone" in ev.key or "contiguous" in ev.key)
+                and ev.self_cpu_time_total > 5e4
+            ]
+            for ev in sorted(rows, key=lambda e: -e.self_cpu_time_total)[:12]:
+                frames = [f for f in (ev.stack or []) if "site-packages/torch/" not in f][:4]
+                print(
+                    f"  {ev.self_cpu_time_total / 1e6:6.2f} s {ev.count:6d}x {ev.key:24s} <- "
+                    + " | ".join(frames)
+                )
 
 
 if __name__ == "__main__":
