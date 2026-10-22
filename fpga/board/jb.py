@@ -23,6 +23,11 @@ import uuid
 import websockets
 
 HOST = os.environ.get("BOARD_JUPYTER", "192.168.137.35:9090")
+for _stream in (sys.stdout, sys.stderr):  # board output has progress bars a cp1252 console cannot print
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
 BASE = f"http://{HOST}"
 STATE = os.path.join(os.path.expanduser("~"), ".kr260_jb_kernel")
 CHUNK = 24 << 20

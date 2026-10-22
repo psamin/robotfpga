@@ -96,6 +96,8 @@ def main():
                 if hasattr(b, "freebuffer"):
                     b.freebuffer()
             bufs.clear()
+            if hasattr(eng, "free_weights"):
+                eng.free_weights()
 
 
 if __name__ == "__main__":

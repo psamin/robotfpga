@@ -83,6 +83,24 @@ def set_pl_clock(mhz: float, built_mhz: float = 300.0) -> float:
     return built_mhz * div0 / new
 
 
+SLAB_BYTES = 32 << 20  # weights are packed into 32 MB CMA slabs (largest SmolVLA layer: 23.6 MB)
+SLAB_ALIGN = 4096  # each layer starts on a 4 KB boundary inside its slab (AXI bursts never cross 4 KB)
+
+
+class SlabWeights:
+    """One layer's packed weights inside a shared CMA slab: what Engine.gemm needs from a weight buffer.
+
+    One CMA allocation per layer wasted ~300 MB of the KR260's 1,000 MB CMA on alignment (the kernel aligns
+    each allocation to up to 1 MB): 708 MB of SmolVLA weights did not fit. Slabs waste < 32 MB in total."""
+
+    def __init__(self, slab, offset: int, nbytes: int):
+        self.slab, self.offset, self.nbytes = slab, offset, nbytes
+        self.physical_address = slab.physical_address + offset
+
+    def freebuffer(self) -> None:  # the slab is freed by Engine.free_weights
+        pass
+
+
 class Engine:
     """PYNQ driver for float_top, or a host-side mock running the identical C core."""
 
@@ -102,6 +120,7 @@ class Engine:
         self.ip = self.ol.float_top_0
         self.regs = self.ip.register_map
         self._bx = self._by = None
+        self._slabs, self._slab_off, self._dirty = [], SLAB_BYTES, set()
 
     def _set_ptr(self, name: str, addr: int) -> None:
         if hasattr(self.regs, name):
@@ -123,13 +142,42 @@ class Engine:
         return self._bx, self._by
 
     def upload(self, packed: np.ndarray):
-        """Copy packed weights into a DDR buffer once; returns the buffer (or the array when mocked)."""
+        """Copy packed weights into DDR once; returns a SlabWeights (or the array when mocked).
+
+        Layers are placed back to back (4 KB aligned) in 32 MB CMA slabs; a layer larger than a slab gets
+        its own allocation. Slabs are flushed from the CPU cache before the next engine call."""
         if self.mock:
             return packed
-        b = self.allocate(shape=(packed.size,), dtype=np.uint16)
-        b[:] = packed
-        b.flush()
-        return b
+        nbytes = packed.size * 2
+        if nbytes > SLAB_BYTES:
+            b = self.allocate(shape=(nbytes,), dtype=np.uint8)
+            self._slabs.append(b)
+            b.view(np.uint16)[:] = packed
+            b.flush()
+            return SlabWeights(b, 0, nbytes)
+        if self._slab_off + nbytes > SLAB_BYTES:
+            self._slabs.append(self.allocate(shape=(SLAB_BYTES,), dtype=np.uint8))
+            self._slab_off = 0
+        slab, off = self._slabs[-1], self._slab_off
+        np.asarray(slab)[off : off + nbytes].view(np.uint16)[:] = packed
+        self._dirty.add(id(slab))
+        self._slab_off = off + -(-nbytes // SLAB_ALIGN) * SLAB_ALIGN
+        return SlabWeights(slab, off, nbytes)
+
+    def _flush_weights(self) -> None:
+        if self._dirty:
+            for slab in self._slabs:
+                if id(slab) in self._dirty:
+                    slab.flush()
+            self._dirty.clear()
+
+    def free_weights(self) -> None:
+        """Release every weight slab (a new policy load uploads all layers again)."""
+        if self.mock:
+            return
+        for slab in self._slabs:
+            slab.freebuffer()
+        self._slabs, self._slab_off, self._dirty = [], SLAB_BYTES, set()
 
     def gemm(self, wbuf, layout, mp: int, x: np.ndarray) -> np.ndarray:
         """y[N][Mp] = x @ W^T: one engine call per K chunk, summed in chunk order on the ARM."""
@@ -145,6 +193,7 @@ class Engine:
                 if self.mock == "layout":  # one chunk = 4 port arrays back to back, as on the board
                     y += self.lib(wbuf[8 * word_off : 8 * (word_off + 4 * pw)], mp, xc)
                     continue
+                self._flush_weights()
                 bx, by = self._scratch(n * kc, n * mp)
                 bx[: n * kc] = xc.reshape(-1)
                 bx.flush()

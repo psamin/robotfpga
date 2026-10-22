@@ -100,7 +100,8 @@ def push(rem: str, bit: Path, hwh: Path, model: Path, name: str, frames: list[Pa
         jb.put(str(p), f"{rem}/ckpt/{name}/{p.name}")
     if (model / "tokenizer").is_dir():
         for p in sorted((model / "tokenizer").glob("*")):
-            jb.put(str(p), f"{rem}/ckpt/{name}/tokenizer/{p.name}")
+            if not p.name.startswith("."):  # skip macOS ._* metadata from tars made on a Mac
+                jb.put(str(p), f"{rem}/ckpt/{name}/tokenizer/{p.name}")
     for d in sorted((ROOT / "build" / "stream" / "float").glob("case_*")):
         for p in sorted(d.glob("*")):
             jb.put(str(p), f"{rem}/build/stream/float/{d.name}/{p.name}")
@@ -211,7 +212,12 @@ def main():
 
     jb.api("POST", f"kernels/{jb.kernel()}/restart")  # releases an overlay or server a previous run left
     time.sleep(3)
-    shell(home, "pkill -f engine_server.py; pkill -f serve_policy_fpga.py; sleep 1; true", "cleanup.log", 60)
+    shell(
+        home,
+        "pkill -f '[e]ngine_server.py'; pkill -f '[s]erve_policy_fpga.py'; sleep 1; true",
+        "cleanup.log",
+        60,
+    )
     clock = f" --clock-mhz {args.clock_mhz}" if args.clock_mhz else ""
 
     if not args.skip_engine_check:
