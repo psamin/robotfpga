@@ -123,8 +123,11 @@ PYNQ's 3.10; the default run pushes code, bitstream, checkpoint and batches, run
 `engine_server.py` as root and `serve_policy_fpga.py --selftest`, and with `--serve` leaves the policy server up.
 Post-route (Vivado 2022.2, `build_bd.tcl` + `resume_impl.tcl`): WNS −0.026 ns at 300 MHz with hold met, i.e. the
 design closes at ~298 MHz; it runs at 250 MHz on the board (`--clock-mhz 250`, 16 GB/s on the weight ports). 52,662
-LUT (45 %), 92,506 FF (39 %), 74.5 BRAM tiles (52 %), 48 URAM (75 %). Board numbers (GB/s, seconds per chunk): not
-measured yet.
+LUT (45 %), 92,506 FF (39 %), 74.5 BRAM tiles (52 %), 48 URAM (75 %). On the board (2026-10-22): `check_engine.py` all 5 cases PASS; `serve_policy_fpga.py --selftest` PASS, max
+0.0043 vs PyTorch FP32 on the release frames, **52–56 s per 50-action chunk** (~32 s in the 1,419 engine calls
+including socket copies, ~22 s on the ARM). Board fixes this needed: weights in 32 MB CMA slabs (`runtime.Engine`),
+and `load_vlm_weights=false` in the board's config copy (avoids loading the 2 GB SmolVLM2 backbone before the
+checkpoint overwrites it; 3.19 → 2.35 GB peak RSS, identical actions).
 
 ## Next steps (FPGA side)
 
