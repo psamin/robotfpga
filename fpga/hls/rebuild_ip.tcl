@@ -2,7 +2,10 @@
 # float_top, without regenerating the Zynq PS IP (its simulation-wrapper template is missing from this
 # Vivado install, which makes build_bd.tcl's fresh project fail at IP generation).
 #   cd fpga/hls && FSTREAM_TP=4 FSTREAM_SRC_TAG= FSTREAM_TAG=v4ip vivado -mode batch -source rebuild_ip.tcl
-#   FSTREAM_SRC=_tp4 FSTREAM_TP=8 FSTREAM_TAG=v4 FSTREAM_MHZ=250 ...   # TP=8 export into the TP=4 project, 250 MHz
+#   FSTREAM_SRC=_tp4 FSTREAM_TP=8 FSTREAM_TAG=v4ip ...                # TP=8 export into the TP=4 project
+#   FSTREAM_STRATEGY=Performance_ExplorePostRoutePhysOpt FSTREAM_OUT=tp4_v4ip_300 ...   # timing-closure re-run
+# (FSTREAM_MHZ changes the block design's PL clock, which regenerates the SmartConnect IPs: that fails on this
+#  Vivado install, so leave it unset and set the PL clock at run time instead.)
 # Opens build/vivado_tp<TP><SRC_TAG>/float_kr260.xpr, points it at build/float_hls_tp<TP>_<TAG>/sol1/impl/ip,
 # upgrades the float_top IP, re-runs synthesis + implementation, writes build/float_tp<TP>_<TAG>.bit/.hwh.
 set here [file dirname [file normalize [info script]]]
@@ -15,6 +18,10 @@ set sfx "$tp"
 if {[info exists ::env(FSTREAM_TAG)]} { append sfx "_$::env(FSTREAM_TAG)" }
 set mhz ""
 if {[info exists ::env(FSTREAM_MHZ)]} { set mhz $::env(FSTREAM_MHZ) }  ;# PL clock of the block design
+set outsfx $sfx
+if {[info exists ::env(FSTREAM_OUT)]} { set outsfx "_$::env(FSTREAM_OUT)" }  ;# output file suffix (default = $sfx)
+set strategy ""
+if {[info exists ::env(FSTREAM_STRATEGY)]} { set strategy $::env(FSTREAM_STRATEGY) }  ;# e.g. Performance_ExplorePostRoutePhysOpt
 set jobs 8
 if {[info exists ::env(VIVADO_JOBS)]} { set jobs $::env(VIVADO_JOBS) }
 set out [file normalize "$here/build"]
@@ -32,14 +39,15 @@ report_ip_status
 if {$mhz ne ""} { set_property CONFIG.PSU__CRL_APB__PL0_REF_CTRL__FREQMHZ $mhz [get_bd_cells zynq] }
 validate_bd_design
 save_bd_design
+if {$strategy ne ""} { set_property strategy $strategy [get_runs impl_1] }
 reset_run synth_1
 launch_runs impl_1 -to_step write_bitstream -jobs $jobs
 wait_on_run impl_1
 if {[get_property PROGRESS [get_runs impl_1]] ne "100%"} { error "impl_1 did not finish; see the run log" }
 open_run impl_1
-report_timing_summary -file "$out/timing$sfx.rpt"
-report_utilization -file "$out/utilization$sfx.rpt"
-file copy -force [glob "$out/vivado$src/float_kr260.runs/impl_1/*.bit"] "$out/float$sfx.bit"
-file copy -force [glob "$out/vivado$src/float_kr260.gen/sources_1/bd/float/hw_handoff/*.hwh"] "$out/float$sfx.hwh"
+report_timing_summary -file "$out/timing$outsfx.rpt"
+report_utilization -file "$out/utilization$outsfx.rpt"
+file copy -force [glob "$out/vivado$src/float_kr260.runs/impl_1/*.bit"] "$out/float$outsfx.bit"
+file copy -force [glob "$out/vivado$src/float_kr260.gen/sources_1/bd/float/hw_handoff/*.hwh"] "$out/float$outsfx.hwh"
 set wns [get_property STATS.WNS [get_runs impl_1]]
-puts "wrote $out/float$sfx.bit and $out/float$sfx.hwh; WNS = $wns ns (>= 0 means the BD clock closed)"
+puts "wrote $out/float$outsfx.bit and $out/float$outsfx.hwh; WNS = $wns ns (>= 0 means the BD clock closed)"
