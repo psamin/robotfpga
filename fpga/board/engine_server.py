@@ -27,6 +27,7 @@ from fpga.board.runtime import Engine, _recv, _send, chunk_layout  # noqa: E402
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bit", help="overlay .bit (board)")
+    ap.add_argument("--clock-mhz", type=float, default=None, help="PL clock to set after loading the overlay")
     ap.add_argument("--mock", choices=["shim", "layout"], help="host-side C core instead of the board")
     ap.add_argument("--socket", default="/tmp/fpga-engine.sock")
     ap.add_argument(
@@ -36,7 +37,7 @@ def main():
     if not args.bit and not args.mock:
         sys.exit("give --bit float.bit (board) or --mock layout")
 
-    eng = Engine(args.bit) if args.bit else Engine(mock=args.mock)
+    eng = Engine(args.bit, clock_mhz=args.clock_mhz) if args.bit else Engine(mock=args.mock)
     bufs, layouts = [], {}
     if os.path.exists(args.socket):
         os.unlink(args.socket)
@@ -95,6 +96,8 @@ def main():
                 if hasattr(b, "freebuffer"):
                     b.freebuffer()
             bufs.clear()
+            if hasattr(eng, "free_weights"):
+                eng.free_weights()
 
 
 if __name__ == "__main__":

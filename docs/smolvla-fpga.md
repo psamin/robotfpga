@@ -98,6 +98,99 @@ synthesis). A chunk covers 1.67 s at 30 Hz, so the arm runs the chunk slower tha
 between chunks. Options, each the owner's call: BF16 multiplies with FP32 accumulation (several times
 more MACs per DSP), running the vision encoder at a lower rate, or fewer camera tokens (a model change).
 
+## FPGA side (2026-10-16, branch `fpga/203-float-engine`, #203)
+
+Synthesis on the FPGA laptop (Vitis HLS 2022.2, Windows) of the engine as committed found four things the C
+simulation could not show, all fixed on the branch with the host cases and the whole model unchanged
+(0.026° max on the base model, 0.0043 normalized on the fine-tuned checkpoint through the board's DDR layout):
+
+| Found in synthesis | Fix |
+|---|---|
+| `red` loop II = 7 and 515 FP32 adders at TP = 2: the runtime `k % PS` index into fully partitioned registers became muxes HLS could not pipeline | MAC loop over (k, token block) with the block innermost at II = 1; partial sums in LUT RAM indexed by block and `k mod PS`, revisited after NB·PS ≥ 16 cycles (`DEPENDENCE` distance); one multiplier and one adder per lane |
+| Weight tile stores II = 4 (8 stores per 128-bit word) and no bursts on the struct-typed `m_axi` pointers (II = 2 per word) | DDR words are `ap_uint<128>` under Vitis (plain structs on the host); the four ports load in one loop (4 bursts at once) |
+| Load/compute overlap not real (sequential calls, #167) | the group loop is a `DATAFLOW` region: `tile` is double-buffered by HLS |
+| X/Y over a 32-bit io port cost 25–35 % at TP = 4 | 128-bit io words (K must be a multiple of 4; SmolVLA's are) |
+
+Results (TP = 4): `mac`, `load`, `load_x`, `store_row` all II = 1; bursts on hp0–hp3 and io; 644 DSP, 83,431 LUT,
+113,161 FF, 48 URAM, 0 BRAM; estimated clock 3.602 ns against the 3.333 ns target (PYNQ can lower `fclk0` at
+runtime, `Engine(clock_mhz=...)`). **TP = 8 does not fit**: an FP32 multiply-add costs ~3 DSP plus a fabric adder,
+so 256 lanes exceed the 1,248 DSPs; TP = 4 (128 MACs/clock, ~6.7 s per chunk by the latency model) is the FP32
+ceiling on this chip. Windows notes: `open_project` must not contain `/`, csim predefines `NT`, and a Windows
+update mid-session broke every Vivado implementation until a reboot (`fpga/hls/resume_impl.tcl` resumes one).
+
+Board chain (`fpga/board/deploy_smolvla.py`): `--setup` installs Python 3.12 + the LeRobot fork offline next to
+PYNQ's 3.10; the default run pushes code, bitstream, checkpoint and batches, runs `check_engine.py`, starts
+`engine_server.py` as root and `serve_policy_fpga.py --selftest`, and with `--serve` leaves the policy server up.
+Post-route (Vivado 2022.2, `build_bd.tcl` + `resume_impl.tcl`): WNS −0.026 ns at 300 MHz with hold met, i.e. the
+design closes at ~298 MHz; it runs at 250 MHz on the board (`--clock-mhz 250`, 16 GB/s on the weight ports). 52,662
+LUT (45 %), 92,506 FF (39 %), 74.5 BRAM tiles (52 %), 48 URAM (75 %). On the board (2026-10-22): `check_engine.py` all 5 cases PASS; `serve_policy_fpga.py --selftest` PASS, max
+0.0043 vs PyTorch FP32 on the release frames, **52–56 s per 50-action chunk** (~32 s in the 1,419 engine calls
+including socket copies, ~22 s on the ARM). Board fixes this needed: weights in 32 MB CMA slabs (`runtime.Engine`),
+and `load_vlm_weights=false` in the board's config copy (avoids loading the 2 GB SmolVLM2 backbone before the
+checkpoint overwrites it; 3.19 → 2.35 GB peak RSS, identical actions).
+
+## Speed work (2026-10-22, branch `fpga/203-float-engine`)
+
+Goal: cut the 52–56 s per chunk with the model untouched (same weights, FP32 math, every part run as often as
+before). First a profile of the board as it was (`fpga/board/profile_engine.py`, `profile_arm.py`):
+
+| Where the 55 s went | Measured | Cause |
+|---|---|---|
+| FPGA busy | 13.0 s (the latency model said 8.5) | per 32-channel group: `K + 8K + ~2,560` cycles. The group loop's `DATAFLOW` did not overlap the next group's weight load with the MACs, and the 32 single-row stores (8 words each) cost ~90 cycles a row |
+| copying results out of the engine | 8.6 s | PYNQ's `allocate` gives uncached memory by default: reading 3 MB of Y ran at ~120 MB/s |
+| socket between the PYNQ (3.10) and LeRobot (3.12) processes | 8.9 s | 1,419 calls × activations both ways |
+| register writes through `register_map` | 0.7 s | |
+| ARM: vision attention | 6.75 s | `scaled_dot_product_attention` (flash CPU kernel) at ~4.5 GMAC/s; the math backend and OpenBLAS `bmm` are slower, so this is this CPU's FP32 ceiling |
+| ARM: `F.gelu(approximate="tanh")` | 4.3 s | torch 2.8's aarch64 kernel runs at 12 M elements/s |
+| ARM: copies, bmm, norms, Python | ~8 s | |
+
+What changed, in order of payoff:
+
+1. **Engine core v4** (`float_linear.h`): one tile pass is a three-process `DATAFLOW` region — `load_all` streams
+   every group's weights through four FIFOs, `compute_all` consumes them (one word per port per k, reused for the
+   NB blocks), `store_all` writes Y. Y is now group-major, `Y_tiled[g][ntiles·NT][32]`, so each tile-group is one
+   4 KB burst; the host un-tiles it (`runtime.Engine`, `float_shim.cpp`). Same summation order, same bits.
+   TP = 4 at 300 MHz: all loops II = 1, HLS estimate 2.8 ns, 648 DSP, 82k LUT (est.), 32 URAM, 40 BRAM.
+2. **Engine in the policy process** (`runtime.Engine(backend="xrt")`, `xrtmem.py`): CMA buffers through XRT's
+   `libxrt_core` and the IP registers through `/dev/mem`, from LeRobot's Python 3.12 as root; cacheable buffers
+   flushed/invalidated over the bytes a call uses; activations copied straight between torch tensors and the
+   buffers, bias added in place by torch. `engine_server.py` + `RemoteEngine` stay as the `--engine socket` option.
+   `load_overlay.py` loads the bitstream once with PYNQ.
+3. **GELU**: SigLIP's tanh-GELU evaluated as `x · sigmoid(2·sqrt(2/π)·(x + 0.044715 x³))` (identical function,
+   91 vs 259 ms per 1024×3072, max |difference| 4.8e-7); `--no-fast-gelu` keeps torch's kernel.
+4. **Two camera images encoded in parallel threads** (`runtime.overlap_image_embedding`): one image's attention,
+   GELU and norms on the ARM overlap the other's linear layers on the FPGA (engine serialized by a lock, the
+   waiting thread yields the GIL); `--no-overlap` turns it off.
+5. Weight layers placed first-fit across the 32 MB CMA slabs (less end-of-slab waste).
+
+Not taken: a one-DSP BF16×FP32 multiplier (`bf16_mul`: the 8×24-bit product is exact, so rounding it gives the FP32
+product bit for bit; `tb_mul.cpp`, 36.6 M pairs, 0 mismatches) would have let TP = 8 fit the DSPs, but Vitis HLS
+estimates it at ~400 LUT per MAC against ~120 for the multiplier core, and TP = 8 with the core (`fulldsp`) is
+1,032 DSP, 161k LUT and 241k FF estimated. Built anyway to be sure (16:10): after synthesis 117,462 LUT, 187k FF;
+Vivado's DRC stopped placement at **118,727 LUTs needed of 117,120** — TP = 8 in FP32 does not fit the K26. Attention on the FPGA through an exact three-way BF16
+split of K/V was also costed: the ARM's softmax alone (3.7 s per chunk at ~80 M exp/s) leaves no gain.
+
+6. **A quiet board**: Ubuntu's automatic updater (the board has internet through the laptop) and snapd ran at
+   100 % of a core; one extra runnable task stalls torch's spin-waiting OpenMP barriers and doubled the ARM part
+   of a chunk (22 → 41 s measured). `deploy_smolvla.py` now stops and disables them (`--keep-noise` to skip) and
+   runs the policy with 3 torch threads (`--threads`), which on this board equals 4 threads with
+   `OMP_WAIT_POLICY=PASSIVE`.
+
+Results (board, `serve_policy_fpga.py --selftest`, 3 release frames, max |chunk − PyTorch FP32| 0.0043 in every
+run, i.e. unchanged; `check_engine.py` all 5 cases PASS on the new bitstream):
+
+| Configuration | s per 50-action chunk | of which engine calls |
+|---|---|---|
+| before: `float_tp4.bit`, engine over the socket, 4 threads (2026-10-22 morning) | 52–56 | 32 |
+| `float_tp4.bit`, engine in-process, fast GELU, images overlapped, 4 threads, noisy board | 51–53 | 19 |
+| same, 3 threads, noisy board | 35.7–37.0 | 16.9 |
+| same, quiet board, 3 threads (or 4 + passive waits) | **26.6–27.6** | 17.0 |
+| `float_tp4_v4ip.bit` (streaming core, 250 MHz), quiet board, 3 threads | **24.4–25.4** | 12.5 |
+
+New bitstream `float_tp4_v4ip.bit` (`rebuild_ip.tcl` on the `vivado_tp4` project: a fresh `build_bd.tcl` project
+fails at the Zynq IP's simulation-wrapper generation on this install): 650 DSP, 55,992 LUT (48 %), 99,154 FF, 84.5
+BRAM tiles, 32 URAM; WNS −0.432 ns at 300 MHz (closes at ~265 MHz), hold met; run at 250 MHz.
+
 ## Next steps (FPGA side)
 
 1. `make -C fpga/hls test`, then `vitis_hls -f run_float_hls.tcl` in `fpga/hls/`: C sim, synthesis at
