@@ -61,3 +61,19 @@ extern "C" int linear_bf16(const uint16_t* w_packed, const float* x, float* y, i
   }
   return status;
 }
+
+// Mode 1 of the engine: softmax over each row of x (N rows of L FP32, L a multiple of 4, L <= 4096),
+// through the same core the FPGA runs (softmax_rows). Rows are independent, so blocks of rows go to
+// OpenMP threads; the result does not depend on the threading.
+extern "C" int softmax_rows_f32(const float* x, float* y, int N, int L) {
+  if (N < 1 || L < 1 || L > SMX_L_MAX || L % F4) return 1;
+  static const int RB = 64;  // rows per task: the host FIFOs hold a task's rows (RB * L * 4 bytes each)
+  int status = 0;
+#pragma omp parallel for schedule(dynamic)
+  for (int r0 = 0; r0 < N; r0 += RB) {
+    const int nr = (N - r0) < RB ? (N - r0) : RB;
+    const int st = softmax_rows((const IoWord*)(x + (size_t)r0 * L), (IoWord*)(y + (size_t)r0 * L), nr, L);
+    if (st) status = st;
+  }
+  return status;
+}

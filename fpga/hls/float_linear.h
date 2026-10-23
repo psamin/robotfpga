@@ -28,11 +28,13 @@
 //  - X moves over the io port as 128-bit words (4 FP32), so K must be a multiple of 4. Y is written
 //    group-major: Y_tiled[g][n][l] for group g (32 lanes), token n of all NT-token tiles (padded), so
 //    one tile-group is a single 4 KB burst. The host un-tiles it.
-// Bias, softmax, norms, activations and RoPE stay on the ARM. Reductions longer than K_MAX are split
-// by the host into K_MAX chunks whose outputs it adds; output widths are padded to 32 by the host.
+// Bias, norms, activations and RoPE stay on the ARM. Reductions longer than K_MAX are split by the
+// host into K_MAX chunks whose outputs it adds; output widths are padded to 32 by the host.
+// A second operation, selected by the top's `mode` register, is the row softmax (softmax_rows below):
+// it shares the io port and the register file with the GEMM and touches none of its logic.
 //
-// Plain C++: the same core builds with Vitis HLS (float_top.cpp), g++ (tb_float.cpp) and as a
-// shared library (float_shim.cpp) for running the whole model in PyTorch.
+// Plain C++: the same core builds with Vitis HLS (float_top.cpp), g++ (tb_float.cpp, tb_softmax.cpp)
+// and as a shared library (float_shim.cpp) for running the whole model in PyTorch.
 #pragma once
 #include <stdint.h>
 #include <string.h>
@@ -42,9 +44,15 @@
 #endif
 #ifdef __VITIS_HLS__
 #include <ap_int.h>
+#include <hls_math.h>
 #include <hls_stream.h>
 #else
+#include <math.h>
+
 #include <vector>
+#ifdef FSTREAM_FPO_EXP
+#include <hls_fpo.h>  // the bit-accurate model of the Xilinx FP exp core, see smx_exp
+#endif
 #endif
 
 namespace fstream {
@@ -332,6 +340,222 @@ tiles:
     }
     run_tile(w0, w1, w2, w3, ymem, xbuf, groups, ntiles, t, K);
   }
+  return 0;
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Mode 1: row softmax. xmem holds N rows of L FP32 values (L a multiple of 4, L <= SMX_L_MAX), ymem
+// receives softmax(row) in FP32, same layout. The recipe is the one of torch's CPU kernel
+// (_vec_softmax_lastdim in aten/src/ATen/native/cpu/SoftMaxKernel.cpp): m = max_i x_i;
+// e_i = exp(x_i - m); s = sum_i e_i; inv = 1 / s; y_i = e_i * inv (one reciprocal per row and a
+// multiply per element, not a division per element). What differs from torch, all inside FP32
+// rounding: exp is the Xilinx floating-point exp core (smx_exp, max 1.1 ulp measured) instead of
+// SLEEF's expf_u10; s is summed as 4 lanes x SMX_P partials in a fixed tree (torch: Vec::size()
+// lanes, then a shuffle tree); e_i below FLT_MIN flush to 0 (the core has no subnormal outputs).
+// The max is exact (an order-preserving integer key, so no FP compare sits in a loop-carried path).
+// Every loop is II = 1 and 4 elements wide: one 128-bit io word per cycle.
+//
+// Four dataflow processes, each a loop over the rows, joined by FIFOs:
+//   smx_read_max    reads the rows as one sequential burst stream, forwards the words, sends each
+//                   row's max when its last word is in
+//   smx_exp_sum     e = exp(x - m) for the 4 lanes of a word, the 4 added in a small tree, the word's
+//                   sum accumulated into one of SMX_P partial sums (the ACC_DIST idea of the MAC loop:
+//                   a partial is revisited SMX_P >= 16 cycles later, after the adder latency); forwards
+//                   the e words; after a row it sends the SMX_P partials as SMX_P / 4 io words
+//   smx_reduce      adds the partials in a fixed order (deterministic) on four adders, one division per
+//                   row (a 63-adder tree, which HLS builds for a plain unrolled reduction, cost 126 DSP)
+//   smx_scale_store multiplies the e words by inv and writes the rows as one burst stream
+// The word FIFOs hold a whole row (SMX_W_MAX words), because a row's max (and its sum) is only known
+// after its last word, so the consumer can only start when the producer has pushed the entire row.
+// With L = 1024 a FIFO holds 4 rows, so reads, exp and writes of neighbouring rows overlap.
+constexpr int SMX_L_MAX = K_MAX;            // values per row (the K register holds L, N the rows)
+constexpr int SMX_W_MAX = SMX_L_MAX / F4;   // io words per row
+constexpr int SMX_P = 16;                   // partial sums per row: >= the FP32 adder latency (11)
+constexpr int SMX_PW = SMX_P / F4;          // io words carrying a row's partials
+constexpr int SMX_FIFO = SMX_W_MAX;         // words buffered between the processes (>= one whole row)
+static_assert((SMX_P & (SMX_P - 1)) == 0 && SMX_P >= 16, "SMX_P: power of 2, past the FP32 add latency");
+
+// The exponential: Vitis HLS maps hls::exp(float) to the Xilinx Floating-Point Operator exp core
+// (hls_exp_float.cpp: HLS_FPO_EXPF). On the host, FSTREAM_FPO_EXP selects that core's bit-accurate
+// C model (tb_softmax.cpp says how to link it), otherwise the C library's expf.
+static inline float smx_exp(float x) {
+#pragma HLS INLINE
+#ifdef __VITIS_HLS__
+  return hls::exp(x);
+#elif defined(FSTREAM_FPO_EXP)
+  return HLS_FPO_EXPF(x);
+#else
+  return expf(x);
+#endif
+}
+
+// Order-preserving unsigned key of an FP32: key(a) > key(b) iff a > b (with -0 < +0, NaN above +inf),
+// so the row max is an integer compare per lane and the loop-carried path has no FP compare.
+static inline uint32_t smx_key(float f) {
+#pragma HLS INLINE
+  uint32_t u;
+  memcpy(&u, &f, sizeof u);
+  return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+static inline float smx_unkey(uint32_t k) {
+#pragma HLS INLINE
+  const uint32_t u = (k & 0x80000000u) ? (k & 0x7FFFFFFFu) : ~k;
+  float f;
+  memcpy(&f, &u, sizeof f);
+  return f;
+}
+
+// Process 1: the words of all rows in one sequential stream (one burst stream over total = rows * L4
+// words); the running max of each lane is an integer key; the row max goes out with the row's last word.
+static void smx_read_max(const IoWord* xmem, int total, int L4, Fifo<IoWord>& xs, Fifo<float>& ms) {
+  int i = 0;
+  uint32_t kmax[F4];
+#pragma HLS ARRAY_PARTITION variable = kmax complete
+read_max:
+  for (int t = 0; t < total; t++) {
+#pragma HLS PIPELINE II = 1
+#pragma HLS LOOP_TRIPCOUNT min = 1 max = 3145728 avg = 3145728
+    const IoWord w = xmem[t];
+    xs.write(w);
+    for (int j = 0; j < F4; j++) {
+#pragma HLS UNROLL
+      const uint32_t k = smx_key(io_lane(w, j));
+      kmax[j] = (i == 0 || k > kmax[j]) ? k : kmax[j];
+    }
+    if (i == L4 - 1) {
+      const uint32_t k01 = kmax[0] > kmax[1] ? kmax[0] : kmax[1];
+      const uint32_t k23 = kmax[2] > kmax[3] ? kmax[2] : kmax[3];
+      ms.write(smx_unkey(k01 > k23 ? k01 : k23));
+      i = 0;
+    } else {
+      i++;
+    }
+  }
+}
+
+// Process 2: per row, e = exp(x - m), the word sum t = (e0 + e1) + (e2 + e3) and the partial sums;
+// then the partials as SMX_PW words. Partial p is the sum of t over the words i == p mod SMX_P, in
+// word order; a row shorter than SMX_P words leaves the partials p >= L4 untouched, so those go out
+// as zero.
+static void smx_exp_sum(Fifo<IoWord>& xs, Fifo<float>& ms, int rows, int L4, Fifo<IoWord>& es,
+                        Fifo<IoWord>& ps) {
+  float acc[SMX_P];
+#pragma HLS BIND_STORAGE variable = acc type = ram_2p impl = lutram
+rows_exp:
+  for (int r = 0; r < rows; r++) {
+#pragma HLS LOOP_TRIPCOUNT min = 1 max = 12288 avg = 12288
+    const float m = ms.read();
+  exp_sum:
+    for (int i = 0; i < L4; i++) {
+#pragma HLS PIPELINE II = 1
+#pragma HLS LOOP_TRIPCOUNT min = 1 max = 1024 avg = 256
+#pragma HLS DEPENDENCE variable = acc inter distance = SMX_P true
+      const IoWord w = xs.read();
+      const int idx = i & (SMX_P - 1);
+      const bool first = i < SMX_P;  // first visit of this partial: start from zero
+      IoWord o;
+      float e[F4];
+      for (int j = 0; j < F4; j++) {
+#pragma HLS UNROLL
+        e[j] = smx_exp(io_lane(w, j) - m);
+        io_set(o, j, e[j]);
+      }
+      const float t = (e[0] + e[1]) + (e[2] + e[3]);
+      const float cur = first ? 0.0f : acc[idx];
+      acc[idx] = cur + t;
+      es.write(o);
+    }
+  emit_partials:
+    for (int p = 0; p < SMX_PW; p++) {
+#pragma HLS PIPELINE II = 1
+      IoWord q;
+      for (int j = 0; j < F4; j++) {
+#pragma HLS UNROLL
+        io_set(q, j, p * F4 + j < L4 ? acc[p * F4 + j] : 0.0f);
+      }
+      ps.write(q);
+    }
+  }
+}
+
+// Process 3: per row, s = the sum of the SMX_P partials in a fixed order and inv = 1 / s (an IEEE
+// division, as torch computes 1 / sum). Four chains of SMX_PW dependent adds run side by side on four
+// adders, then the chains are added; the two sub-loops keep HLS from flattening the row loop, which
+// would instantiate one adder per add.
+static void smx_reduce(Fifo<IoWord>& ps, int rows, Fifo<float>& ss) {
+rows_reduce:
+  for (int r = 0; r < rows; r++) {
+#pragma HLS LOOP_TRIPCOUNT min = 1 max = 12288 avg = 12288
+    float v[SMX_P];
+#pragma HLS ARRAY_PARTITION variable = v complete
+  gather:
+    for (int p = 0; p < SMX_PW; p++) {
+#pragma HLS PIPELINE II = 1
+      const IoWord q = ps.read();
+      for (int j = 0; j < F4; j++) {
+#pragma HLS UNROLL
+        v[p * F4 + j] = io_lane(q, j);
+      }
+    }
+    float a[F4];
+#pragma HLS ARRAY_PARTITION variable = a complete
+    for (int j = 0; j < F4; j++) {
+#pragma HLS UNROLL
+      a[j] = v[j];
+    }
+  chains:
+    for (int p = 1; p < SMX_PW; p++) {
+      for (int j = 0; j < F4; j++) {
+#pragma HLS UNROLL
+        a[j] += v[p * F4 + j];
+      }
+    }
+    const float s = (a[0] + a[1]) + (a[2] + a[3]);
+    ss.write(1.0f / s);
+  }
+}
+
+// Process 4: y = e * inv, the rows as one sequential burst stream of total = rows * L4 writes.
+static void smx_scale_store(Fifo<IoWord>& es, Fifo<float>& ss, int total, int L4, IoWord* ymem) {
+  int i = 0;
+  float inv = 0.0f;
+scale_store:
+  for (int t = 0; t < total; t++) {
+#pragma HLS PIPELINE II = 1
+#pragma HLS LOOP_TRIPCOUNT min = 1 max = 3145728 avg = 3145728
+    if (i == 0) inv = ss.read();
+    const IoWord e = es.read();
+    IoWord o;
+    for (int j = 0; j < F4; j++) {
+#pragma HLS UNROLL
+      io_set(o, j, io_lane(e, j) * inv);
+    }
+    ymem[t] = o;
+    i = (i == L4 - 1) ? 0 : i + 1;
+  }
+}
+
+static void smx_rows_dataflow(const IoWord* xmem, IoWord* ymem, int rows, int L4, int total) {
+#pragma HLS DATAFLOW
+  Fifo<IoWord> xs, es, ps;
+  Fifo<float> ms, ss;
+#pragma HLS STREAM variable = xs depth = SMX_FIFO
+#pragma HLS STREAM variable = es depth = SMX_FIFO
+#pragma HLS STREAM variable = ps depth = 4 * SMX_PW
+#pragma HLS STREAM variable = ms depth = 8
+#pragma HLS STREAM variable = ss depth = 8
+  smx_read_max(xmem, total, L4, xs, ms);
+  smx_exp_sum(xs, ms, rows, L4, es, ps);
+  smx_reduce(ps, rows, ss);
+  smx_scale_store(es, ss, total, L4, ymem);
+}
+
+// Mode 1 entry: softmax over each of `rows` rows of L FP32 values, xmem -> ymem (row-major, 128-bit
+// words, rows * L / 4 words each). L a multiple of 4, 1 <= L <= SMX_L_MAX, rows >= 1, rows * L / 4 < 2^31.
+static int softmax_rows(const IoWord* xmem, IoWord* ymem, int rows, int L) {
+  if (rows < 1 || L < 1 || L > SMX_L_MAX || L % F4) return 1;
+  const int L4 = L / F4;
+  smx_rows_dataflow(xmem, ymem, rows, L4, rows * L4);
   return 0;
 }
 

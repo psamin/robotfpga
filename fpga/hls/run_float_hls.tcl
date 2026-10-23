@@ -7,6 +7,7 @@
 #   FSTREAM_TAG=v4 ...                              # project name suffix (keeps older exports)
 #   FSTREAM_IP_MUL=maxdsp|fulldsp|meddsp ...        # FP32 multiplier core implementation (default maxdsp)
 #   FSTREAM_BF16_MUL=1 ...                          # one-DSP exact multiplier instead of the core
+#   FSTREAM_NO_EXPORT=1 ...                         # stop after csynth_design (export_design runs the Vivado IP packager)
 # Target 300 MHz; the four weight bundles go to S_AXI_HP0..HP3_FPD in the block design.
 set here [file dirname [file normalize [info script]]]
 set case [file normalize "$here/../../build/stream/float/case_2560x960x50"]
@@ -48,5 +49,7 @@ if {![info exists ::env(FSTREAM_NO_CSIM)]} {
     csim_design -argv "$case"
 }
 csynth_design
-export_design -format ip_catalog -rtl verilog
+if {![info exists ::env(FSTREAM_NO_EXPORT)]} {
+    export_design -format ip_catalog -rtl verilog
+}
 exit

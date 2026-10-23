@@ -5,7 +5,10 @@ replaces the cluster's policy server. After LeRobot loads the policy, every nn.L
 runtime.FpgaLinear: its BF16 weights go to DDR and each call runs on the FPGA, driven from this process
 (--engine xrt, default) or through engine_server.py (--engine socket). The rest of SmolVLA (attention,
 norms, convolution, ...) runs in FP32 on the ARM; SigLIP's tanh-GELU uses its sigmoid form (same
-function, 3x faster on this CPU; --no-fast-gelu keeps torch's kernel).
+function, 3x faster on this CPU; --no-fast-gelu keeps torch's kernel). Linear layers that take the same
+input (q/k/v, gate/up) share one engine call and the expert's cross-attention k/v projections of the
+fixed prefix cache are computed once per chunk (runtime.fpga_linears fuse/memo: same numbers, 1,419 ->
+859 engine calls per chunk; --no-fuse / --no-memo switch them off).
 Listens on 127.0.0.1 only: LeRobot's gRPC transport uses pickle, so reach it through an SSH tunnel.
 
     # board, once (PYNQ's Python): load the bitstream
@@ -14,6 +17,8 @@ Listens on 127.0.0.1 only: LeRobot's gRPC transport uses pickle, so reach it thr
     sudo env HF_HOME=... HF_HUB_OFFLINE=1 <venv>/bin/python fpga/board/serve_policy_fpga.py --port 8080
     # check first, without the arm: load the checkpoint as the server does, replay the release's batches
     python fpga/board/serve_policy_fpga.py --selftest <checkpoint dir> --batches <dir of frame_*.pt>
+    # the same without a board (host C core; --mock ip runs the board's buffer/register code path too)
+    python fpga/board/serve_policy_fpga.py --mock layout --selftest <checkpoint dir> --batches <dir>
 """
 
 import argparse
@@ -33,12 +38,14 @@ from fpga.board.runtime import (  # noqa: E402
 
 FAST_GELU = True
 OVERLAP = True
+FUSE = True  # q/k/v and gate/up of one input: one engine call (runtime.fusion_groups)
+MEMO = True  # expert cross-attention k/v of the prefix cache: computed once per chunk (runtime.memo_modules)
 
 
 def to_fpga(policy, eng):
     """Swap the linears (packing from the stored BF16, then freeing them), then FP32 for the rest."""
     t0 = time.perf_counter()
-    n = fpga_linears(policy, eng)
+    n = fpga_linears(policy, eng, fuse=FUSE, memo=MEMO)
     policy.float()
     g = fast_tanh_gelu(policy) if FAST_GELU else 0
     if OVERLAP:
@@ -46,7 +53,8 @@ def to_fpga(policy, eng):
     left = sum(p.numel() for p in policy.parameters())
     print(
         f"{n} linear layers on the FPGA in {time.perf_counter() - t0:.1f} s; {left:,} params left on the ARM;"
-        f" {g} tanh-GELU modules on the sigmoid form; images {'overlapped' if OVERLAP else 'sequential'}",
+        f" {g} tanh-GELU modules on the sigmoid form; images {'overlapped' if OVERLAP else 'sequential'};"
+        f" fused calls {'on' if FUSE else 'off'}, k/v memo {'on' if MEMO else 'off'}",
         flush=True,
     )
     return policy
@@ -124,6 +132,13 @@ def main():
     ap.add_argument("--socket", default="/tmp/fpga-engine.sock", help="engine_server.py socket")
     ap.add_argument("--no-fast-gelu", action="store_true", help="keep torch's F.gelu(tanh) kernel")
     ap.add_argument("--no-overlap", action="store_true", help="encode the camera images one after the other")
+    ap.add_argument(
+        "--no-fuse", action="store_true", help="one engine call per nn.Linear (no q/k/v, gate/up fusion)"
+    )
+    ap.add_argument("--no-memo", action="store_true", help="recompute the expert's prefix k/v at every step")
+    ap.add_argument(
+        "--mock", choices=["layout", "ip"], help="selftest on the host C core instead of the board (no root)"
+    )
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--fps", type=int, default=30)
@@ -135,10 +150,16 @@ def main():
         sys.exit(
             "refusing to listen beyond localhost: the gRPC transport unpickles requests; use an SSH tunnel"
         )
-    global FAST_GELU, OVERLAP
+    global FAST_GELU, OVERLAP, FUSE, MEMO
     FAST_GELU = not args.no_fast_gelu
     OVERLAP = not args.no_overlap
-    eng = Engine(backend="xrt") if args.engine == "xrt" else RemoteEngine(args.socket)
+    FUSE, MEMO = not args.no_fuse, not args.no_memo
+    if args.mock:
+        if not args.selftest:
+            sys.exit("--mock is for --selftest")
+        eng = Engine(mock=args.mock)
+    else:
+        eng = Engine(backend="xrt") if args.engine == "xrt" else RemoteEngine(args.socket)
     selftest(args, eng) if args.selftest else serve(args, eng)
 
 
