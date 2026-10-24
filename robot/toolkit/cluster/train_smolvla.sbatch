@@ -15,6 +15,7 @@ set -euo pipefail
 DATASET=${DATASET:?set DATASET=<hf_user>/<dataset>}
 STEPS=${STEPS:-20000}
 EXCLUDE=${EXCLUDE:-}   # e.g. "[11,14]": episode indices to leave out of training
+read -ra EXTRA <<< "${EXTRA:-}"   # more lerobot-train flags, e.g. EXTRA='--policy.resize_imgs_with_padding=[256,256]'
 LEROBOT_REV=e624f3f7f8411ec3a02635d06e79373341e5ef35   # same commit the dataset was recorded with
 HOME_DIR=/nethome-instruction/$USER                      # /nethome is a broken symlink on compute nodes
 RESULT=$HOME_DIR/models/smolvla-${DATASET##*/}-$SLURM_JOB_ID
@@ -48,6 +49,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv
   --batch_size=64 \
   --steps="$STEPS" \
   --policy.scheduler_decay_steps="$STEPS" \
+  ${EXTRA[@]+"${EXTRA[@]}"} \
   --save_freq=5000 \
   --num_workers=12 \
   --policy.device=cuda \
