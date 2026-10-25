@@ -2,14 +2,16 @@
 
 The laptop runs the arm and cameras exactly as with the cluster (robot/toolkit/policy.sh, BOARD=...); this
 replaces the cluster's policy server. After LeRobot loads the policy, every nn.Linear is swapped for
-runtime.FpgaLinear: its BF16 weights go to DDR through engine_server.py (PYNQ's Python) and each call runs
-on the FPGA. The rest of SmolVLA (attention matmuls, norms, convolution, ...) runs in FP32 on the ARM.
+runtime.FpgaLinear: its BF16 weights go to DDR and each call runs on the FPGA, driven from this process
+(--engine xrt, default) or through engine_server.py (--engine socket). The rest of SmolVLA (attention,
+norms, convolution, ...) runs in FP32 on the ARM; SigLIP's tanh-GELU uses its sigmoid form (same
+function, 3x faster on this CPU; --no-fast-gelu keeps torch's kernel).
 Listens on 127.0.0.1 only: LeRobot's gRPC transport uses pickle, so reach it through an SSH tunnel.
 
-    # board, terminal 1 (PYNQ's Python):
-    sudo -E /usr/local/share/pynq-venv/bin/python3 fpga/board/engine_server.py --bit float.bit
-    # board, terminal 2 (LeRobot venv, Python 3.12):
-    python fpga/board/serve_policy_fpga.py --port 8080
+    # board, once (PYNQ's Python): load the bitstream
+    sudo /usr/local/share/pynq-venv/bin/python3 fpga/board/load_overlay.py --bit float.bit --clock-mhz 250
+    # board (LeRobot venv, Python 3.12, root: the engine maps CMA buffers and the IP registers itself)
+    sudo env HF_HOME=... HF_HUB_OFFLINE=1 <venv>/bin/python fpga/board/serve_policy_fpga.py --port 8080
     # check first, without the arm: load the checkpoint as the server does, replay the release's batches
     python fpga/board/serve_policy_fpga.py --selftest <checkpoint dir> --batches <dir of frame_*.pt>
 """
@@ -21,7 +23,16 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from fpga.board.runtime import RemoteEngine, fpga_linears  # noqa: E402
+from fpga.board.runtime import (  # noqa: E402
+    Engine,
+    RemoteEngine,
+    fast_tanh_gelu,
+    fpga_linears,
+    overlap_image_embedding,
+)
+
+FAST_GELU = True
+OVERLAP = True
 
 
 def to_fpga(policy, eng):
@@ -29,9 +40,13 @@ def to_fpga(policy, eng):
     t0 = time.perf_counter()
     n = fpga_linears(policy, eng)
     policy.float()
+    g = fast_tanh_gelu(policy) if FAST_GELU else 0
+    if OVERLAP:
+        overlap_image_embedding(policy, eng)
     left = sum(p.numel() for p in policy.parameters())
     print(
-        f"{n} linear layers on the FPGA in {time.perf_counter() - t0:.1f} s; {left:,} params left on the ARM",
+        f"{n} linear layers on the FPGA in {time.perf_counter() - t0:.1f} s; {left:,} params left on the ARM;"
+        f" {g} tanh-GELU modules on the sigmoid form; images {'overlapped' if OVERLAP else 'sequential'}",
         flush=True,
     )
     return policy
@@ -100,7 +115,15 @@ def serve(args, eng):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--engine",
+        choices=["xrt", "socket"],
+        default="xrt",
+        help="xrt: drive the FPGA from this process (root); socket: through engine_server.py",
+    )
     ap.add_argument("--socket", default="/tmp/fpga-engine.sock", help="engine_server.py socket")
+    ap.add_argument("--no-fast-gelu", action="store_true", help="keep torch's F.gelu(tanh) kernel")
+    ap.add_argument("--no-overlap", action="store_true", help="encode the camera images one after the other")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--fps", type=int, default=30)
@@ -112,7 +135,10 @@ def main():
         sys.exit(
             "refusing to listen beyond localhost: the gRPC transport unpickles requests; use an SSH tunnel"
         )
-    eng = RemoteEngine(args.socket)
+    global FAST_GELU, OVERLAP
+    FAST_GELU = not args.no_fast_gelu
+    OVERLAP = not args.no_overlap
+    eng = Engine(backend="xrt") if args.engine == "xrt" else RemoteEngine(args.socket)
     selftest(args, eng) if args.selftest else serve(args, eng)
 
 
