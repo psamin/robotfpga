@@ -15,7 +15,7 @@ make -C fpga/hls test PY="$UV run --no-sync python"
 VLA=$SCR/vla
 "$UV" venv -q --python 3.12 "$VLA"
 "$UV" pip install -q -p "$VLA" "lerobot[smolvla,dataset] @ git+https://github.com/psamin/lerobot@e624f3f7"
-OUT=$(fix "$HOME/robotfpga-work/runs/smolvla-fpga")
+OUT=$(fix "${OUT:-$HOME/robotfpga-work/runs/smolvla-fpga}")  # OUT=<dir> keeps another checkpoint's batches
 "$VLA/bin/python" policy/smolvla_fpga.py --model "$(fix "$MODEL")" --out "$OUT" --frames "${FRAMES:-5}" \
   --runtime layout --dump-batches
 for d in "$OUT"/layers/*/; do fpga/hls/build/tb_float "$d"; done
