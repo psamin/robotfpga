@@ -28,6 +28,7 @@ scripts run against is `~/Documents/GitHub/lerobot` (commit `e624f3f7`), environ
 | `cluster/train_smolvla.sbatch` | Fine-tune SmolVLA on a dataset (H200). |
 | `cluster/serve_policy.sbatch` | Serve a trained policy on the H200, localhost-only, for `policy.sh`. |
 | `test_policy_server.py` | Check a running server end to end with a recorded frame, without moving the arm. |
+| `native_camera_shapes.py` | Set a checkpoint copy's camera shapes to the recorded 640×480 / 480×640, so the live client stops squashing frames to 256×256 before the policy letterboxes them (#215). |
 
 `~/so101` is a symlink to this folder.
 

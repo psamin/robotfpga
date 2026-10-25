@@ -11,6 +11,27 @@ passed (max difference from PyTorch FP32 0.0043, normalized units, on 3 real fra
 server, `robot/toolkit/test_policy_server.py` got 50 actions for a recorded frame, the first within 1.08° mean (1.77° max)
 of the recorded action. **Nothing here has run on the board yet**: it needs the bitstream (Q12) and the board.
 
+## The 256-px checkpoint (`-12392`, #215)
+
+This is a re-finetune of the same recipe with 256×256 camera images instead of 512 (only the action expert is trained). It does
+about 3× less work per chunk: the linear layers drop from 255 to 107 GMAC and the vision attention on the ARM from 38.7 to 2.4 GMAC. The
+layer shapes are the same, so the same bitstream runs it. Release
+[policy-smolvla-12392-256px](https://github.com/psamin/robotfpga/releases/tag/policy-smolvla-12392-256px) has three files:
+
+- `smolvla-so101-pickplace-12392-256px.tar`: the checkpoint, with camera shapes fixed.
+- `smolvla-12392-replay-batches.tar.gz`: the same 3 frames, with references from this checkpoint. It extracts to `batches-12392/`.
+- `SHA256SUMS`.
+
+On x86 with the host C core (job 12405), the selftest passes with max difference 0.0084. Through the gRPC test client, the first
+action is within 0.19° mean (0.40° max) of the recording.
+
+- **Use its own batches.** `-9604`'s references fail against this model. Its frame files have the same names and sizes as
+  `-9604`'s, and `deploy_smolvla.py` skips any file the board already has at the same size. Delete the board's `batches/`
+  folders (the Jupyter upload folder and `/home/<user>/smolvla/`) before deploying it, and again when switching back.
+- **Camera shapes.** Its `config.json` holds the recorded camera shapes (front 3×480×640, wrist 3×640×480). LeRobot's
+  client resizes live frames to these shapes; with the old 3×256×256 it squashed them to squares
+  (`robot/toolkit/native_camera_shapes.py`).
+
 ## What runs where
 
 | Machine | Process | Python | Does |
