@@ -1,0 +1,125 @@
+W1120 20:15:31.217000 26608 Lib\site-packages\torch\distributed\elastic\multiprocessing\redirects.py:29] NOTE: Redirects are currently not supported in Windows or MacOs.
+WARNING:root:No accelerated backend detected. Using default cpu, this will be slow.
+WARNING:lerobot.configs.policies:Device 'cuda' is not available. Switching to 'cpu'.
+Loading  HuggingFaceTB/SmolVLM2-500M-Video-Instruct weights ...
+`torch_dtype` is deprecated! Use `dtype` instead!
+Loading weights:   0%|          | 0/489 [00:00<?, ?it/s]Loading weights:   0%|          | 1/489 [00:00<02:13,  3.65it/s]Loading weights:  19%|#9        | 95/489 [00:00<00:01, 321.95it/s]Loading weights:  31%|###       | 150/489 [00:00<00:00, 365.91it/s]Loading weights:  41%|####      | 200/489 [00:00<00:00, 366.56it/s]Loading weights:  50%|#####     | 245/489 [00:00<00:00, 389.72it/s]Loading weights:  59%|#####9    | 290/489 [00:00<00:00, 402.56it/s]Loading weights:  81%|########1 | 397/489 [00:00<00:00, 577.79it/s]Loading weights: 100%|##########| 489/489 [00:01<00:00, 480.87it/s]
+Reducing the number of VLM layers to 16 ...
+Loading weights from local directory
+loaded in 9.1 s
+config: {"vision": {"layers": 12, "hidden": 768, "ln_eps": 1e-06, "image_size": 512, "patch": 16}, "text": {"layers": 16, "hidden": 960, "heads": 15, "kv_heads": 5, "rms_eps": 1e-05}, "expert": {"layers": 16, "hidden": 720, "heads": 15, "kv_heads": 5, "rms_eps": 1e-05, "intermediate": 2048}, "num_steps": 10, "chunk": 50}
+patched 91 norm modules of 91 in the policy
+frame 0 stats     max|chunk-ref| 5.126e-06 mean 2.454e-07 (2.0 s)
+frame 0 torch     max|chunk-ref| 5.126e-06 mean 2.454e-07 (1.1 s)
+frame 0 zf32      max|chunk-ref| 3.755e-06 mean 1.961e-07 (1.6 s)
+frame 0 kernel    max|chunk-ref| 1.447e-04 mean 3.097e-05 (1.6 s)
+frame 0 torchq16  max|chunk-ref| 7.789e-04 mean 4.519e-05 (1.1 s)
+frame 0: kernel vs torchq16 0.0007578730583190918, zf32 vs torch 1.4007091522216797e-06
+frame 3563 stats     max|chunk-ref| 4.619e-07 mean 1.197e-07 (1.9 s)
+frame 3563 torch     max|chunk-ref| 4.619e-07 mean 1.197e-07 (1.1 s)
+frame 3563 zf32      max|chunk-ref| 3.725e-07 mean 9.194e-08 (1.6 s)
+frame 3563 kernel    max|chunk-ref| 1.554e-04 mean 5.755e-05 (1.7 s)
+frame 3563 torchq16  max|chunk-ref| 1.298e-04 mean 4.333e-05 (1.1 s)
+frame 3563: kernel vs torchq16 5.65648078918457e-05, zf32 vs torch 2.384185791015625e-07
+frame 7489 stats     max|chunk-ref| 4.768e-07 mean 1.048e-07 (1.9 s)
+frame 7489 torch     max|chunk-ref| 4.768e-07 mean 1.048e-07 (1.1 s)
+frame 7489 zf32      max|chunk-ref| 4.768e-07 mean 1.309e-07 (1.6 s)
+frame 7489 kernel    max|chunk-ref| 1.081e-04 mean 4.197e-05 (1.6 s)
+frame 7489 torchq16  max|chunk-ref| 1.523e-04 mean 3.698e-05 (1.2 s)
+frame 7489: kernel vs torchq16 7.236003875732422e-05, zf32 vs torch 1.7881393432617188e-07
+counts per chunk:
+   {'group': 'expert', 'kind': 'RMS', 'D': 720, 'out': 'q16', 'calls': 320, 'rows': 16000, 'elements': 11520000}
+   {'group': 'expert_final', 'kind': 'RMS', 'D': 720, 'out': 'q16', 'calls': 10, 'rows': 500, 'elements': 360000}
+   {'group': 'lm', 'kind': 'RMS', 'D': 960, 'out': 'q16', 'calls': 32, 'rows': 2592, 'elements': 2488320}
+   {'group': 'lm_final', 'kind': 'RMS', 'D': 960, 'out': 'unused', 'calls': 1, 'rows': 81, 'elements': 77760}
+   {'group': 'vision', 'kind': 'LN', 'D': 768, 'out': 'q16', 'calls': 48, 'rows': 12288, 'elements': 9437184}
+   {'group': 'vision_post', 'kind': 'LN', 'D': 768, 'out': 'zf32', 'calls': 2, 'rows': 512, 'elements': 393216}
+row stats (frames run): {
+ "vision": {
+  "n": 36864,
+  "mean_over_std": 0.812639752123752,
+  "max_over_std": 26.230905977868307,
+  "minstd": 0.06178045886331434
+ },
+ "vision_post": {
+  "n": 1536,
+  "mean_over_std": 0.0912215669482463,
+  "max_over_std": 25.21794249457185,
+  "minstd": 0.9008373650051807
+ },
+ "lm": {
+  "n": 7776,
+  "mean_over_std": 0.10613862126264102,
+  "max_over_std": 27.6210741854748,
+  "minstd": 0.23269473152580766
+ },
+ "lm_final": {
+  "n": 243,
+  "mean_over_std": 0.10539911108991938,
+  "max_over_std": 27.70307964560442,
+  "minstd": 4.07008083886588
+ },
+ "expert": {
+  "n": 48000,
+  "mean_over_std": 0.10709585193875688,
+  "max_over_std": 6.749200085813158,
+  "minstd": 0.5388538524756868
+ },
+ "expert_final": {
+  "n": 1500,
+  "mean_over_std": 0.08960480498279572,
+  "max_over_std": 6.077808402235586,
+  "minstd": 1.8953061896542547
+ }
+}
+kernel vs torch per norm call (all calls of the frames run): {
+ "vision/LN": {
+  "n": 36864,
+  "z_rel": 3.674926176699955e-07,
+  "deq_rel": 1.5500292647629976e-05,
+  "q_mismatch": 399065,
+  "q_total": 28311552,
+  "qdiff_max": 1
+ },
+ "vision_post/LN": {
+  "n": 1536,
+  "z_rel": 3.5392054087424185e-07,
+  "deq_rel": 1.5429288396262564e-05,
+  "q_mismatch": 8593,
+  "q_total": 1179648,
+  "qdiff_max": 1
+ },
+ "lm/RMS": {
+  "n": 7776,
+  "z_rel": 3.393025451714493e-07,
+  "deq_rel": 1.5464065654668957e-05,
+  "q_mismatch": 103042,
+  "q_total": 7464960,
+  "qdiff_max": 1
+ },
+ "lm_final/RMS": {
+  "n": 243,
+  "z_rel": 3.333106235459127e-07,
+  "deq_rel": 1.5319117665058002e-05,
+  "q_mismatch": 3084,
+  "q_total": 233280,
+  "qdiff_max": 1
+ },
+ "expert/RMS": {
+  "n": 48000,
+  "z_rel": 3.3309251534774376e-07,
+  "deq_rel": 1.5469724530703388e-05,
+  "q_mismatch": 1009838,
+  "q_total": 34560000,
+  "qdiff_max": 1
+ },
+ "expert_final/RMS": {
+  "n": 1500,
+  "z_rel": 2.6379893824923784e-07,
+  "deq_rel": 1.5413741493830457e-05,
+  "q_mismatch": 21797,
+  "q_total": 1080000,
+  "qdiff_max": 1
+ }
+}
+wrote C:\Users\athit\robotfpga\fpga\kernels\norm_residual\policy_check.json

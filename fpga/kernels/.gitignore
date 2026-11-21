@@ -1,0 +1,10 @@
+build/
+vectors/
+hls_probe/build/
+*.exe
+*.bin
+*.log
+*.out
+__pycache__/
+*.pt
+.Xil/

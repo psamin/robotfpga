@@ -1,0 +1,376 @@
+{
+ "as_run": {
+  "sites": {
+   "vision": {
+    "mac_cycles": 2359296,
+    "model_cycles": 7962624,
+    "y_words": 5898240,
+    "x_words": 3009024,
+    "w_words": 4718592,
+    "padded_macs": 2415919104,
+    "useful_macs": 2415919104,
+    "head_iters": 576,
+    "softmax_elems": 18874368,
+    "engine_calls": 24,
+    "softmax_calls": 12,
+    "pack_cycles": 7468800,
+    "pack_calls": 24,
+    "repeats": 12,
+    "shape": {
+     "H": 12,
+     "Hkv": 12,
+     "G": 1,
+     "Tq": 256,
+     "Tk": 256,
+     "images": 2,
+     "qk": {
+      "M": 256,
+      "K": 64,
+      "N": 256,
+      "H": 24
+     },
+     "pv": {
+      "M": 64,
+      "K": 256,
+      "N": 256,
+      "H": 24
+     }
+    },
+    "ms_mac": 9.437184,
+    "ms_model": 31.850496,
+    "ms_pack": 29.8752,
+    "ms_ideal": 9.437184
+   },
+   "prefix": {
+    "mac_cycles": 226560,
+    "model_cycles": 946560,
+    "y_words": 819200,
+    "x_words": 384640,
+    "w_words": 453120,
+    "padded_macs": 231997440,
+    "useful_macs": 201553920,
+    "head_iters": 160,
+    "softmax_elems": 1574640,
+    "engine_calls": 32,
+    "softmax_calls": 16,
+    "pack_cycles": 1513856,
+    "pack_calls": 32,
+    "repeats": 16,
+    "shape": {
+     "H": 15,
+     "Hkv": 5,
+     "G": 3,
+     "Tq": 81,
+     "Tk": 81,
+     "images": 1,
+     "qk": {
+      "M": 96,
+      "K": 64,
+      "N": 243,
+      "H": 5
+     },
+     "pv": {
+      "M": 64,
+      "K": 81,
+      "N": 243,
+      "H": 5
+     }
+    },
+    "ms_mac": 0.90624,
+    "ms_model": 3.7862400000000003,
+    "ms_pack": 6.055424,
+    "ms_ideal": 0.78732
+   },
+   "expert_self": {
+    "mac_cycles": 1164000,
+    "model_cycles": 4427200,
+    "y_words": 3584000,
+    "x_words": 1614400,
+    "w_words": 2793600,
+    "padded_macs": 1191936000,
+    "useful_macs": 1006080000,
+    "head_iters": 800,
+    "softmax_elems": 7860000,
+    "engine_calls": 160,
+    "softmax_calls": 80,
+    "pack_cycles": 6769920,
+    "pack_calls": 160,
+    "repeats": 80,
+    "shape": {
+     "H": 15,
+     "Hkv": 5,
+     "G": 3,
+     "Tq": 50,
+     "Tk": 131,
+     "images": 1,
+     "qk": {
+      "M": 160,
+      "K": 64,
+      "N": 150,
+      "H": 5
+     },
+     "pv": {
+      "M": 64,
+      "K": 131,
+      "N": 150,
+      "H": 5
+     }
+    },
+    "ms_mac": 4.656000000000001,
+    "ms_model": 17.7088,
+    "ms_pack": 27.07968,
+    "ms_ideal": 3.93
+   },
+   "expert_cross": {
+    "mac_cycles": 708000,
+    "model_cycles": 3196800,
+    "y_words": 2560000,
+    "x_words": 1208000,
+    "w_words": 1699200,
+    "padded_macs": 724992000,
+    "useful_macs": 622080000,
+    "head_iters": 800,
+    "softmax_elems": 4860000,
+    "engine_calls": 160,
+    "softmax_calls": 80,
+    "pack_cycles": 3801024,
+    "pack_calls": 168,
+    "repeats": 80,
+    "shape": {
+     "H": 15,
+     "Hkv": 5,
+     "G": 3,
+     "Tq": 50,
+     "Tk": 81,
+     "images": 1,
+     "qk": {
+      "M": 96,
+      "K": 64,
+      "N": 150,
+      "H": 5
+     },
+     "pv": {
+      "M": 64,
+      "K": 81,
+      "N": 150,
+      "H": 5
+     }
+    },
+    "ms_mac": 2.832,
+    "ms_model": 12.7872,
+    "ms_pack": 15.204096,
+    "ms_ideal": 2.4299999999999997
+   }
+  },
+  "total": {
+   "mac_cycles": 4457856,
+   "model_cycles": 16533184,
+   "y_words": 12861440,
+   "x_words": 6216064,
+   "w_words": 9664512,
+   "padded_macs": 4564844544,
+   "useful_macs": 4245633024,
+   "head_iters": 2336,
+   "softmax_elems": 33169008,
+   "engine_calls": 376,
+   "softmax_calls": 188,
+   "pack_cycles": 19553600,
+   "pack_calls": 384,
+   "ms_mac": 17.831424000000002,
+   "ms_model": 66.132736,
+   "ms_pack": 78.21440000000001,
+   "ms_ideal": 16.584504,
+   "calls": 948,
+   "ms_calls_driver_0.1ms": 94.80000000000001,
+   "ms_calls_sequencer_0.02ms": 18.96,
+   "ms_softmax_1word_per_clk": 33.169008
+  }
+ },
+ "compacted_prefix": {
+  "sites": {
+   "vision": {
+    "mac_cycles": 2359296,
+    "model_cycles": 7962624,
+    "y_words": 5898240,
+    "x_words": 3009024,
+    "w_words": 4718592,
+    "padded_macs": 2415919104,
+    "useful_macs": 2415919104,
+    "head_iters": 576,
+    "softmax_elems": 18874368,
+    "engine_calls": 24,
+    "softmax_calls": 12,
+    "pack_cycles": 7468800,
+    "pack_calls": 24,
+    "repeats": 12,
+    "shape": {
+     "H": 12,
+     "Hkv": 12,
+     "G": 1,
+     "Tq": 256,
+     "Tk": 256,
+     "images": 2,
+     "qk": {
+      "M": 256,
+      "K": 64,
+      "N": 256,
+      "H": 24
+     },
+     "pv": {
+      "M": 64,
+      "K": 256,
+      "N": 256,
+      "H": 24
+     }
+    },
+    "ms_mac": 9.437184,
+    "ms_model": 31.850496,
+    "ms_pack": 29.8752,
+    "ms_ideal": 9.437184
+   },
+   "prefix": {
+    "mac_cycles": 87200,
+    "model_cycles": 513920,
+    "y_words": 409600,
+    "x_words": 183360,
+    "w_words": 209280,
+    "padded_macs": 89292800,
+    "useful_macs": 62208000,
+    "head_iters": 160,
+    "softmax_elems": 486000,
+    "engine_calls": 32,
+    "softmax_calls": 16,
+    "pack_cycles": 1009024,
+    "pack_calls": 32,
+    "repeats": 16,
+    "shape": {
+     "H": 15,
+     "Hkv": 5,
+     "G": 3,
+     "Tq": 45,
+     "Tk": 45,
+     "images": 1,
+     "qk": {
+      "M": 64,
+      "K": 64,
+      "N": 135,
+      "H": 5
+     },
+     "pv": {
+      "M": 64,
+      "K": 45,
+      "N": 135,
+      "H": 5
+     }
+    },
+    "ms_mac": 0.3488,
+    "ms_model": 2.0556799999999997,
+    "ms_pack": 4.036096000000001,
+    "ms_ideal": 0.243
+   },
+   "expert_self": {
+    "mac_cycles": 764000,
+    "model_cycles": 3241600,
+    "y_words": 2560000,
+    "x_words": 1320000,
+    "w_words": 1833600,
+    "padded_macs": 782336000,
+    "useful_macs": 729600000,
+    "head_iters": 800,
+    "softmax_elems": 5700000,
+    "engine_calls": 160,
+    "softmax_calls": 80,
+    "pack_cycles": 5893120,
+    "pack_calls": 160,
+    "repeats": 80,
+    "shape": {
+     "H": 15,
+     "Hkv": 5,
+     "G": 3,
+     "Tq": 50,
+     "Tk": 95,
+     "images": 1,
+     "qk": {
+      "M": 96,
+      "K": 64,
+      "N": 150,
+      "H": 5
+     },
+     "pv": {
+      "M": 64,
+      "K": 95,
+      "N": 150,
+      "H": 5
+     }
+    },
+    "ms_mac": 3.056,
+    "ms_model": 12.9664,
+    "ms_pack": 23.57248,
+    "ms_ideal": 2.85
+   },
+   "expert_cross": {
+    "mac_cycles": 436000,
+    "model_cycles": 2569600,
+    "y_words": 2048000,
+    "x_words": 916800,
+    "w_words": 1046400,
+    "padded_macs": 446464000,
+    "useful_macs": 345600000,
+    "head_iters": 800,
+    "softmax_elems": 2700000,
+    "engine_calls": 160,
+    "softmax_calls": 80,
+    "pack_cycles": 3734144,
+    "pack_calls": 168,
+    "repeats": 80,
+    "shape": {
+     "H": 15,
+     "Hkv": 5,
+     "G": 3,
+     "Tq": 50,
+     "Tk": 45,
+     "images": 1,
+     "qk": {
+      "M": 64,
+      "K": 64,
+      "N": 150,
+      "H": 5
+     },
+     "pv": {
+      "M": 64,
+      "K": 45,
+      "N": 150,
+      "H": 5
+     }
+    },
+    "ms_mac": 1.7440000000000002,
+    "ms_model": 10.2784,
+    "ms_pack": 14.936576,
+    "ms_ideal": 1.35
+   }
+  },
+  "total": {
+   "mac_cycles": 3646496,
+   "model_cycles": 14287744,
+   "y_words": 10915840,
+   "x_words": 5429184,
+   "w_words": 7807872,
+   "padded_macs": 3734011904,
+   "useful_macs": 3553327104,
+   "head_iters": 2336,
+   "softmax_elems": 27760368,
+   "engine_calls": 376,
+   "softmax_calls": 188,
+   "pack_cycles": 18105088,
+   "pack_calls": 384,
+   "ms_mac": 14.585984,
+   "ms_model": 57.150976,
+   "ms_pack": 72.420352,
+   "ms_ideal": 13.880184,
+   "calls": 948,
+   "ms_calls_driver_0.1ms": 94.80000000000001,
+   "ms_calls_sequencer_0.02ms": 18.96,
+   "ms_softmax_1word_per_clk": 27.760368
+  }
+ }
+}

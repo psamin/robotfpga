@@ -1,0 +1,5 @@
+build/
+vectors/
+__pycache__/
+*.exe
+vitis_hls.log

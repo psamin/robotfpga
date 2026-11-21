@@ -2,6 +2,9 @@
 // Four weight bundles map to S_AXI_HP0..HP3_FPD in the block design; X/Y share a fifth bundle
 // (an HPC port, 128-bit words). Target 300 MHz.   cd fpga/hls && vitis_hls -f run_float_hls.tcl
 #include "float_linear.h"
+#if defined(FSTREAM_ARITH) && FSTREAM_ARITH == 16
+#include "int16_linear.h"  // -DFSTREAM_ARITH=16: int16 W x int16 X -> int48, FP32 out (same interfaces)
+#endif
 
 using namespace fstream;
 
@@ -17,6 +20,11 @@ int float_top(const WPort* w0, const WPort* w1, const WPort* w2, const WPort* w3
 #pragma HLS INTERFACE mode = s_axilite port = K
 #pragma HLS INTERFACE mode = s_axilite port = N
 #pragma HLS INTERFACE mode = s_axilite port = return
+#if defined(FSTREAM_ARITH) && FSTREAM_ARITH == 16
+  // xmem = [s_row: M/4 words][s_tok: Np/4 words][X interleaved], int16_linear.h DRIVER CONTRACT
+  const int np = ((N + fstream16::TB - 1) / fstream16::TB) * fstream16::TB;
+  return fstream16::linear_int16_core(w0, w1, w2, w3, xmem, ymem, M, K, N, M / F4, (M + np) / F4);
+#else
   // Token a of every block in its own memory (dim 1), 4 consecutive k in 4 memories (dim 3) so the
   // 128-bit X loads write 4 values per cycle.
   static float xbuf[TP][NB][K_MAX];
@@ -24,4 +32,5 @@ int float_top(const WPort* w0, const WPort* w1, const WPort* w2, const WPort* w3
 #pragma HLS ARRAY_PARTITION variable = xbuf complete dim = 1
 #pragma HLS ARRAY_PARTITION variable = xbuf cyclic factor = 4 dim = 3
   return linear_bf16_core(w0, w1, w2, w3, xmem, ymem, M, K, N, xbuf);
+#endif
 }
