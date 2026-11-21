@@ -8,6 +8,10 @@ comparable). Conditions on our demos:
   gamma_0.5 / gamma_2.0      exposure: brighter / darker (img ** gamma)
   warm_3000K / cool_10000K   color temperature, approximate black-body white balance vs 6500 K
   shadow      one random shadow band per image (RandomShadow, opacity 0.3-0.6, fixed seed)
+  live_squash each frame resized to 256x256 first, as LeRobot's async client does for a checkpoint whose
+              input_features are (3, 256, 256) (squashes the aspect ratio); the policy then letterboxes it
+  res_256 / res_320 / res_384  aspect kept, downsampled to N px on the long side with SmolVLA's own resize,
+              then letterboxed by the policy as usual: the image detail an N-px model would get
 Community: held-out episodes (index >= --community-episodes, never used in training), wrist only.
 --eval-repos picks the community datasets; a dataset whose whole task family a run held out tests new tasks.
 
@@ -65,6 +69,20 @@ def lighting(name: str):
 
         sh = RandomShadow(opacity=(0.3, 0.6))
         return lambda img: sh(img)
+    if name == "live_squash":  # async_inference/helpers.py resize_robot_observation_image
+        return lambda img: torch.nn.functional.interpolate(
+            img[None], size=(256, 256), mode="bilinear", align_corners=False
+        )[0]
+    if name.startswith("res_"):  # vla_utils.resize_with_pad's interpolation, without the padding
+        n = int(name.split("_")[1])
+
+        def down(img):
+            r = max(img.shape[-2:]) / n
+            size = (int(img.shape[-2] / r), int(img.shape[-1] / r))
+            out = torch.nn.functional.interpolate(img[None], size=size, mode="bilinear", align_corners=False)
+            return out[0]
+
+        return down
     return lambda img: img
 
 
@@ -170,7 +188,19 @@ def main():
         sets[r["id"]] = (view, lo, hi)
         print(f"held-out {r['id']}: frames {lo}..{hi} (episodes from {args.community_episodes})", flush=True)
 
-    conds = ["both", "wrist_only", "gamma_0.5", "gamma_2.0", "warm_3000K", "cool_10000K", "shadow"]
+    conds = [
+        "both",
+        "wrist_only",
+        "gamma_0.5",
+        "gamma_2.0",
+        "warm_3000K",
+        "cool_10000K",
+        "shadow",
+        "live_squash",
+        "res_256",
+        "res_320",
+        "res_384",
+    ]
     results = {}
     for spec in args.ckpt:
         name, path = spec.split("=", 1)
