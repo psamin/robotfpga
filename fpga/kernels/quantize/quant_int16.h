@@ -27,7 +27,13 @@
 // (README.md has the synthesised numbers). QZ_IMPL_FDIV instead uses the FP32 divider core per lane
 // (x / s, IEEE round to nearest even; denormal x flushed to 0 cannot change q: |x / s| < 4e-4).
 //
-// Inputs must be finite (NaN / Inf rows are undefined here, as they are useless downstream).
+// This is the contract quantizer (fpga/kernels/CONTRACT.md 2.1, contract.h ctr::ref::quant_row,
+// contract.py quant_rows): every int16 producer of float_top uses these functions. The STORED scale
+// (stored_scale) is s * 2^shift (shift = record parameter p4 in [-8, 8], an exponent add; Q uses -3 for
+// the attention's 1/8); an all-zero row stores 1.0 whatever the shift.
+// Non-finite rows: q is undefined (finite garbage, no hang), but the stored scale is not hidden: a row whose
+// absmax is +Inf stores +Inf, a NaN row stores that NaN (as ctr::ref / torch, whose s = amax / 32767 is
+// non-finite too), so a divergence reaches the next GEMM's output instead of vanishing.
 // Plain C++ on ap_int.h: the same code builds in Vitis HLS and in g++ with -I<Vitis_HLS>/include.
 #pragma once
 #include <ap_int.h>
@@ -184,6 +190,30 @@ recip:
     recip_step(st, S);
   }
   return recip_result(st);
+}
+
+// The same 25 steps fully unrolled: for a pipelined loop that needs one R per clock (the row unit's sc
+// stage). 25 compare-subtract stages of 25 bits, about 1.2k LUT in all, no DSP; HLS registers the chain to
+// meet the clock. Call it once per hardware instance: every call site inside a pipelined loop is its own
+// 25-stage divider (an iterative recip_step engine is ~0.4k LUT but delivers one R per 27 clocks).
+static inline ap_uint<26> recip_unrolled(ap_uint<24> S) {
+#pragma HLS INLINE
+  RecipState st = recip_init(S);
+  for (int i = 0; i < RECIP_STEPS; i++) {
+#pragma HLS UNROLL
+    recip_step(st, S);
+  }
+  return recip_result(st);
+}
+
+// The scale written to DDR next to the int16 row (CONTRACT.md 2.1): s * 2^shift for a nonzero finite
+// absmax (s is normal with a biased exponent in [12, 240], so shift in [-8, 8] keeps it normal and exact),
+// 1.0 for an all-zero row, and the absmax itself (+Inf or the NaN) for a non-finite row.
+static inline ap_uint<32> stored_scale(abits_t a_bits, ap_uint<32> s_bits, ap_int<5> shift) {
+#pragma HLS INLINE
+  const bool nonfinite = a_bits(30, 23) == 255;
+  const ap_uint<32> sh = s_bits + (ap_uint<32>(ap_int<32>(shift)) << 23);
+  return a_bits == 0 ? ap_uint<32>(ONE_BITS) : nonfinite ? ap_uint<32>(a_bits) : sh;
 }
 
 // Row parameters from s (R left out: fill it with recip_* from S).

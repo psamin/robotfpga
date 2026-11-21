@@ -1,29 +1,28 @@
-// Host testbench of the norm_residual kernel: runs nr_top (the HLS code, compiled by g++) on whole DDR images
-// written by gen_vectors.py and compares the result with the image nr_emul.py expects, word for word (outputs
-// bit-exact, everything else untouched). One shared image serves all four ports (sequencer-mode addressing).
-//   g++ -std=c++14 -O2 -ffp-contract=off -I<Vitis_HLS>/include tb_nr.cpp nr_top.cpp -o tb_nr.exe
-//   tb_nr.exe case1.bin case2.bin ...       exit code 0 iff every case matches
+// Host testbench of the NORM mode: runs nr_top (the HLS code, compiled by g++) on whole DDR images written by
+// gen_vectors.py and compares the image afterwards with the one nr_emul.py expects, byte for byte (outputs
+// bit-exact, everything else untouched), and the return code with contract.py's validate.
+// Two builds of the same sources:
+//   sequential   the processes of the DATAFLOW region run one after another on unbounded streams (C simulation)
+//   -DNR_DFSIM   every process in its own thread, every stream bounded at its declared depth (nr_dfsim.h):
+//                a FIFO-depth deadlock hangs here as on the IP and the watchdog exits with code 3
+//   g++ -std=c++14 -O2 -ffp-contract=off -I<Vitis_HLS>/include -I.. -I../quantize tb_nr.cpp nr_top.cpp -o tb.exe
+//   tb.exe [--units] case1.bin case2.bin ...       exit code 0 iff every case matches
+// The image sits at its DDR address: the ports point at image - base / 16, so the 64-bit / 40-bit address path
+// is exercised (cases at 4 GB, 32 GB and 64 GB).
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-
-#include <math.h>
 
 #include <random>
 #include <vector>
 
 #include "norm_residual.h"
 
-int nr_top(const nr::word_t* hp0, const nr::word_t* hp1, const nr::word_t* hp2, nr::word_t* io, unsigned flags,
-           int K, int N, int B, unsigned eps, unsigned a_off, unsigned a_pitch, unsigned a_stride, unsigned b_off,
-           unsigned b_pitch, unsigned b_stride, unsigned e_off, unsigned c_off, unsigned c_pitch, unsigned c_stride,
-           unsigned d_off, unsigned d_pitch, unsigned d_stride, unsigned f_off, unsigned f_stride);
-
-static nr::word_t to_word(const uint32_t* u) {
-  nr::word_t w = 0;
-  for (int l = 0; l < 4; l++) w.range(32 * l + 31, 32 * l) = u[l];
-  return w;
+namespace nr {
+long g_leftover = 0;
 }
+
+int nr_top(const nr::word_t* w2, const nr::word_t* xmem, nr::word_t* ymem, int M, int K, int N);
 
 static int run_case(const char* path) {
   FILE* fh = fopen(path, "rb");
@@ -31,19 +30,16 @@ static int run_case(const char* path) {
     printf("%s: cannot open\n", path);
     return 1;
   }
-  uint32_t hdr[2];
-  if (fread(hdr, 4, 2, fh) != 2 || hdr[0] != 0x3143524Eu || hdr[1] != 20) {
+  uint32_t magic, W;
+  uint64_t base, list;
+  int32_t want;
+  if (fread(&magic, 4, 1, fh) != 1 || magic != 0x3243524Eu || fread(&base, 8, 1, fh) != 1 ||
+      fread(&list, 8, 1, fh) != 1 || fread(&want, 4, 1, fh) != 1 || fread(&W, 4, 1, fh) != 1) {
     printf("%s: bad header\n", path);
     fclose(fh);
     return 1;
   }
-  uint32_t c[20], W;
-  if (fread(c, 4, 20, fh) != 20 || fread(&W, 4, 1, fh) != 1) {
-    printf("%s: short read\n", path);
-    fclose(fh);
-    return 1;
-  }
-  std::vector<uint32_t> in(4 * (size_t)W), ex(4 * (size_t)W);
+  std::vector<uint8_t> in(16 * (size_t)W), ex(16 * (size_t)W);
   if (fread(in.data(), 16, W, fh) != W || fread(ex.data(), 16, W, fh) != W) {
     printf("%s: short image\n", path);
     fclose(fh);
@@ -51,95 +47,128 @@ static int run_case(const char* path) {
   }
   fclose(fh);
   std::vector<nr::word_t> mem(W);
-  for (uint32_t i = 0; i < W; i++) mem[i] = to_word(&in[4 * (size_t)i]);
-  const int rc = nr_top(mem.data(), mem.data(), mem.data(), mem.data(), c[0], (int)c[1], (int)c[2], (int)c[3], c[4],
-                        c[5], c[6], c[7], c[8], c[9], c[10], c[11], c[12], c[13], c[14], c[15], c[16], c[17], c[18],
-                        c[19]);
+  for (uint32_t i = 0; i < W; i++) {
+    nr::word_t w = 0;
+    for (int b = 0; b < 16; b++) w.range(8 * b + 7, 8 * b) = in[16 * (size_t)i + b];
+    mem[i] = w;
+  }
+  nr::word_t* p = mem.data() - (base >> 4);  // word index = byte address / 16, as on the bus
+  const long left0 = nr::g_leftover;
+  const int rc = nr_top(p, p, p, 0, (int)(uint32_t)(list >> 4), 0);
+  const long left = nr::g_leftover - left0;
   long bad = 0, outs = 0;
   for (uint32_t i = 0; i < W; i++) {
-    for (int l = 0; l < 4; l++) {
-      const uint32_t got = (uint32_t)mem[i].range(32 * l + 31, 32 * l);
-      const uint32_t want = ex[4 * (size_t)i + l];
-      if (want != in[4 * (size_t)i + l]) outs++;
-      if (got != want) {
-        if (bad < 8)
-          printf("  mismatch word %u lane %d: got %08X want %08X (input %08X)\n", i, l, got, want,
-                 in[4 * (size_t)i + l]);
+    for (int b = 0; b < 16; b++) {
+      const uint8_t got = (uint8_t)mem[i].range(8 * b + 7, 8 * b);
+      const uint8_t wantb = ex[16 * (size_t)i + b];
+      if (wantb != in[16 * (size_t)i + b]) outs++;
+      if (got != wantb) {
+        if (bad < 6)
+          printf("  mismatch at 0x%llx: got %02X want %02X (input %02X)\n",
+                 (unsigned long long)(base + 16 * (uint64_t)i + b), got, wantb, in[16 * (size_t)i + b]);
         bad++;
       }
     }
   }
   const char* name = strrchr(path, '/');
   name = name ? name + 1 : path;
-  printf("%-28s K=%4u N=%3u B=%u flags=0x%02X rc=%d  %s (%ld of %lu u32 differ, %ld changed by the call)\n", name,
-         c[1], c[2], c[3], c[0], rc, bad == 0 && rc == 0 ? "BIT-EXACT" : "FAIL", bad, 4ul * W, outs);
-  return bad == 0 && rc == 0 ? 0 : 1;
+  const bool ok = bad == 0 && rc == want && left == 0;
+  printf("%-28s base 0x%010llx rc 0x%04x (want 0x%04x) %s: %ld of %zu bytes differ, %ld changed by the call%s\n",
+         name, (unsigned long long)base, rc, want, ok ? "BIT-EXACT" : "FAIL", bad, in.size(), outs,
+         left ? ", LEFTOVER STREAM DATA" : "");
+  return ok ? 0 : 1;
 }
 
-// Dimension checks: nothing written, return 1.
-static int bad_dims() {
-  std::vector<nr::word_t> mem(64, nr::word_t(0x5A));
-  int fails = 0;
-  const int Ks[] = {0, 4, 12, nr::KMAX + 8};
-  for (int K : Ks) {
-    const int rc = nr_top(mem.data(), mem.data(), mem.data(), mem.data(), 0x1E, K, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                          0, 0, 0, 0, 0, 0, 0);
-    if (rc != 1) fails++;
+// The restoring divider against an exact reference: rn(n / d) 2^k with __int128 long division.
+static uint32_t div_ref(unsigned __int128 n, unsigned __int128 d, int k, bool neg) {
+  if (n == 0) return 0;
+  auto bl = [](unsigned __int128 v) {
+    int b = 0;
+    while (v) {
+      b++;
+      v >>= 1;
+    }
+    return b;
+  };
+  int s = 24 - (bl(n) - bl(d));
+  unsigned __int128 q, r;
+  for (;;) {
+    const unsigned __int128 nn = s >= 0 ? n << s : n, dd = s >= 0 ? d : d << -s;
+    q = nn / dd;
+    r = nn % dd;
+    if (q >= ((unsigned __int128)1 << 25))
+      s--;
+    else if (q < ((unsigned __int128)1 << 24))
+      s++;
+    else
+      break;
   }
-  if (nr_top(mem.data(), mem.data(), mem.data(), mem.data(), 0x1E, 64, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-             0, 0) != 1)
-    fails++;
-  for (auto& w : mem)
-    if (w != nr::word_t(0x5A)) fails++;
-  printf("bad-dimension calls: %s\n", fails ? "FAIL" : "rejected, nothing written");
-  return fails ? 1 : 0;
+  uint64_t m = (uint64_t)(q >> 1);
+  const bool rb = q & 1, st = r != 0;
+  if (rb && (st || (m & 1))) m++;
+  int ex = 1 - s;
+  if (m == (1ull << 24)) {
+    m >>= 1;
+    ex++;
+  }
+  const int field = ex + 23 + 127 + k;
+  const uint32_t sign = neg ? 0x80000000u : 0u;
+  if (field <= 0) return 0;
+  if (field >= 255) return sign | 0x7F800000u;
+  return sign | ((uint32_t)field << 23) | ((uint32_t)m & 0x7FFFFF);
 }
 
-// Scalar units against independent references: i2f_seq / i2f_rne (all 72-bit widths, ties, sparse values)
-// against long double (exact below 2^64) and each other; quant1 against double rne(z * inv) over random z, A.
 static int unit_tests() {
-  std::mt19937_64 g(5);
+  std::mt19937_64 g(7);
   long bad = 0;
-  const int NI = 1000000;
-  for (int it = 0; it < NI; it++) {
-    const int bl = 1 + (int)(g() % 72);
-    ap_uint<72> a = 0;
-    a(63, 0) = g();
-    a(71, 64) = g() & 0xFF;
-    if (bl < 72) a = a & ((ap_uint<72>(1) << bl) - 1);
-    if (it % 7 == 0) a = (a >> 30) << 30;
-    if (it % 11 == 0) a = (ap_uint<72>(1) << (g() % 72)) | (ap_uint<72>(1) << (g() % 72));
-    const bool neg = it & 1;
-    const uint32_t x = nr::f2u(nr::i2f_rne<72>(a, neg)), y = nr::f2u(nr::i2f72(a, neg));
-    if (x != y) bad++;
-    if (a < (ap_uint<72>(1) << 64)) {
-      long double ref = 0;
-      for (int b = 63; b >= 0; b--) ref = ref * 2 + (a[b] ? 1 : 0);
-      const uint32_t want = a == 0 ? 0u : nr::f2u((float)(neg ? -ref : ref));  // the kernel's zero is +0
-      if (want != x) bad++;
+  const int NT = 400000;
+  for (int it = 0; it < NT; it++) {
+    const uint32_t K = 8 * (1 + (uint32_t)(g() % 128));
+    const bool sq = it & 1;
+    const uint64_t d = sq ? (uint64_t)K * K : K;
+    unsigned __int128 n = ((unsigned __int128)(g() & 0xFF) << 64) | g();  // 72 bits
+    const int bits = 1 + (int)(g() % 72);
+    if (bits < 72) n &= (((unsigned __int128)1) << bits) - 1;
+    if (it % 9 == 0) n = (unsigned __int128)d * (g() % 100000);  // exact quotients
+    if (it % 13 == 0) n = (unsigned __int128)d * (2 * (g() % 4096) + 1) << (g() % 20);  // ties and near ties
+    const int k = (int)(g() % 520) - 400;
+    const bool neg = (it % 3) == 0;
+    ap_uint<72> na = 0;
+    na(63, 0) = (uint64_t)n;
+    na(71, 64) = (uint64_t)(n >> 64);
+    const ap_uint<5> ld = nr::bitlen((uint32_t)d);
+    const ap_uint<72> dn = ap_uint<72>(d) << (72 - (int)ld);
+    const uint32_t got = nr::div_rn(na, dn, ld, k, neg);
+    const uint32_t want = div_ref(n, d, k, neg);
+    if (got != want) {
+      if (bad < 5) printf("  div_rn K=%u sq=%d k=%d: got %08X want %08X\n", K, sq, k, got, want);
+      bad++;
     }
   }
-  printf("unit i2f (72-bit, %d values): %s\n", NI, bad ? "FAIL" : "exact");
-  long qbad = 0;
-  std::uniform_real_distribution<float> u(-1.f, 1.f);
-  const int NQ = 2000000;
-  for (int it = 0; it < NQ; it++) {
-    const float A = expf(u(g) * 40.f);
-    const float z = u(g) * A;
-    const float r = nr::recip_nr(A);
-    const uint32_t ib = nr::f2u(r * 32767.0f) & nr::INV_MASK;
-    double p = (double)z * (double)nr::u2f(ib);  // exact: 24 x 17 bits
-    double q = nearbyint(p);
-    q = q > 32767 ? 32767 : (q < -32767 ? -32767 : q);
-    if ((int)nr::quant1(nr::f2u(z), ib) != (int)q) qbad++;
-  }
-  printf("unit quant1 (%d values): %s\n", NQ, qbad ? "FAIL" : "exact");
-  return (bad || qbad) ? 1 : 0;
+  printf("unit div_rn (%d random 72-bit / K or K^2 divisions, ties, exact quotients): %s\n", NT,
+         bad ? "FAIL" : "exact");
+  return bad ? 1 : 0;
 }
 
 int main(int argc, char** argv) {
-  int fails = unit_tests() + bad_dims();
-  for (int i = 1; i < argc; i++) fails += run_case(argv[i]);
-  printf("%s: %d failing\n", fails ? "FAIL" : "ALL PASS", fails);
+#ifdef NR_DFSIM
+  printf("build: threaded DATAFLOW model, streams bounded at their declared depths\n");
+#else
+  printf("build: sequential C simulation\n");
+#endif
+  int fails = 0, n = 0;
+  for (int i = 1; i < argc; i++) {
+    if (!strcmp(argv[i], "--units")) {
+      fails += unit_tests();
+      continue;
+    }
+    fails += run_case(argv[i]);
+    n++;
+  }
+#ifdef NR_DFSIM
+  printf("FIFO peaks over all cases (words or entries held / declared depth):\n");
+  for (auto& p : dfsim::peaks()) printf("  %-4s %4zu / %4zu\n", p.name.c_str(), p.peak, p.depth);
+#endif
+  printf("%s: %d case(s), %d failing\n", fails ? "FAIL" : "ALL PASS", n, fails);
   return fails ? 1 : 0;
 }

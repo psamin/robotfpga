@@ -1,21 +1,26 @@
-"""Full-policy effect of the gelu_silu kernel on checkpoint -12392 and its 3 replay frames.
+"""Full-policy effect of the gelu_silu front end on checkpoint -12392 and its 3 replay frames, contract 1.0 arithmetic.
 
-The kernel's exact arithmetic (gs_emu, bit-identical to the HLS C model) replaces SigLIP's tanh-GELU and the LM /
-expert silu(gate) * up, and its int16 output + per-token scale feeds fc2 / down_proj. Variants (per frame, max and
-mean |chunk - ref_chunk_raw| in normalized action units; gate 0.05):
+The front end's exact arithmetic (gs_emu, bit-identical to the HLS C model) replaces SigLIP's tanh-GELU, the LM /
+expert silu(gate) * up and the action-time F.silu; its y goes through the contract quantizer (contract.quant_rows)
+into fc2 / down_proj / action_time_mlp_out. Variants (per frame, max and mean |chunk - ref_chunk_raw| in normalized
+action units; gate 0.05):
 
-  F0        FP32 linears, torch activations                                (control: laptop vs cluster reference)
-  F2        FP32 linears, torch activations, fc2/down inputs int16 per-token absmax (ideal quantiser, torch order)
-  F1_nsbN   FP32 linears, kernel activations: q * s into fc2/down          (F1 - F2 = the kernel's own arithmetic)
-            (all three uses: SigLIP GELU mode 0, LM/expert silu(gate) * up mode 1, action-time MLP silu mode 2)
-  I0        int16 engine emulation (int16 W per row x int16 X per token, exact sums; the 21 FP32-stored layers FP32),
-            torch activations                                              (the engine alone)
-  I1_nsbN   I0 with the kernel: its q and s go straight into fc2/down      (the proposed arithmetic)
+  F0   FP32 linears, torch activations                                     (control: laptop vs cluster reference)
+  F1   FP32 linears, the kernel's q * s into fc2 / down / time_out           (the kernel alone, on FP32 linears)
+  C0   contract engine emulation, torch activations quantized by the contract quantizer      (the engine alone)
+  C1   C0 with the kernel: its q and s go straight into fc2 / down / time_out  (the proposed arithmetic)
+
+Contract engine emulation (CONTRACT.md 2): every linear on int16, including the 21 FP32-stored layers (design study
+(b)); weights and activations per row / per token by the contract quantizer (s = fl32(max(a, 1e-30) / 32767), all-zero
+rows 1.0, q = clamp(rne(fl32(x / s)))); exact integer sums; epilogue y = ((fl(acc) * s_row) * s_tok) + bias, one FP32
+operation per step with denormals flushed (contract.gemm_out); action_time_mlp_in's time half is the constant FP32 row
+W_t t_emb + b added as D (2.4). Not emulated here (the contract owner's golden executor T-P1): int16 attention and
+the softmax kernel, the folded sqrt(960) / Euler constants, norm / rope kernels, the trimmed language tokens.
 
     set HF_HUB_OFFLINE=1
-    C:\\kp\\lerobot-venv\\Scripts\\python.exe fpga\\kernels\\gelu_silu\\policy_check.py [--variants F0,I1_nsb9] [--frames 0]
-    ... --dump build/gelu_silu/real9 --nsb 9      # also write real-activation test vectors for tb_gelu_silu
-Writes one JSON line per (variant, frame) to stdout and the summary to build/gelu_silu/policy_check.json.
+    C:\\kp\\lerobot-venv\\Scripts\\python.exe fpga\\kernels\\gelu_silu\\policy_check.py [--variants F0,C1] [--frames 0]
+    ... --dump build/gelu_silu/c1/real       # write real-activation test vectors (frame 0, C1) for tb_gelu_silu
+Writes one JSON line per (variant, frame) to stdout and the summary to build/gelu_silu/c1/policy_check.json.
 """
 
 from __future__ import annotations
@@ -28,164 +33,164 @@ import time
 import types
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+sys.path.insert(1, str(HERE.parent))
+import contract  # noqa: E402
 import gs_emu  # noqa: E402
 
 ROOT = HERE.parents[2]
 CKPT = ROOT / "build/ckpt/smolvla-12392/smolvla-so101_medicine_bottle_pickplace-12392-native"
 BATCHES = ROOT / "build/ckpt/smolvla-12392/batches-12392"
-OUT = ROOT / "build/gelu_silu"
-TINY = 1e-30
+OUT = ROOT / "build/gelu_silu/c1"
+TINY = torch.tensor(1e-30, dtype=torch.float32)
+QMAX = 32767
 
 CFG = dict(linear="fp32", act="torch", nsb=9)
 STATS: dict = {}
 DUMP: dict = {}
 
 
-def quant_sym(x: torch.Tensor, qmax: int = 32767):
-    s = x.abs().amax(-1, keepdim=True).clamp_min(TINY) / qmax
-    return torch.round(x / s).clamp_(-qmax, qmax), s
+def ftz(t: torch.Tensor) -> torch.Tensor:
+    """contract.ftz: FP32 values with a zero exponent field become a zero of the same sign."""
+    b = t.contiguous().view(torch.int32)
+    return torch.where((b & 0x7F800000) == 0, b & torch.tensor(-(1 << 31), dtype=torch.int32), b).view(torch.float32)
+
+
+def cquant(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """The contract quantizer over the last axis (= contract.quant_rows, checked in main): q (float, integer-valued),
+    s (..., 1) FP32."""
+    x = x.to(torch.float32)
+    a = x.abs().amax(-1, keepdim=True)
+    s = torch.where(a == 0, torch.ones_like(a), torch.maximum(a, TINY) / QMAX)
+    return torch.round(x / s).clamp_(-QMAX, QMAX), s
+
+
+def gemm_out(acc: torch.Tensor, s_row: torch.Tensor, s_tok: torch.Tensor, bias, addend=None) -> torch.Tensor:
+    """contract.gemm_out in torch: acc (rows, M) float64 exact sums; s_row (M,), s_tok (rows, 1) FP32."""
+    y = ftz(ftz(acc.to(torch.float32)) * ftz(s_row)[None, :])
+    y = ftz(y * ftz(s_tok))
+    if bias is not None:
+        y = ftz(y + ftz(bias.to(torch.float32))[None, :])
+    if addend is not None:
+        y = ftz(y + ftz(addend))
+    return y
 
 
 class Lin:
-    """Replacement forward of one nn.Linear: FP32 as loaded, or the int16 engine (exact integer sums)."""
+    """Replacement forward of one nn.Linear: FP32 as loaded, or the contract int16 engine."""
 
-    def __init__(self, name: str, mod: nn.Linear, keep_fp32: bool):
-        self.name, self.mod, self.keep = name, mod, keep_fp32
-        self.w = mod.weight.detach()
-        self.b = None if mod.bias is None else mod.bias.detach()
+    def __init__(self, name: str, mod: nn.Linear):
+        self.name, self.mod = name, mod
+        self.w = mod.weight.detach().float()
+        self.b = None if mod.bias is None else mod.bias.detach().float()
+        self.time_in = name.endswith("action_time_mlp_in")  # [a_emb | t_emb]: the t half is an FP32 D row
         self.wq = None
 
     def prep(self):
         if self.wq is None:
-            q, s = quant_sym(self.w)
-            self.wq, self.sw = q.double(), s.squeeze(1).double()
+            w = self.w[:, : self.w.shape[1] // 2] if self.time_in else self.w
+            q, s = cquant(w)
+            self.wq, self.sw = q.double(), s.squeeze(1)
         return self.wq, self.sw
 
-    def int16_mode(self) -> bool:
-        return CFG["linear"] == "int16" and not self.keep
-
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        if not self.int16_mode():
+        if CFG["linear"] != "int16":
             return F.linear(x, self.w, self.b)
-        xq, sx = quant_sym(x)
-        return self.preq(xq, sx)
+        if self.time_in:
+            h = x.shape[-1] // 2
+            d = F.linear(x[..., h:], self.w[:, h:], self.b)  # W_t t_emb + b: constant FP32 rows (host, at load)
+            q, s = cquant(x[..., :h])
+            return self.preq(q, s, addend=d, bias=False)
+        q, s = cquant(x)
+        return self.preq(q, s)
 
-    def preq(self, q: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
-        """Already-quantised input (q integer-valued, s per token): the engine's acc * s_row * s_tok."""
+    def preq(self, q: torch.Tensor, s: torch.Tensor, addend=None, bias=True) -> torch.Tensor:
+        """Already-quantised input (q integer-valued, s per token)."""
         shape = q.shape
-        if not self.int16_mode():  # FP32 linear fed the dequantised kernel output
-            return F.linear((q.to(torch.float32) * s), self.w, self.b)
+        if CFG["linear"] != "int16":  # FP32 linear fed the dequantised kernel output
+            return F.linear(q.to(torch.float32) * s, self.w, self.b)
         wq, sw = self.prep()
         acc = q.reshape(-1, shape[-1]).double() @ wq.t()
-        y = (acc * s.reshape(-1, 1).double() * sw[None, :]).float()
-        if self.b is not None:
-            y = y + self.b
+        ad = None if addend is None else addend.reshape(-1, wq.shape[0])
+        y = gemm_out(acc, sw, s.reshape(-1, 1).to(torch.float32), self.b if bias else None, ad)
         return y.reshape(*shape[:-1], wq.shape[0])
 
 
 def note(kind: str, x: torch.Tensor, u: torch.Tensor | None, q: torch.Tensor, s: torch.Tensor, yb: torch.Tensor):
-    st = STATS.setdefault(kind, dict(calls=0, rows=[], K=int(x.shape[-1]), elems=0, lsb_max=0.0, lsb_sq=0.0,
-                                     kern_lsb_max=0.0, kern_lsb_sq=0.0, n=0, amax_min=1e30, amax_max=0.0))
+    st = STATS.setdefault(kind, dict(calls=0, rows=[], K=int(x.shape[-1]), elems=0, q_max=0.0, q_sq=0.0, y_max=0.0,
+                                     y_sq=0.0, n=0))
     st["calls"] += 1
-    rows = x.numel() // x.shape[-1]
-    st["rows"].append(rows)
+    st["rows"].append(x.numel() // x.shape[-1])
     st["elems"] += x.numel()
     ref = gs_emu.act_exact(x, u, {"gelu": 0, "silu1": 2}.get(kind, 1))
     sd = s.double()
-    ok = sd > 0
-    e = ((q.double() * sd - ref).abs() / sd.clamp_min(1e-300))[ok.expand_as(ref)]
-    ek = ((gs_emu.b2f(yb).double() - ref).abs() / sd.clamp_min(1e-300))[ok.expand_as(ref)]
-    st["lsb_max"] = max(st["lsb_max"], float(e.max()))
-    st["lsb_sq"] += float((e**2).sum())
-    st["kern_lsb_max"] = max(st["kern_lsb_max"], float(ek.max()))
-    st["kern_lsb_sq"] += float((ek**2).sum())
+    e = (q.double() * sd - ref).abs() / sd
+    ey = (gs_emu.b2f(yb).double() - ref).abs() / sd
+    st["q_max"] = max(st["q_max"], float(e.max()))
+    st["q_sq"] += float((e**2).sum())
+    st["y_max"] = max(st["y_max"], float(ey.max()))
+    st["y_sq"] += float((ey**2).sum())
     st["n"] += int(e.numel())
-    am = sd * 32767
-    st["amax_min"] = min(st["amax_min"], float(am.min()))
-    st["amax_max"] = max(st["amax_max"], float(am.max()))
+
+
+def run_kernel(kind: str, x: torch.Tensor, u: torch.Tensor | None):
+    mode = {"gelu": 0, "silu1": 2}.get(kind, 1)
+    q, s, yb = gs_emu.kernel(x, u, mode, CFG["nsb"])
+    note(kind, x, u, q, s, yb)
+    if CFG.get("dump") and kind not in DUMP and (kind != "gelu" or CFG.get("vis_idx") == 6):
+        DUMP[kind] = (x.reshape(-1, x.shape[-1]).clone(), None if u is None else u.reshape(-1, u.shape[-1]).clone())
+    return q.to(torch.float32), s
 
 
 def make_vision_mlp(mod, lin1: Lin, lin2: Lin, idx: int):
     def forward(self, h):
         a = lin1(h)
         if CFG["act"] == "torch":
-            return lin2(self.activation_fn(a))
-        if CFG["act"] == "torch_q":
-            q, s = quant_sym(self.activation_fn(a))
-            return lin2.preq(q, s)
-        q, s, yb = gs_emu.kernel(a, None, 0, CFG["nsb"])
-        note("gelu", a, None, q, s, yb)
-        if CFG.get("dump") and idx == 6 and "gelu" not in DUMP:
-            DUMP["gelu"] = (a.reshape(-1, a.shape[-1]).clone(), None)
-        return lin2.preq(q, s)
+            y = self.activation_fn(a)
+            return lin2(y) if CFG["linear"] != "int16" else lin2.preq(*cquant(y))
+        CFG["vis_idx"] = idx
+        return lin2.preq(*run_kernel("gelu", a, None))
 
     return forward
 
 
-def make_llama_mlp(mod, lg: Lin, lu: Lin, ld: Lin, kind: str, idx: int):
+def make_llama_mlp(mod, lg: Lin, lu: Lin, ld: Lin, kind: str):
     def forward(self, x):
         g, u = lg(x), lu(x)
         if CFG["act"] == "torch":
-            return ld(self.act_fn(g) * u)
-        if CFG["act"] == "torch_q":
-            q, s = quant_sym(self.act_fn(g) * u)
-            return ld.preq(q, s)
-        q, s, yb = gs_emu.kernel(g, u, 1, CFG["nsb"])
-        note(kind, g, u, q, s, yb)
-        if CFG.get("dump") and idx == 3 and kind not in DUMP:
-            DUMP[kind] = (g.reshape(-1, g.shape[-1]).clone(), u.reshape(-1, u.shape[-1]).clone())
-        return ld.preq(q, s)
+            y = self.act_fn(g) * u
+            return ld(y) if CFG["linear"] != "int16" else ld.preq(*cquant(y))
+        return ld.preq(*run_kernel(kind, g, u))
 
     return forward
 
 
 def make_silu_alone():
-    """F.silu of modeling_smolvla (action_time_mlp: silu(action_time_mlp_in(.)) -> action_time_mlp_out), mode 2.
-    The kernel's q * s goes to the next Lin, which (int16 mode) re-quantizes it: the same q and s up to one ulp of
-    s (q * s / s' rounds back to q since |q| < 2^15)."""
+    """F.silu of modeling_smolvla (action_time_mlp: silu(action_time_mlp_in(.)) -> action_time_mlp_out). The kernel's
+    q * s goes to action_time_mlp_out, which (int16) re-quantizes it: q * s re-quantizes to the same q and s up to one
+    ulp of s (|q| < 2^15), so q * s is passed as the activation."""
     silu = F.silu
 
     def f(x, inplace=False):
         if CFG["act"] == "torch":
             return silu(x)
-        if CFG["act"] == "torch_q":
-            q, s = quant_sym(silu(x))
-            return q * s
-        q, s, yb = gs_emu.kernel(x, None, 2, CFG["nsb"])
-        note("silu1", x, None, q, s, yb)
-        if CFG.get("dump") and "silu1" not in DUMP:
-            DUMP["silu1"] = (x.reshape(-1, x.shape[-1]).clone(), None)
-        return q.to(torch.float32) * s
+        q, s = run_kernel("silu1", x, None)
+        return q * s
 
     return f
 
 
-def fp32_stored(ckpt: Path) -> set[str]:
-    from safetensors import safe_open
-
-    names = set()
-    with safe_open(str(ckpt / "model.safetensors"), "pt") as sf:
-        for k in sf.keys():
-            if k.endswith(".weight") and sf.get_slice(k).get_dtype() == "F32":
-                names.add(k[: -len(".weight")])
-    return names
-
-
-def install(policy, ckpt: Path) -> None:
-    keep = fp32_stored(ckpt)
+def install(policy) -> None:
     lins: dict[str, Lin] = {}
-    n_keep = 0
     for name, mod in policy.named_modules():
         if isinstance(mod, nn.Linear):
-            k = any(name.endswith(kn) or kn.endswith(name) for kn in keep)
-            n_keep += k
-            lp = Lin(name, mod, k)
+            lp = Lin(name, mod)
             lins[name] = lp
             mod.forward = types.MethodType(lambda self, x, _lp=lp: _lp(x), mod)
     nv = nl = ne = 0
@@ -195,34 +200,29 @@ def install(policy, ckpt: Path) -> None:
             mod.forward = types.MethodType(make_vision_mlp(mod, lins[name + ".fc1"], lins[name + ".fc2"], nv), mod)
             nv += 1
         elif tn == "LlamaMLP":
-            assert type(mod.act_fn).__name__ == "SiLUActivation" or "silu" in str(mod.act_fn).lower(), mod.act_fn
             kind = "expert" if "lm_expert" in name else "lm"
-            idx = ne if kind == "expert" else nl
             mod.forward = types.MethodType(
-                make_llama_mlp(mod, lins[name + ".gate_proj"], lins[name + ".up_proj"], lins[name + ".down_proj"], kind, idx),
+                make_llama_mlp(mod, lins[name + ".gate_proj"], lins[name + ".up_proj"], lins[name + ".down_proj"], kind),
                 mod,
             )
-            if kind == "expert":
-                ne += 1
-            else:
-                nl += 1
+            ne += kind == "expert"
+            nl += kind == "lm"
     import lerobot.policies.smolvla.modeling_smolvla as ms
 
     fp = types.SimpleNamespace(**{k: getattr(F, k) for k in dir(F) if not k.startswith("__")})
     fp.silu = make_silu_alone()
     ms.F = fp  # only modeling_smolvla's own F.silu (the action-time MLP) is redirected
-    print(f"patched {len(lins)} linears ({n_keep} kept FP32 as stored), {nv} vision MLPs, {nl} LM MLPs, {ne} expert MLPs",
+    nt = sum(lp.time_in for lp in lins.values())
+    print(f"patched {len(lins)} linears ({nt} time_in), {nv} vision MLPs, {nl} LM MLPs, {ne} expert MLPs",
           file=sys.stderr, flush=True)
 
 
 VARIANTS = {
     "F0": dict(linear="fp32", act="torch"),
-    "F2": dict(linear="fp32", act="torch_q"),
-    "F1_nsb9": dict(linear="fp32", act="kernel", nsb=9),
-    "F1_nsb10": dict(linear="fp32", act="kernel", nsb=10),
-    "I0": dict(linear="int16", act="torch_q"),
-    "I1_nsb9": dict(linear="int16", act="kernel", nsb=9),
-    "I1_nsb10": dict(linear="int16", act="kernel", nsb=10),
+    "F1": dict(linear="fp32", act="kernel"),
+    "C0": dict(linear="int16", act="torch"),
+    "C1": dict(linear="int16", act="kernel"),
+    "C1n10": dict(linear="int16", act="kernel", nsb=10),  # sensitivity: the 1024-segment table
 }
 
 
@@ -232,41 +232,53 @@ def run(policy, frame: dict) -> torch.Tensor:
         return policy.predict_action_chunk(copy.deepcopy(frame["batch"]), noise=frame["noise"].clone()).float()
 
 
+def check_cquant() -> None:
+    """cquant (torch) == contract.quant_rows (numpy) on edge rows: the rule this file applies everywhere."""
+    g = torch.Generator().manual_seed(3)
+    x = torch.randn(64, 960, generator=g) * torch.logspace(-35, 35, 64)[:, None]
+    x[0] = 0.0
+    x[1] = -0.0
+    x[2, :5] = torch.tensor([1e-40, -1e-38, 1e-31, 0.0, 2e-31])
+    x[2, 5:] = 0.0
+    q, s = cquant(x)
+    qc, sc = contract.quant_rows(x.numpy())
+    assert np.array_equal(q.numpy().astype(np.int16), qc) and np.array_equal(s[:, 0].numpy(), sc), "cquant != contract"
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--variants", default=",".join(VARIANTS))
+    ap.add_argument("--variants", default="F0,F1,C0,C1")
     ap.add_argument("--frames", default="0,1,2")
     ap.add_argument("--dump", type=Path, default=None)
-    ap.add_argument("--nsb", type=int, default=9, help="table size for --dump")
+    ap.add_argument("--nsb", type=int, default=9)
     ap.add_argument("--threads", type=int, default=8)
     a = ap.parse_args()
     torch.set_num_threads(a.threads)
+    check_cquant()
     from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 
     t0 = time.perf_counter()
     policy = SmolVLAPolicy.from_pretrained(str(CKPT)).to("cpu").eval().float()
-    install(policy, CKPT)
+    install(policy)
     print(f"loaded in {time.perf_counter() - t0:.1f} s", file=sys.stderr, flush=True)
     files = sorted(BATCHES.glob("frame_*.pt"))
     frames = [torch.load(files[int(i)], weights_only=False) for i in a.frames.split(",")]
 
     if a.dump:
-        sys.path.insert(0, str(HERE))
         from make_vectors import write_case
 
-        CFG.update(linear="fp32", act="kernel", nsb=a.nsb, dump=True)
+        CFG.update(linear="int16", act="kernel", nsb=a.nsb, dump=True)
         run(policy, frames[0])
         for kind, (x, u) in DUMP.items():
             write_case(a.dump / f"real_{kind}", {"gelu": 0, "silu1": 2}.get(kind, 1), x, u, a.nsb)
             print(f"dumped real_{kind}: {tuple(x.shape)}", file=sys.stderr)
-        CFG["dump"] = False
         return
 
     results = []
     chunks: dict = {}
     for vn in a.variants.split(","):
         v = VARIANTS[vn]
-        CFG.update(linear=v["linear"], act=v["act"], nsb=v.get("nsb", 9))
+        CFG.update(linear=v["linear"], act=v["act"], nsb=v.get("nsb", a.nsb), dump=False)
         for fr in frames:
             STATS.clear()
             t1 = time.perf_counter()
@@ -274,19 +286,18 @@ def main() -> None:
             dt = time.perf_counter() - t1
             ref = fr["ref_chunk_raw"].float()
             err = (ch - ref).abs()
-            chunks[(vn, int(fr["frame"]))] = ch
-            r = dict(variant=vn, frame=int(fr["frame"]), max_abs_err=float(err.max()), mean_abs_err=float(err.mean()),
+            fi = int(fr["frame"])
+            chunks[(vn, fi)] = ch
+            r = dict(variant=vn, frame=fi, max_abs_err=float(err.max()), mean_abs_err=float(err.mean()),
                      seconds=round(dt, 1))
-            for base in ("F2", "I0"):
-                if vn[0] == base[0] and (base, r["frame"]) in chunks and vn != base:
-                    r[f"max_vs_{base}"] = float((ch - chunks[(base, r["frame"])]).abs().max())
+            base = {"F1": "F0", "C1": "C0", "C1n10": "C0"}.get(vn)
+            if base and (base, fi) in chunks:
+                r[f"max_vs_{base}"] = float((ch - chunks[(base, fi)]).abs().max())
             if STATS:
                 r["kernel"] = {
                     k: dict(calls=s["calls"], K=s["K"], elems=s["elems"], rows_per_call=sorted(set(s["rows"])),
-                            q_err_lsb_max=round(s["lsb_max"], 4), q_err_lsb_rms=round((s["lsb_sq"] / s["n"]) ** 0.5, 4),
-                            y_err_lsb_max=round(s["kern_lsb_max"], 4),
-                            y_err_lsb_rms=round((s["kern_lsb_sq"] / s["n"]) ** 0.5, 5),
-                            amax_min=s["amax_min"], amax_max=s["amax_max"])
+                            q_err_steps_max=round(s["q_max"], 4), q_err_steps_rms=round((s["q_sq"] / s["n"]) ** 0.5, 4),
+                            y_err_steps_max=round(s["y_max"], 4), y_err_steps_rms=round((s["y_sq"] / s["n"]) ** 0.5, 5))
                     for k, s in STATS.items()
                 }
             print(json.dumps(r), flush=True)
@@ -295,7 +306,8 @@ def main() -> None:
     out = OUT / "policy_check.json"
     old = []
     if out.exists():
-        old = [r for r in json.loads(out.read_text()) if (r["variant"], r["frame"]) not in {(x["variant"], x["frame"]) for x in results}]
+        done = {(x["variant"], x["frame"]) for x in results}
+        old = [r for r in json.loads(out.read_text()) if (r["variant"], r["frame"]) not in done]
     out.write_text(json.dumps(old + results, indent=1))
     print("wrote", out, file=sys.stderr)
 

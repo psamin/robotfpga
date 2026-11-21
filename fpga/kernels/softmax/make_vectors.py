@@ -1,256 +1,272 @@
-"""Test cases for tb_softmax.cpp: whole DDR images (one SOFTMAX record + scores + rank tables + output regions full
-of 0xA5 canaries) and the image the kernel must leave behind, computed with the bit-exact torch emulation
-(smx_emu.py). Also prints each case's error against FP64 softmax.
+"""Test cases for tb_softmax.cpp (integration contract 1.0): whole DDR images holding one 256-byte SOFTMAX
+record
+(contract.encode), the scores, the rank vectors and output regions full of 0xA5 canaries, and the image the
+unit
+must leave behind, from the golden executor smx_emu.run_cmd. Also prints each case's error against FP64
+softmax,
+and checks the emulation's closed forms against the pre-contract formulas.
 
-    python make_vectors.py [--out DIR] [--real scores.pt]
+    python make_vectors.py [--out DIR] [--real scores.pt] [--quick]
 
-Each case directory holds params.txt ("rec_word total_words status_fp32build status_u16build"), mem.bin and
-expect.bin (little-endian 128-bit words). Layouts and the record: README.md.
+Each case directory holds params.txt ("<base hex> <record byte offset> <bytes> <expected return hex>
+<direct>"),
+mem.bin and expect.bin. The expected return of softmax_top: 0 when the record runs; (ME << 16) | 0x13 when
+validate_hw (contract.validate(full=False)) rejects it; an ST_BAD_* code when it does not decode.
 """
 
 from __future__ import annotations
 
 import argparse
-import math
 import struct
+import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 
-import smx_emu as E
-
 HERE = Path(__file__).resolve().parent
-F_QOUT, F_MASK, F_ENGINE, F_EMPTY_UNIFORM = 0x0002, 0x0100, 0x1000, 0x2000
-ST_OK, ST_DIMS, ST_ALIGN, ST_OPCODE = 0, 1, 2, 3
-L_MAX, R_MAX = 256, 256
-CANARY = 0xA5A5A5A5
+sys.path.insert(0, str(HERE.parent))
+import contract as CT  # noqa: E402
+import smx_emu as E  # noqa: E402
 
-
-def f32u(x) -> int:
-    return struct.unpack("<I", struct.pack("<f", float(x)))[0]
-
-
-def pad(n, m):
-    return (n + m - 1) // m * m
+C = CT.C
+CANARY = 0xA5
+LOG2E = E.LOG2E
 
 
 class Image:
-    """Word-addressed DDR image; word 0..7 hold the record."""
+    """Byte image at physical address `base`; the record sits at offset 0."""
 
-    def __init__(self):
-        self.n = 8
-        self.puts = []
+    def __init__(self, base: int = 0):
+        self.base = base
+        self.n = C.REC_BYTES
+        self.puts: list[tuple[int, bytes]] = []
 
-    def alloc(self, words, align=4):
-        off = pad(self.n, align)
-        self.n = off + max(int(words), 0)
-        return off
+    def alloc(self, nbytes: int, align: int = 64) -> int:
+        off = -(-self.n // align) * align
+        self.n = off + max(int(nbytes), 0)
+        return self.base + off
 
-    def put(self, off, u32):
-        self.puts.append((off, np.asarray(u32, dtype=np.uint32).reshape(-1)))
+    def put(self, addr: int, data) -> None:
+        self.puts.append((addr - self.base, bytes(np.ascontiguousarray(data).view(np.uint8).reshape(-1))))
 
-    def build(self):
-        mem = np.full(pad(self.n, 4) * 4 + 64, CANARY, dtype=np.uint32)
-        for off, a in self.puts:
-            mem[4 * off : 4 * off + a.size] = a
+    def build(self) -> np.ndarray:
+        mem = np.full(-(-self.n // 64) * 64 + 64, CANARY, dtype=np.uint8)
+        for off, b in self.puts:
+            mem[off : off + len(b)] = np.frombuffer(b, np.uint8)
         return mem
 
 
-def record(flags, L, N, B, p0, slots, opcode=0x40):
-    """32 uint32 fields; slots: dict name -> (byte addr, pitch bytes, stride bytes)."""
-    f = [0] * 32
-    f[0] = (opcode & 0xFF) | (0xC5 << 8) | (flags << 16)
-    f[1] = 0x5F7A0001
-    f[3], f[4], f[5] = L, N, B
-    for s, name in enumerate("ABCDEF"):
-        a, p, st = slots.get(name, (0, 0, 0))
-        f[6 + 3 * s] = a & 0xFFFFFFFF
-        f[7 + 3 * s] = ((a >> 32) & 0xFF) | (p << 8)
-        f[8 + 3 * s] = st
-    f[24] = f32u(p0)
-    x = 0x5EC0C5ED
-    for v in f[:31]:
-        x ^= v
-    f[31] = x
-    return np.array(f, dtype=np.uint32)
+def expect_code(c: CT.Cmd) -> int:
+    me = CT.validate(c, full=False)
+    return (me << 16) | C.ST_MODE_ERROR if me else C.ST_END
 
 
-def words_of_rows(a: np.ndarray, lanes: int) -> np.ndarray:
-    """(R, n) values of 32 / lanes bits -> uint32 array of whole 128-bit words per row (row-major)."""
-    return np.ascontiguousarray(a).view(np.uint32).reshape(-1)
-
-
-def write_case(out: Path, name, x, p0, *, engine=False, qout=True, ranks=None, empty="zero", a_pitch=None,
-               c_pitch=None, item_gap=0, misalign=False, opcode=0x40, L_rec=None, N_rec=None, seed=0,
-               emulate=True):
-    """x (B, N, L) float32 scores; ranks None or (E (Be, L), D (Bd, N)) int with Be, Bd in {1, B}."""
-    g = torch.Generator().manual_seed(seed)
-    B, N, L = x.shape
-    L4 = (L + 3) // 4
-    flags = (F_QOUT if qout else 0) | (F_MASK if ranks is not None else 0) | (F_ENGINE if engine else 0) | (
-        F_EMPTY_UNIFORM if empty == "uniform" else 0)
-    img = Image()
-    c = E.c_from_mult(p0)
-    # ---- scores
-    if engine:
-        Np, Mk = pad(N, 32), pad(L, 32)
-        G = Mk // 32
-        aw = G * Np * 8
-        a_stride = aw + item_gap
-        a_off = img.alloc(B * a_stride)
-        for b in range(B):
-            y = torch.randn(Np, Mk, generator=g) * 50.0  # padding keys / rows: finite garbage
-            y[:N, :L] = x[b]
-            yt = y.numpy().astype(np.float32).reshape(Np, G, 32).transpose(1, 0, 2)  # [g][n][32]
-            img.put(a_off + b * a_stride, np.ascontiguousarray(yt).view(np.uint32))
-        a_pitch_b = 0
-    else:
-        a_pitch = a_pitch or L4
-        a_stride = N * a_pitch + item_gap
-        a_off = img.alloc(B * a_stride)
-        for b in range(B):
-            y = torch.randn(N, a_pitch * 4, generator=g) * 1e3
-            y[:, :L] = x[b]
-            img.put(a_off + b * a_stride, y.numpy().astype(np.float32).view(np.uint32))
-        a_pitch_b = a_pitch * 16
-    # ---- rank tables
-    slots = {"A": (a_off * 16 + (8 if misalign else 0), a_pitch_b, a_stride * 16)}
-    if ranks is not None:
-        Ek, Dn = ranks
-        Ek, Dn = torch.as_tensor(Ek).to(torch.int64), torch.as_tensor(Dn).to(torch.int64)
-        e_st = pad(L, 4) // 4 if Ek.shape[0] > 1 else 0
-        d_st = pad(N, 4) // 4 if Dn.shape[0] > 1 else 0
-        e_off = img.alloc(max(Ek.shape[0], 1) * (pad(L, 4) // 4))
-        d_off = img.alloc(max(Dn.shape[0], 1) * (pad(N, 4) // 4))
-        for i in range(Ek.shape[0]):
-            v = np.zeros(pad(L, 4), np.int64)
-            v[:L] = Ek[i].numpy()
-            img.put(e_off + i * e_st, (v & 0xFFFFFFFF).astype(np.uint32))
-        for i in range(Dn.shape[0]):
-            v = np.zeros(pad(N, 4), np.int64)
-            v[:N] = Dn[i].numpy()
-            img.put(d_off + i * d_st, (v & 0xFFFFFFFF).astype(np.uint32))
-        slots["D"] = (d_off * 16, 0, d_st * 16)
-        slots["E"] = (e_off * 16, 0, e_st * 16)
-    # ---- outputs
-    if engine:
-        Np = pad(N, 32)
-        cw = Np * L // 8  # X: [Np/32][L][4 words]
-        c_stride = cw + item_gap
-        c_off = img.alloc(B * c_stride)
-        f_stride = Np // 4
-        f_off = img.alloc(B * f_stride)
-        slots["C"] = (c_off * 16, 0, c_stride * 16)
-        slots["F"] = (f_off * 16, 0, f_stride * 16)
-    else:
-        c_pitch = c_pitch or ((L + 7) // 8 if qout else L4)
-        c_stride = N * c_pitch + item_gap
-        c_off = img.alloc(B * c_stride)
-        f_stride = (N + 3) // 4
-        f_off = img.alloc(B * f_stride) if qout else 0
-        slots["C"] = (c_off * 16, c_pitch * 16, c_stride * 16)
-        if qout:
-            slots["F"] = (f_off * 16, 0, f_stride * 16)
-    rec = record(flags, L if L_rec is None else L_rec, N if N_rec is None else N_rec, B, p0, slots, opcode)
-    img.put(0, rec)
+def write_case(
+    out: Path,
+    name: str,
+    img: Image,
+    c: CT.Cmd,
+    *,
+    direct=False,
+    raw_rec: bytes | None = None,
+    want: int | None = None,
+):
+    rec = raw_rec if raw_rec is not None else CT.encode(c)
+    img.put(img.base, np.frombuffer(rec, np.uint8))
     mem = img.build()
     exp = mem.copy()
-    # ---- expected results (emulation) and errors vs FP64
-    errs = [torch.zeros(1)]
-    for b in range(B if emulate else 0):
-        if ranks is not None:
-            Ek, Dn = ranks
-            valid = E.rank_valid(torch.as_tensor(Ek[b if Ek.shape[0] > 1 else 0]),
-                                 torch.as_tensor(Dn[b if Dn.shape[0] > 1 else 0]))
-        else:
-            valid = torch.ones(N, L, dtype=torch.bool)
-        xb = x[b].float()
-        if qout:
-            q, s = E.kernel(xb, c, valid, empty=empty)
-            p_hat = q.double() * s.double()
-        else:
-            p = E.kernel(xb, c, valid, fp32_out=True, empty=empty)
-            p_hat = p.double()
-        if engine:
-            Np = pad(N, 32)
-            xi = np.zeros((Np, L), np.uint16)
-            xi[:N] = q.numpy().astype(np.uint16)
-            xi = np.ascontiguousarray(xi.reshape(Np // 32, 32, L).transpose(0, 2, 1))  # [b][k][32 rows]
-            o = c_off + b * c_stride
-            exp[4 * o : 4 * o + xi.size // 2] = xi.reshape(-1).view(np.uint32)
-            st = np.zeros(Np, np.float32)
-            st[:N] = s[:, 0].numpy()
-            o = f_off + b * f_stride
-            exp[4 * o : 4 * o + Np] = st.view(np.uint32)
-        else:
-            o = c_off + b * c_stride
-            if qout:
-                rows = np.zeros((N, c_pitch * 8), np.uint16)
-                rows[:, :L] = q.numpy().astype(np.uint16)
-            else:
-                rows = np.zeros((N, c_pitch * 4), np.float32)
-                rows[:, :L] = p.numpy()
-            exp[4 * o : 4 * o + N * c_pitch * 4] = rows.view(np.uint32).reshape(-1)
-            if qout:
-                st = np.zeros(f_stride * 4, np.float32)
-                st[:N] = s[:, 0].numpy()
-                o = f_off + b * f_stride
-                exp[4 * o : 4 * o + f_stride * 4] = st.view(np.uint32)
-        # FP64 torch softmax with the same mask and empty-row rule
-        temp = c / E.LOG2E
-        xs = torch.where(valid, xb.double() * temp, torch.full_like(xb.double(), -1e300))
-        ref = torch.softmax(xs, -1)
-        if empty == "zero":
-            ref = torch.where(valid.any(-1, keepdim=True), ref, torch.zeros_like(ref))
-        errs.append((p_hat - ref).abs())
-    err = torch.cat([e.reshape(-1) for e in errs])
+    if want is None:
+        want = expect_code(c)
+    if want == C.ST_END:
+        assert CT.validate(c, full=True) == C.ME_OK, name
+        E.run_cmd(c, exp, img.base)
     d = out / name
     d.mkdir(parents=True, exist_ok=True)
     (d / "mem.bin").write_bytes(mem.tobytes())
     (d / "expect.bin").write_bytes(exp.tobytes())
-    return d, mem, err
+    (d / "params.txt").write_text(f"{img.base:x} 0 {mem.size} {want:x} {int(direct)}\n")
+    return mem, exp
 
 
-def finish(d: Path, mem, st_fp1, st_fp0):
-    (d / "params.txt").write_text(f"0 {mem.size // 4} {st_fp1} {st_fp0}\n")
-
-
-def case(out, res, name, x, p0, st_fp1=ST_OK, st_fp0=None, **kw):
-    d, mem, err = write_case(out, name, x, p0, emulate=st_fp1 == ST_OK, **kw)
-    if st_fp0 is None:
-        st_fp0 = st_fp1 if kw.get("qout", True) else ST_DIMS  # FP32 output needs SMX_FP32_OUT=1
-    finish(d, mem, st_fp1, st_fp0)
-    if st_fp1 == ST_OK:
-        ref_max = 1.0
-        print(f"{name:26s} B {x.shape[0]:2d} N {x.shape[1]:4d} L {x.shape[2]:4d}: max|p-p64| {float(err.max()):.3e}"
-              f"  mean {float(err.mean()):.2e}")
-        res.append(dict(case=name, max_abs=float(err.max()), mean_abs=float(err.mean())))
+def smx_case(
+    out,
+    res,
+    name,
+    x,
+    *,
+    p0=1.0,
+    ranks=None,
+    np_=0,
+    a_pad=0,
+    c_pad=0,
+    gap=0,
+    base=0,
+    direct=False,
+    share_ranks=True,
+    mutate=None,
+    raw=None,
+    want=None,
+    flags=None,
+    f_pad=0,
+):
+    """x (B, N, L) float32 scores. ranks None or (E (Be, L), D (Bd, N)) int with Be, Bd in {1, B}
+    (1 = one vector shared by every item: stride 0). a_pad / c_pad: extra bytes of row pitch; gap: bytes
+    between items. mutate(cmd) edits the record before encoding (error cases)."""
+    B, N, L = x.shape
+    NP = np_ or N
+    img = Image(base)
+    g = torch.Generator().manual_seed(len(name))
+    a_pitch = 4 * L + a_pad
+    a_stride = N * a_pitch + gap
+    A = img.alloc(B * a_stride)
+    for b in range(B):
+        y = (
+            torch.randn(N, a_pitch // 4, generator=g) * 1e3
+        )  # pitch padding: finite garbage, never read as data
+        y[:, :L] = x[b]
+        img.put(A + b * a_stride, y.numpy().astype(np.float32))
+    c_pitch = 2 * L + c_pad
+    c_stride = NP * c_pitch + gap
+    Cb = img.alloc(B * c_stride)
+    f_stride = 4 * CT.pad4(NP) + f_pad
+    Fb = img.alloc(B * f_stride)
+    s = {
+        "A": CT.Slot(A, a_pitch, a_stride),
+        "C": CT.Slot(Cb, c_pitch, c_stride),
+        "F": CT.Slot(Fb, 0, f_stride),
+    }
+    fl = C.F_QOUT if flags is None else flags
+    if ranks is not None:
+        fl |= C.F_MASK
+        Ek, Dn = (torch.as_tensor(r).to(torch.int64) for r in ranks)
+        e_st = 0 if Ek.shape[0] == 1 else 4 * L + 16
+        d_st = 0 if Dn.shape[0] == 1 else 4 * CT.pad4(N) + 32
+        Ea = img.alloc(max(1, Ek.shape[0]) * (e_st or 4 * L))
+        Da = img.alloc(max(1, Dn.shape[0]) * (d_st or 4 * CT.pad4(N)))
+        for i in range(Ek.shape[0]):
+            img.put(Ea + i * e_st, Ek[i].numpy().astype(np.int64).astype(np.int32))
+        for i in range(Dn.shape[0]):
+            v = np.full(CT.pad4(N), -1, np.int32)  # pad lanes: never read
+            v[:N] = Dn[i].numpy().astype(np.int64).astype(np.int32)
+            img.put(Da + i * d_st, v)
+        s["D"], s["E"] = CT.Slot(Da, 0, d_st), CT.Slot(Ea, 0, e_st)
+    p = {C.P_EPS: CT.f32bits(p0)}
+    if np_:
+        p[C.P_NP] = np_
+    c = CT.Cmd(C.OP_SOFTMAX, fl, 0x5F7A0001, 0, L, N, B, s, p)
+    if mutate:
+        mutate(c)
+    mem, exp = write_case(out, name, img, c, direct=direct, raw_rec=raw, want=want)
+    code = int((out / name / "params.txt").read_text().split()[3], 16)
+    if code == C.ST_END:
+        err = fp64_error(c, exp, img.base, x, ranks)
+        res.append(dict(case=name, max_abs=err))
+        print(f"{name:26s} B {B:2d} N {N:4d} NP {NP:4d} L {L:3d}: max|P-P64| {err:.3e}")
     else:
-        print(f"{name:26s} expect status {st_fp1} / {st_fp0}")
+        print(f"{name:26s} expect return 0x{code:05x}")
 
 
-def prefix_ranks(n_img=32, n_lang=48, n_real=17, n_state=1, pad_keys=0):
-    """SmolVLA prefix: images + language (padded) bidirectional (block 0), state in block 1; pad tokens never
-    visible and their rows fully masked. Keys padded with pad_keys never-visible keys."""
-    L = n_img + n_lang + n_state
-    blk = torch.zeros(L, dtype=torch.long)
-    blk[n_img + n_lang :] = 1
-    padm = torch.ones(L, dtype=torch.bool)
-    padm[n_img + n_real : n_img + n_lang] = False
-    Ek = torch.where(padm, blk, torch.full_like(blk, -1))
-    Dn = torch.where(padm, blk, torch.full_like(blk, -1))
-    if pad_keys:
-        Ek = torch.cat([Ek, torch.full((pad_keys,), -1, dtype=torch.long)])
-    return Ek[None], Dn[None]
+def fp64_error(c, exp, base, x, ranks) -> float:
+    """max |q * scale - softmax64| over the items (fully masked rows: zero on both sides)."""
+    B, N, L = x.shape
+    Cs, F = c.slot("C"), c.slot("F")
+    cv = E.c_from_mult(CT.bits_f32(c.par(C.P_EPS)))
+    worst = 0.0
+    for b in range(B):
+        q = (
+            E._rows(exp, base, Cs.addr + b * Cs.stride, Cs.pitch, N, 2 * L)
+            .copy()
+            .view(np.int16)
+            .reshape(N, L)
+        )
+        o = F.addr + b * F.stride - base
+        sc = exp[o : o + 4 * N].copy().view(np.float32)
+        p = q.astype(np.float64) * sc[:, None].astype(np.float64)
+        if ranks is not None:
+            Ek, Dn = ranks
+            v = E.rank_valid(
+                torch.as_tensor(Ek[b if Ek.shape[0] > 1 else 0]),
+                torch.as_tensor(Dn[b if Dn.shape[0] > 1 else 0]),
+            ).numpy()
+        else:
+            v = np.ones((N, L), bool)
+        xs = np.where(v, x[b].double().numpy() * (cv / LOG2E), -np.inf)
+        with np.errstate(invalid="ignore", over="ignore"):
+            mx = xs.max(-1, keepdims=True)
+            ex = np.where(v, np.exp(xs - np.where(np.isfinite(mx), mx, 0)), 0.0)
+            ref = ex / np.maximum(ex.sum(-1, keepdims=True), 1e-300)
+        # rows with inf / NaN have no FP64 reference; rows with |x c| >= 2^25 are in fix()'s documented
+        # saturation range (|x 2^ec| >= 2^26 compares as equal): both are reported apart, not in this number
+        xa = np.abs(x[b].numpy().astype(np.float64))
+        ok = np.isfinite(xa).all(-1) & (xa.max(-1, initial=0.0) * cv < 2.0**25)
+        worst = max(worst, float(np.abs(p - ref)[ok].max(initial=0.0)))
+    return worst
 
 
-def expert_self_ranks(n_pre=81, n_real=17, n_act=50):
-    """Suffix queries over prefix + suffix keys: prefix (pads never) fully visible, actions causal."""
-    Ekp, _ = prefix_ranks(n_real=n_real)
-    Ek = torch.cat([torch.where(Ekp[0] < 0, -1, 0), torch.arange(1, n_act + 1)])
-    Dn = torch.arange(1, n_act + 1)
-    return Ek[None], Dn[None]
+# ---------------------------------------------------------------- SmolVLA rank vectors (CONTRACT.md 5)
+PRE, TQP_LM, TQ_E, TQP_E, LP, LS = 45, 48, 50, 52, 64, 128
+
+
+def prefix_ranks():
+    """LM prefix: 45 tokens (2 x 16 image, 12 language: rank 0; state: rank 1), rows 3 heads x 48 (pad rows
+    -1),
+    keys 64 (pad keys -1)."""
+    tok = torch.full((TQP_LM,), -1)
+    tok[: PRE - 1] = 0
+    tok[PRE - 1] = 1
+    Ek = torch.full((LP,), -1)
+    Ek[:PRE] = tok[:PRE]
+    return Ek[None], tok.repeat(3)[None]
+
+
+def expert_self_ranks():
+    """Expert self-attention: rows 3 heads x 52 (i < 50: rank 2 + i); keys: prefix [0, 64) (0 / state 1 / pad
+    -1),
+    suffix [64, 128): key j < 50 rank 2 + j, pad -1."""
+    Ek = torch.full((LS,), -1)
+    Ek[: PRE - 1] = 0
+    Ek[PRE - 1] = 1
+    Ek[LP : LP + TQ_E] = 2 + torch.arange(TQ_E)
+    row = torch.full((TQP_E,), -1)
+    row[:TQ_E] = 2 + torch.arange(TQ_E)
+    return Ek[None], row.repeat(3)[None]
+
+
+def expert_cross_ranks():
+    Ek = torch.full((LP,), -1)
+    Ek[:PRE] = 0
+    row = torch.full((TQP_E,), -1)
+    row[:TQ_E] = 0
+    return Ek[None], row.repeat(3)[None]
+
+
+def self_checks() -> None:
+    """The emulation's closed forms against the pre-contract kernel's formulas and the IEEE reference."""
+    g = torch.Generator().manual_seed(7)
+    e23 = torch.randint(0, 1 << 23, (1 << 20,), generator=g)
+    ip = torch.randint(0, 32, (1 << 20,), generator=g)
+    old = torch.where(ip >= 24, torch.zeros_like(e23), (((e23 << 1) >> ip.clamp(max=24)) + 1) >> 1)
+    old = (old + 128) >> 8
+    new = torch.where(ip >= 17, torch.zeros_like(e23), (((e23 << 1) >> ip.clamp(max=17)) + 257) >> 9)
+    assert torch.equal(old, new), "q closed form"
+    from fractions import Fraction
+
+    s = torch.cat([torch.randint(1, 1 << 23, (4000,), generator=g), torch.tensor([1, 2, 3, 32767, 8388352])])
+    r = E.rn_recip(s)
+    for sv, rv in zip(
+        s.tolist(), r.tolist(), strict=True
+    ):  # exactly the nearest FP32 (ties to even) of 1 / s
+        f = np.float32(rv)
+        lo, hi = np.nextafter(f, np.float32(0)), np.nextafter(f, np.float32(1))
+        ex = Fraction(1, sv)
+        dist = abs(Fraction(float(f)) - ex)
+        assert dist <= abs(Fraction(float(lo)) - ex) and dist <= abs(Fraction(float(hi)) - ex), (
+            "rn_recip",
+            sv,
+        )
+    assert float(E.rn_recip(torch.tensor([0]))[0]) == 1.0, "zero row scale"
+    print(f"self checks: q closed form on {e23.numel()} values, rn_recip exact on {s.numel()} sums: PASS")
 
 
 def main():
@@ -259,36 +275,58 @@ def main():
     ap.add_argument("--real", default=str(HERE / "build/real_scores.pt"))
     a = ap.parse_args()
     out = Path(a.out)
+    self_checks()
     g = torch.Generator().manual_seed(1)
     res = []
-    T8 = 0.125
-    # ---------------- rows layout (sequencer contract)
-    x = torch.randn(2, 64, 256, generator=g) * 12.0
-    case(out, res, "rows_vision_u16", x, T8)
-    case(out, res, "rows_vision_f32", x, T8, qout=False)
-    case(out, res, "rows_vision_pitch_u16", x, T8, a_pitch=72, c_pitch=40, item_gap=12)
-    Ek, Dn = prefix_ranks(pad_keys=15)  # 81 rows, 96 keys (15 padding keys never visible)
-    x = torch.randn(3, 81, 96, generator=g) * 20.0
-    case(out, res, "rows_prefix_mask_u16", x, T8, ranks=(Ek, Dn))
-    case(out, res, "rows_prefix_uniform_u16", x, T8, ranks=(Ek, Dn), empty="uniform")
-    case(out, res, "rows_prefix_mask_f32", x, T8, ranks=(Ek, Dn), qout=False)
-    Ek, Dn = expert_self_ranks()
-    x = torch.randn(2, 50, 131, generator=g) * 15.0
-    case(out, res, "rows_expert_self_u16", x, T8, ranks=(Ek, Dn))
-    # per-item masks (non-zero E / D strides): valid length per row + causal, different per item
-    B, N, L = 3, 40, 64
-    Ek = torch.arange(L)[None].repeat(B, 1)
-    Dn = torch.stack([torch.arange(N) + off for off in (0, -5, 30)])
+    rn = lambda *s, k=1.0: torch.randn(*s, generator=g) * k  # noqa: E731
+    # ---------------- the four SOFTMAX shapes of the -12392 chunk (contract_plan.py), p0 = 1 (Q carries 1/8)
+    smx_case(out, res, "plan_vision", rn(24, 256, 256, k=1.5))
+    smx_case(out, res, "plan_lm_prefix", rn(5, 144, 64, k=2.5), ranks=prefix_ranks())
+    smx_case(out, res, "plan_expert_self", rn(5, 156, 128, k=2.0), ranks=expert_self_ranks())
+    smx_case(out, res, "plan_expert_cross", rn(5, 156, 64, k=2.0), ranks=expert_cross_ranks())
+    # the same scores with p0 = 1/8 on 8x larger scores: the same bits (1/8 is exact)
+    x = rn(2, 64, 256, k=12.0)
+    smx_case(out, res, "p0_eighth", x, p0=0.125)
+    smx_case(out, res, "p0_one_prescaled", x * 0.125)
+    # ---------------- addressing: pitches, gaps, per-item ranks, blocks, NP, high addresses
+    Ek = torch.arange(64)[None].repeat(3, 1)
+    Dn = torch.stack([torch.arange(40) + off for off in (0, -5, 30)])
     Dn[1, :3] = -1
-    x = torch.randn(B, N, L, generator=g) * 4.0
-    case(out, res, "rows_causal_items_u16", x, 1.0, ranks=(Ek, Dn))
-    case(out, res, "rows_causal_items_unif", x, 1.0, ranks=(Ek, Dn), empty="uniform")
-    # clamps: E >= 0x7FFF never visible, D > 0x7FFE clamped
-    Ek = torch.tensor([[0, 5, 40000, 0x7FFE, -7, 3, 2, 1]])
-    Dn = torch.tensor([[40000, 5, 4, 0, -1, 0x7FFF, 2, 3, 1 << 30]])
-    case(out, res, "rows_rank_clamp_u16", torch.randn(1, 9, 8, generator=g), 1.0, ranks=(Ek, Dn))
-    # edge values
-    x = torch.randn(1, 64, 40, generator=g)
+    xi = rn(3, 40, 64, k=4.0)
+    smx_case(out, res, "items_ranks_strided", xi, ranks=(Ek, Dn), a_pad=48, c_pad=32, gap=80, f_pad=16)
+    smx_case(out, res, "pitch_a_only", rn(2, 30, 96, k=3.0), a_pad=16)
+    smx_case(out, res, "pitch_c_only", rn(2, 30, 96, k=3.0), c_pad=16)
+    smx_case(out, res, "blocks_300", rn(2, 300, 64, k=5.0))
+    Ek = torch.arange(32)[None]
+    Dn = (torch.arange(300) % 40 - 4)[None]
+    smx_case(out, res, "blocks_300_mask_np", rn(2, 300, 32, k=5.0), ranks=(Ek, Dn), np_=307)
+    smx_case(out, res, "blocks_513_pitch", rn(1, 513, 16, k=5.0), a_pad=32, c_pad=16, np_=515)
+    smx_case(out, res, "np_pad", rn(3, 5, 8, k=2.0), np_=11)
+    smx_case(out, res, "n1", rn(1, 1, 8))
+    smx_case(out, res, "short_rows_l8", rn(2, 90, 8, k=3.0))  # divider-paced (2 words per row)
+    smx_case(out, res, "short_rows_l24", rn(2, 70, 24, k=3.0))
+    smx_case(out, res, "high_32g", rn(5, 144, 64, k=2.5), ranks=prefix_ranks(), base=0x8_0000_0000)
+    smx_case(
+        out,
+        res,
+        "high_1t",
+        rn(5, 156, 64, k=2.0),
+        ranks=expert_cross_ranks(),
+        base=0xFF_0000_0000,
+        direct=True,
+    )
+    # ---------------- ranks: int32 semantics (values beyond 16 bits, negatives, fully masked rows)
+    Ek = torch.tensor(
+        [[0, 5, 40000, 0x7FFE, -7, 3, 2, 1, 0x7FFFFFFF, 70000, -(2**31), 65536, 65535, 9, 1 << 20, 0]]
+    )
+    Dn = torch.tensor(
+        [[40000, 5, 4, 0, -1, 0x7FFF, 2, 3, 1 << 30, 0x7FFFFFFF, -(2**31), 65535, 69999, 70000]]
+    )
+    smx_case(out, res, "ranks_int32", rn(1, 14, 16), ranks=(Ek, Dn))
+    Dn = torch.full((1, 9), -1)
+    smx_case(out, res, "all_rows_masked", rn(2, 9, 16), ranks=(torch.zeros(1, 16), Dn), np_=10)
+    # ---------------- edge values and multipliers
+    x = rn(1, 64, 40)
     x[0, 0] = 1e4
     x[0, 1, :] = torch.tensor([3.0e4, -3.0e4] * 20)
     x[0, 2, :] = 1e-30
@@ -298,63 +336,99 @@ def main():
     x[0, 5, :] = torch.linspace(-1e3, 1e3, 40)
     x[0, 6, :] = -1e30
     x[0, 7, :] = torch.tensor([5.0, 5.0, -5.0, 5.0] * 10)
-    case(out, res, "rows_edge_u16", x, 1.0 / E.LOG2E)
-    case(out, res, "rows_edge_f32", x, 1.0 / E.LOG2E, qout=False)
-    case(out, res, "rows_edge_bigc_u16", x[:, :, :37], 26.0)
-    case(out, res, "rows_edge_smallc_u16", x[:, :, :37] * 1e3, 2.0e-4)
-    case(out, res, "rows_one_u16", torch.randn(1, 9, 1, generator=g), 1.0)
-    case(out, res, "rows_five_f32", torch.randn(2, 9, 5, generator=g), 1.0, qout=False)
-    x = torch.randn(1, 300, 256, generator=g) * 30  # two scale blocks of 256 rows
-    case(out, res, "rows_lmax_300_u16", x, T8)
-    case(out, res, "rows_lmax_f32", x[:, :6] * 0.01, T8, qout=False)  # FP32 sums > 2^24
-    case(out, res, "rows_short_u16", torch.randn(2, 90, 9, generator=g), 1.0)  # divider-paced rows
-    # ---------------- engine layout (int16_linear.h Y in, X + s_tok out)
-    x = torch.randn(2, 256, 256, generator=g) * 12.0
-    case(out, res, "eng_vision_u16", x, T8, engine=True)
-    Ek, Dn = prefix_ranks()
-    Dn3 = Dn.repeat(1, 3)  # 3 query heads stacked per KV head: row t = h * 81 + i
-    x = torch.randn(2, 243, 81, generator=g) * 20.0
-    case(out, res, "eng_prefix_mask_u16", x, T8, engine=True, ranks=(Ek, Dn3), item_gap=20)
-    case(out, res, "eng_prefix_uniform_u16", x, T8, engine=True, ranks=(Ek, Dn3), empty="uniform")
-    Ek, Dn = expert_self_ranks()
-    x = torch.randn(2, 150, 131, generator=g) * 15.0
-    case(out, res, "eng_expert_self_u16", x, T8, engine=True, ranks=(Ek, Dn.repeat(1, 3)))
-    case(out, res, "eng_small_u16", torch.randn(3, 5, 7, generator=g) * 3, 1.0, engine=True)
-    case(out, res, "eng_lmax_u16", torch.randn(1, 256, 256, generator=g) * 30, T8, engine=True)
-    # ---------------- errors (nothing written)
-    x = torch.randn(1, 8, 16, generator=g)
-    case(out, res, "err_opcode", x, 1.0, opcode=0x41, st_fp1=ST_OPCODE)
-    case(out, res, "err_align", x, 1.0, misalign=True, st_fp1=ST_ALIGN)
-    case(out, res, "err_L0", x, 1.0, L_rec=0, st_fp1=ST_DIMS)
-    case(out, res, "err_Lbig", x, 1.0, L_rec=L_MAX + 1, st_fp1=ST_DIMS)
-    case(out, res, "err_pitch", x, 1.0, L_rec=24, st_fp1=ST_DIMS)  # a_pitch 4 words < ceil(24 / 4)
-    case(out, res, "err_cneg", x, -1.0, st_fp1=ST_DIMS)
-    case(out, res, "err_eng_rows", torch.randn(1, 257, 8, generator=g), 1.0, engine=True, st_fp1=ST_DIMS)
-    case(out, res, "err_eng_f32", x, 1.0, engine=True, qout=False, st_fp1=ST_DIMS, st_fp0=ST_DIMS)
-    Ek, Dn = torch.zeros(1, 8, dtype=torch.long), torch.zeros(1, 300, dtype=torch.long)
-    case(out, res, "err_mask_rows", torch.randn(1, 300, 8, generator=g), 1.0, ranks=(Ek, Dn), st_fp1=ST_DIMS)
-    # ---------------- real score rows of -12392 (policy_check.py --dump-scores), both layouts
+    x[0, 8, :] = 3.4e38
+    x[0, 9, :] = -3.4e38
+    x[0, 10, 3] = float("inf")
+    x[0, 11, 5] = float("-inf")
+    x[0, 12, 7] = float("nan")
+    x[0, 13, :] = float("-inf")
+    x[0, 14, :] = torch.tensor([6e8, 5.9e8] * 20)
+    x[0, 15, 0] = -float("nan")
+    smx_case(out, res, "edge_c1", x, p0=1.0 / LOG2E)
+    smx_case(out, res, "edge_c26", x[:, :, :32], p0=26.0)
+    smx_case(out, res, "edge_c2e-4", x[:, :, :32] * 1e3, p0=2.0e-4)
+    smx_case(out, res, "edge_p0_denormal", x[:, :, :32], p0=1e-39)
+    smx_case(out, res, "edge_p0_tiny_normal", x[:, :, :32] * 1e30, p0=1.2e-38)
+    smx_case(out, res, "edge_p0_1e29", rn(1, 16, 32) * 1e-30, p0=9.9e29)
+    smx_case(out, res, "lmax_x30", rn(1, 64, 256, k=30.0), p0=0.125)
+    # ---------------- records validate_hw rejects (nothing may be written)
+    xe = rn(1, 8, 16)
+
+    def mut(**kw):
+        def f(c):
+            for k, v in kw.items():
+                setattr(c, k, v)
+
+        return f
+
+    def mut_p(i, v):
+        def f(c):
+            c.p[i] = v
+
+        return f
+
+    def mut_slot(n, s):
+        def f(c):
+            c.s[n] = s
+
+        return f
+
+    smx_case(out, res, "err_k0", xe, mutate=mut(K=0))
+    smx_case(out, res, "err_k264", xe, mutate=mut(K=264))
+    smx_case(out, res, "err_k12", xe, mutate=mut(K=12))
+    smx_case(out, res, "err_n0", xe, mutate=mut(N=0))
+    smx_case(out, res, "err_no_qout", xe, flags=0)
+    smx_case(out, res, "err_f_engine", xe, flags=C.F_QOUT | 0x1000)
+    smx_case(out, res, "err_f_uniform", xe, flags=C.F_QOUT | 0x2000)
+    smx_case(out, res, "err_p0_zero", xe, mutate=mut_p(C.P_EPS, 0))
+    smx_case(out, res, "err_p0_neg", xe, mutate=mut_p(C.P_EPS, CT.f32bits(-1.0)))
+    smx_case(out, res, "err_p0_nan", xe, mutate=mut_p(C.P_EPS, 0x7FC00000))
+    smx_case(out, res, "err_np_lt_n", xe, mutate=mut_p(C.P_NP, 4))
+    smx_case(out, res, "err_param", xe, mutate=mut_p(3, 1))
+    smx_case(out, res, "err_slot_b", xe, mutate=mut_slot("B", CT.Slot(0x1000, 0, 0)))
+    smx_case(out, res, "err_misaligned", xe, mutate=lambda c: c.s.__setitem__("A", c.s["A"] + 8))
+    smx_case(out, res, "err_pitch", xe, mutate=lambda c: c.s.__setitem__("C", CT.Slot(c.s["C"].addr, 16, 0)))
+    smx_case(out, res, "err_addr", xe, mutate=lambda c: c.s.__setitem__("A", CT.Slot(1 << 40, 64, 0)))
+    good = CT.encode(CT.Cmd(C.OP_SOFTMAX, C.F_QOUT, 0, 0, 16, 8, 1, {}, {C.P_EPS: CT.f32bits(1.0)}))
+    bad = bytearray(good)
+    bad[1] ^= 0xFF  # REC_MAGIC, f0[15:8]
+    smx_case(out, res, "err_bad_magic", xe, raw=bytes(bad), want=C.ST_BAD_MAGIC)
+    bad = bytearray(good)
+    bad[100] ^= 1
+    smx_case(out, res, "err_bad_check", xe, raw=bytes(bad), want=C.ST_BAD_CHECK)
+    f = list(struct.unpack("<64I", good))
+    f[C.FLD_VERSION] = 0x0000FFFF
+    x_ = C.CHECK_SEED
+    for v in f[:63]:
+        x_ ^= v
+    f[63] = x_
+    smx_case(out, res, "err_bad_version", xe, raw=struct.pack("<64I", *f), want=C.ST_BAD_VERSION)
+    norm = CT.encode(CT.Cmd(C.OP_NORM, 0, 0, 0, 16, 8, 1, {}, {}))
+    smx_case(out, res, "err_not_softmax", xe, raw=norm, want=C.ST_BAD_OPCODE)
+    # ---------------- real -12392 score rows (policy_check.py --dump-scores): 2 heads of every site, frame 0.
+    # The contract feeds scores already x 1/8 (Q's stored scale) with p0 = 1; keys padded to a multiple of 8
+    # with never-visible keys (rank -1).
     rp = Path(a.real)
     if rp.exists():
         real = torch.load(rp, weights_only=False)
         for k, v in real.items():
-            xs, msk, rph = v["scores"], v.get("valid"), v["rph"]
+            xs, msk, rph = v["scores"].float() * 0.125, v.get("valid"), v["rph"]
             n, L = xs.shape
-            x = xs.reshape(n // rph, rph, L)  # heads as items
-            rk = None
-            if msk is not None:
-                r = E.ranks_from_mask(msk[:rph])
+            L8 = CT.pad8(L)
+            xp = torch.cat([xs, torch.randn(n, L8 - L, generator=g) * 50], 1)
+            if msk is not None or L8 != L:
+                vv = torch.ones(n, L, dtype=torch.bool) if msk is None else msk
+                vv = torch.cat([vv, torch.zeros(n, L8 - L, dtype=torch.bool)], 1)
+                r = E.ranks_from_mask(vv.reshape(n // rph, rph, L8))
                 assert r is not None, f"{k}: mask not rank-representable"
-                rk = (r[0][None], r[1][None])
-            case(out, res, f"real_{k}_u16", x, T8, ranks=rk)
-            case(out, res, f"real_{k}_f32", x, T8, ranks=rk, qout=False)
-            xe = x.reshape(1, n, L) if n <= R_MAX else x  # stacked heads as one engine item when they fit
-            rke = None if rk is None else (rk[0], rk[1].repeat(1, xe.shape[1] // rph))
-            case(out, res, f"real_{k}_eng", xe, T8, engine=True, ranks=rke)
+                rk = r
+            else:
+                rk = None
+            smx_case(out, res, f"real_{k}", xp.reshape(n // rph, rph, L8), ranks=rk)
     else:
         print(f"(no real scores at {rp}; run policy_check.py --dump-scores first for real-score cases)")
     worst = max(res, key=lambda r: r["max_abs"])
-    print(f"worst max|p-p64| {worst['max_abs']:.3e} ({worst['case']})")
+    print(f"worst max|P-P64| {worst['max_abs']:.3e} ({worst['case']})")
 
 
 if __name__ == "__main__":

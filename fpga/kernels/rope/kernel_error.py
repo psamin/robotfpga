@@ -2,10 +2,10 @@
 apply_rope, over every apply_rope call of one -12392 replay frame (272 calls, 165,920 (token, head) rows).
 
 Reported per output mode, relative to each row's max |torch result| (the scale the int16 formats use):
-  f32    MODE_F32                      vs torch FP32
-  int16  MODE_INT16 q * 2^e            vs torch FP32
-  absmax torch FP32 -> int16 with s = amax/32767, q = round(x/s) (the format reference, no kernel)
-plus the fraction of MODE_F32 outputs bit-equal to torch.
+  f32    the FP32 rotation (ROPE without F_QOUT)                          vs torch FP32
+  q      q * s: the FP32 rotation through the contract quantizer (F_QOUT / F_KW)  vs torch FP32
+  fmt    torch FP32 -> the contract quantizer (the format reference, no kernel)
+plus the fraction of FP32 outputs bit-equal to torch.
 
     set HF_HUB_OFFLINE=1
     C:\\kp\\lerobot-venv\\Scripts\\python.exe fpga\\kernels\\rope\\kernel_error.py [frame_index]
@@ -34,7 +34,11 @@ def main():
     from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 
     fi = int(sys.argv[1]) if len(sys.argv) > 1 else 0
-    policy = SmolVLAPolicy.from_pretrained(str(ROOT / "smolvla-so101_medicine_bottle_pickplace-12392-native")).eval().float()
+    policy = (
+        SmolVLAPolicy.from_pretrained(str(ROOT / "smolvla-so101_medicine_bottle_pickplace-12392-native"))
+        .eval()
+        .float()
+    )
     fr = torch.load(sorted((ROOT / "batches-12392").glob("frame_*.pt"))[fi], weights_only=False)
     calls, orig = [], swe.apply_rope
 
@@ -49,12 +53,15 @@ def main():
             policy.predict_action_chunk(copy.deepcopy(fr["batch"]), noise=fr["noise"].clone())
     finally:
         swe.apply_rope = orig
-    st = {k: dict(max=0.0, sq=0.0, n=0) for k in ("f32", "int16", "absmax")}
+    st = {k: dict(max=0.0, sq=0.0, n=0) for k in ("f32", "q", "fmt")}
     rows, exact = 0, 0
     for x, pos, ref in calls:
         amax = ref.abs().amax(-1, keepdim=True).clamp_min(1e-30)
-        outs = {"f32": R.kernel_from_natural(x, pos, "f32"), "int16": R.kernel_from_natural(x, pos, "int16", 0),
-                "absmax": R.absmax_int16(ref)}
+        outs = {
+            "f32": R.kernel_from_natural(x, pos, "f32"),
+            "q": R.kernel_from_natural(x, pos, "q"),
+            "fmt": R.fmt_contract(ref),
+        }
         for k, y in outs.items():
             e = ((y - ref).abs() / amax).double()
             st[k]["max"] = max(st[k]["max"], float(e.max()))
@@ -63,7 +70,9 @@ def main():
         f = outs["f32"]
         exact += int((f == ref).sum())
         rows += x.shape[0] * x.shape[1] * x.shape[2]
-    res = dict(frame=int(fr["frame"]), calls=len(calls), rows=rows, f32_bit_equal_to_torch=exact / (rows * 64))
+    res = dict(
+        frame=int(fr["frame"]), calls=len(calls), rows=rows, f32_bit_equal_to_torch=exact / (rows * 64)
+    )
     for k, v in st.items():
         res[f"{k}_max_err_over_row_amax"] = v["max"]
         res[f"{k}_rms_err_over_row_amax"] = (v["sq"] / v["n"]) ** 0.5

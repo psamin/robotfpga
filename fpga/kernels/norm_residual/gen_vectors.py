@@ -1,15 +1,18 @@
-"""Test vectors for tb_nr.cpp: whole DDR images before / after one kernel call, expected from nr_emul.py.
+"""Test vectors for tb_nr.cpp: whole DDR images before / after one NORM command (contract 1.0 record), the
+expected image computed by nr_emul.py, plus records that validate_hw must reject with the image untouched.
 
-Each case file (little-endian):
-  u32 magic 0x3143524E ('NRC1'), u32 NCFG = 20, NCFG x u32 config (nr_top's scalar arguments, in order),
-  u32 W (image size in 128-bit words), W x 16 bytes input image, W x 16 bytes expected image.
-Every region (A, B, E, C, D, F) sits in the image with sentinel words around it and in its pitch / stride gaps;
-the expected image keeps the sentinels, so any write outside the kernel's outputs is a mismatch.
-The script also prints the emulation's error against torch (F.layer_norm / the Llama RMSNorm) per case.
+Case file (little-endian): u32 magic 0x3243524E ('NRC2'), u64 base (DDR byte address of image byte 0),
+u64 list (byte address of the record), i32 want (nr_top's expected return: 0, or (status << 8) | ME code),
+u32 W (image size in 128-bit words), W x 16 bytes input image, W x 16 bytes expected image.
+Every region sits between sentinel bytes and leaves its pitch / stride gaps as sentinels, so any write outside
+the command's outputs (C rows incl. the zero rows [N, NP), F scale vectors incl. their pad lanes) is a
+mismatch.
+The script also prints, per case, the kernel's error against a float64 torch norm (and torch's own FP32 one).
 
   C:\\kp\\lerobot-venv\\Scripts\\python.exe fpga\\kernels\\norm_residual\\gen_vectors.py OUTDIR [--real]
---real adds cases built from real -12392 norm inputs (frame 0), captured with hooks (loads the policy).
+--real adds cases from real -12392 norm inputs (frame 0), captured with hooks (loads the policy).
 """
+
 from __future__ import annotations
 
 import argparse
@@ -18,229 +21,375 @@ import struct
 import sys
 
 import numpy as np
-import torch
-import torch.nn.functional as F
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE.parent))
+import contract  # noqa: E402
 import nr_emul  # noqa: E402
+from contract import C, Cmd, Slot  # noqa: E402
 
-F_QOUT, F_RESID, F_SUM, F_LN = 0x2, 0x4, 0x8, 0x10
-SENT = 0xA5A5A5A5
-MAGIC = 0x3143524E
-
-
-def f32bits(x: float) -> int:
-    return int(np.array([x], np.float32).view(np.uint32)[0])
+SENT = 0xA5
+MAGIC = 0x3243524E
 
 
 class Image:
-    def __init__(self):
-        self.words = []  # list of np.uint32 arrays of 4
+    """A DDR window at byte address `base`: regions get 16-byte aligned addresses with sentinels around."""
 
-    def alloc(self, nwords: int) -> int:
-        self.pad(3)
-        off = len(self.words)
-        self.words.extend([np.full(4, SENT, np.uint32) for _ in range(nwords)])
-        self.pad(5)
-        return off
+    def __init__(self, base: int):
+        self.base = base
+        self.buf = bytearray()
 
-    def pad(self, n):
-        self.words.extend([np.full(4, SENT, np.uint32) for _ in range(n)])
+    def alloc(self, nbytes: int, align: int = 64) -> int:
+        self.buf += bytes([SENT]) * 48
+        while (self.base + len(self.buf)) % align:
+            self.buf.append(SENT)
+        addr = self.base + len(self.buf)
+        self.buf += bytes([SENT]) * nbytes
+        return addr
 
-    def arr(self):
-        return np.stack(self.words).copy()
-
-
-def put_rows(img: np.ndarray, off, pitch, stride, rows: np.ndarray, lanes_per_word: int):
-    """rows (B, N, K) of uint32 (FP32 bits) or uint16 (int16 bits)."""
-    B, N, K = rows.shape
-    flat = img.reshape(-1).view(np.uint8)
-    for b in range(B):
-        for n in range(N):
-            base = (off + b * stride + n * pitch) * 16
-            data = rows[b, n].tobytes()
-            flat[base:base + len(data)] = np.frombuffer(data, np.uint8)
+    def finish(self) -> np.ndarray:
+        self.buf += bytes([SENT]) * 80
+        while len(self.buf) % 16:
+            self.buf.append(SENT)
+        return np.frombuffer(bytes(self.buf), np.uint8).copy()
 
 
-def torch_norm(y, g, b, eps, ln):
+def put(img: np.ndarray, base: int, addr: int, data: bytes) -> None:
+    o = addr - base
+    img[o : o + len(data)] = np.frombuffer(data, np.uint8)
+
+
+def put_rows(img, base, s: Slot, rows: np.ndarray, nrows: int | None = None) -> None:
+    """rows (B, N, X) of any dtype: row n of item b at s.addr + b s.stride + n s.pitch."""
+    for b in range(rows.shape[0]):
+        for n in range(rows.shape[1] if nrows is None else nrows):
+            put(img, base, s.addr + b * s.stride + n * s.pitch, rows[b, n].tobytes())
+
+
+def torch_norm64(y, g, b, eps, ln):
+    yd = y.astype(np.float64)
     if ln:
-        return F.layer_norm(y.double(), (y.shape[-1],), g.double(), b.double(), eps).float()
-    h = y.double()
-    return (g.double() * (h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + eps))).float()
-
-
-def make_case(path, name, A, Bm, g, beta, eps, ln, resid, sumo, qout, pad=(0, 0, 0, 0), rec_out=False,
-              a_gap=None):
-    """A, Bm: (B, N, K) FP32 tensors. pad: extra words per row pitch for A, B, C, D.
-    rec_out: D and C as records (C row r right after D row r, both with pitch K/4 + C row words): WM_REC.
-    a_gap: A rows with this many gap words after each row (K/8: A is a record-layout residual stream)."""
-    Bn, N, K = A.shape
-    KW = K // 4
-    CW = K // 8 if qout else KW
-    ap, bp, cp, dp = KW + pad[0], KW + pad[1], CW + pad[2], KW + pad[3]
-    if a_gap is not None:
-        ap = KW + a_gap
-    if rec_out:
-        assert sumo
-        cp = dp = KW + CW
-    img = Image()
-    a_stride = N * ap + (2 if pad[0] else 0)
-    b_stride = N * bp + (1 if pad[1] else 0)
-    c_stride = N * cp + (3 if pad[2] else 0)
-    d_stride = N * dp + (1 if pad[3] else 0)
-    FW = (N + 3) // 4
-    f_stride = FW + (2 if any(pad) else 0)
-    a_off = img.alloc(Bn * a_stride)
-    b_off = img.alloc(Bn * b_stride) if resid else 0
-    e_off = img.alloc(2 * KW if ln else KW)
-    if rec_out:
-        d_stride = c_stride = N * dp + (4 if any(pad) else 0)
-        d_off = img.alloc(Bn * d_stride)
-        c_off = d_off + KW
+        z = (yd - yd.mean(1, keepdims=True)) / np.sqrt(yd.var(1, keepdims=True) + eps) * g + b
     else:
-        c_off = img.alloc(Bn * c_stride)
-        d_off = img.alloc(Bn * d_stride) if sumo else 0
-    f_off = img.alloc(Bn * f_stride) if qout else 0
-    im = img.arr()
-    put_rows(im, a_off, ap, a_stride, A.numpy().view(np.uint32), 4)
-    if resid:
-        put_rows(im, b_off, bp, b_stride, Bm.numpy().view(np.uint32), 4)
-    e = g.numpy().view(np.uint32)
+        z = g * (yd / np.sqrt((yd * yd).mean(1, keepdims=True) + eps))
+    return z
+
+
+def torch_norm32(y, g, b, eps, ln):
+    import torch
+    import torch.nn.functional as F
+
+    t = torch.from_numpy(y)
     if ln:
-        e = np.concatenate([e, beta.numpy().view(np.uint32)])
-    put_rows(im, e_off, 0, 0, e.reshape(1, 1, -1), 4)
-    # expected
-    y = (A + Bm) if resid else A.clone()
-    y2 = y.reshape(-1, K)
-    z, q, s, mean, rstd = nr_emul.kernel(y2, g, beta if ln else None, eps, ln)
-    ex = im.copy()
-    if sumo:
-        put_rows(ex, d_off, dp, d_stride, y.numpy().view(np.uint32), 4)
-    if qout:
-        put_rows(ex, c_off, cp, c_stride, q.to(torch.int16).numpy().view(np.uint16).reshape(Bn, N, K), 8)
-        sb = s.numpy().view(np.uint32).reshape(Bn, N)
-        for b in range(Bn):
-            sw = np.zeros(FW * 4, np.uint32)
-            sw[:N] = sb[b]
-            put_rows(ex, f_off + b * f_stride, 1, 0, sw.reshape(1, FW, 4), 4)
-    else:
-        put_rows(ex, c_off, cp, c_stride, z.numpy().view(np.uint32).reshape(Bn, N, K), 4)
-    flags = (F_LN if ln else 0) | (F_RESID if resid else 0) | (F_SUM if sumo else 0) | (F_QOUT if qout else 0)
-    cfg = [flags, K, N, Bn, f32bits(eps), a_off, ap, a_stride, b_off, bp, b_stride, e_off, c_off, cp, c_stride,
-           d_off, dp, d_stride, f_off, f_stride]
+        return F.layer_norm(t, (y.shape[1],), torch.from_numpy(g), torch.from_numpy(b), eps).numpy()
+    h = t * torch.rsqrt(t.pow(2).mean(-1, keepdim=True) + eps)
+    return (torch.from_numpy(g) * h).numpy()
+
+
+def write_case(path, base, list_addr, want, im, ex):
+    assert im.size % 16 == 0
     with open(path, "wb") as fh:
-        fh.write(struct.pack("<II", MAGIC, len(cfg)))
-        fh.write(struct.pack(f"<{len(cfg)}I", *cfg))
-        fh.write(struct.pack("<I", im.shape[0]))
+        fh.write(struct.pack("<IQQiI", MAGIC, base, list_addr, want, im.size // 16))
         fh.write(im.tobytes())
         fh.write(ex.tobytes())
-    # error of the kernel (= emulation) against torch in double
-    zt = torch_norm(y2, g, beta, eps, ln)
-    am = zt.abs().amax(1).clamp_min(1e-30)
-    zrel = float(((z - zt).abs().amax(1) / am).max())
-    deq = q.float() * s[:, None]
-    drel = float(((deq - zt).abs().amax(1) / am).max())
-    if ln:  # torch's own FP32 LayerNorm against the same double reference (cancellation class)
-        z32 = F.layer_norm(y2, (K,), g, beta, eps)
+
+
+def make_case(
+    out,
+    name,
+    A,
+    g,
+    beta,
+    eps,
+    ln,
+    qout,
+    *,
+    a_pad=0,
+    a_gap_item=0,
+    c_pad=0,
+    c_gap_item=0,
+    f_gap_item=0,
+    np_extra=0,
+    shift=0,
+    base=0x1000_0000,
+):
+    """A: (B, N, K) FP32. *_pad: extra bytes per row pitch; *_gap_item: extra bytes per item stride."""
+    A = np.ascontiguousarray(A, np.float32)
+    Bn, N, K = A.shape
+    NP = N + np_extra
+    img = Image(base)
+    a_pitch = 4 * K + a_pad
+    a_stride = N * a_pitch + a_gap_item
+    a_addr = img.alloc(Bn * a_stride)
+    e_addr = img.alloc((8 if ln else 4) * K)
+    eb = 2 if qout else 4
+    c_pitch = eb * K + c_pad
+    c_stride = NP * c_pitch + c_gap_item
+    c_addr = img.alloc(Bn * c_stride)
+    f_stride = 4 * contract.pad4(NP) + f_gap_item if qout else 0
+    f_addr = img.alloc(Bn * max(f_stride, 16)) if qout else 0
+    list_addr = img.alloc(C.REC_BYTES, 256)
+    s = {
+        "A": Slot(a_addr, a_pitch, a_stride if Bn > 1 else 0),
+        "E": Slot(e_addr),
+        "C": Slot(c_addr, c_pitch, c_stride if Bn > 1 else 0),
+    }
+    if qout:
+        s["F"] = Slot(f_addr, 0, f_stride if Bn > 1 else 0)
+    p = {C.P_EPS: contract.f32bits(eps)}
+    if np_extra:
+        p[C.P_NP] = NP
+    if shift:
+        p[C.P_SHIFT] = shift & 0xFFFFFFFF
+    flags = (C.F_QOUT if qout else 0) | (C.F_LN if ln else 0)
+    cmd = Cmd(C.OP_NORM, flags, 7, 0, K, N, Bn, s, p)
+    me = contract.validate(cmd)
+    assert me == C.ME_OK, (name, me)
+    im = img.finish()
+    base = img.base
+    put_rows(im, base, s["A"], A)
+    e = np.asarray(g, np.float32).tobytes() + (np.asarray(beta, np.float32).tobytes() if ln else b"")
+    put(im, base, e_addr, e)
+    put(im, base, list_addr, contract.encode(cmd))
+    y2 = A.reshape(-1, K)
+    z, q, sc, _, _ = nr_emul.kernel(y2, g, beta if ln else None, eps, ln, shift)
+    ex = im.copy()
+    if qout:
+        qq = np.zeros((Bn, NP, K), np.int16)
+        qq[:, :N] = q.reshape(Bn, N, K)
+        put_rows(ex, base, s["C"], qq)
+        sv = np.ones((Bn, contract.pad4(NP)), np.float32)
+        sv[:, :N] = sc.reshape(Bn, N)
+        for b in range(Bn):
+            put(ex, base, f_addr + b * f_stride, sv[b].tobytes())
     else:
-        z32 = g * (y2 * torch.rsqrt(y2.pow(2).mean(-1, keepdim=True) + eps))
-    trel = float(((z32 - zt).abs().amax(1) / am).max())
-    print(f"{name:22s} K={K:4d} N={N:3d} B={Bn} flags=0x{flags:02x} words={im.shape[0]:7d}  "
-          f"z vs torch(f64) max {zrel:.2e} of row max|z| (torch f32 {trel:.2e}), int16 dequant {drel:.2e}")
+        put_rows(ex, base, s["C"], z.reshape(Bn, N, K))
+    write_case(out / f"{name}.bin", base, list_addr, 0, im, ex)
+    # accuracy against float64 (and torch's FP32 norm against the same reference)
+    with np.errstate(all="ignore"):
+        zt = torch_norm64(y2, g.astype(np.float64), beta if ln else 0.0, eps, ln)
+        am = np.maximum(np.abs(zt).max(1), 1e-30)
+        zrel = float((np.abs(z - zt).max(1) / am).max())
+        deq = q.astype(np.float32) * (sc / np.float32(2.0**shift))[:, None]
+        drel = float((np.abs(deq - zt).max(1) / am).max())
+        z32 = torch_norm32(
+            y2, np.asarray(g, np.float32), np.asarray(beta, np.float32) if ln else None, eps, ln
+        )
+        trel = float((np.abs(z32 - zt).max(1) / am).max())
+    print(
+        f"{name:22s} K={K:4d} N={N:3d} NP={NP:3d} B={Bn} flags=0x{flags:02x} words={im.size // 16:7d}  "
+        f"z vs f64 {zrel:.2e} of row max (torch f32 {trel:.2e}), int16 dequant {drel:.2e}"
+    )
+    return z
 
 
-def synth_cases(out: pathlib.Path):
-    torch.manual_seed(1)
-    cases = []
+def make_reject(out, name, cmd: Cmd, *, corrupt=None, base=0x2000_0000):
+    """A record validate_hw (or decode) rejects: the expected image is the input image."""
+    img = Image(base)
+    list_addr = img.alloc(C.REC_BYTES, 256)
+    im = img.finish()
+    rec = bytearray(contract.encode(cmd))
+    if corrupt:
+        corrupt(rec)
+    st, c = contract.decode(bytes(rec))
+    if st != C.ST_END:
+        want = st << 8
+    elif c.op != C.OP_NORM:
+        want = C.ST_BAD_OPCODE << 8
+    else:
+        me = contract.validate(c, full=False)
+        assert me != C.ME_OK, name
+        want = (C.ST_MODE_ERROR << 8) | me
+    put(im, base, list_addr, bytes(rec))
+    write_case(out / f"{name}.bin", base, list_addr, want, im, im.copy())
+    print(f"{name:22s} rejected: want 0x{want:04x}")
+
+
+def reject_cases(out):
+    good = dict(
+        op=C.OP_NORM,
+        flags=C.F_QOUT,
+        K=720,
+        N=50,
+        B=1,
+        s={"A": Slot(0x1000, 2944), "E": Slot(0x40000), "C": Slot(0x80000, 1440), "F": Slot(0xC0000)},
+        p={C.P_EPS: contract.f32bits(1e-5)},
+    )
+    assert contract.validate(Cmd(**good)) == C.ME_OK
+
+    def var(**kw):
+        d = {k: (dict(v) if isinstance(v, dict) else v) for k, v in good.items()}
+        for k, v in kw.items():
+            if k in ("s", "p"):
+                d[k].update(v)
+            else:
+                d[k] = v
+        return Cmd(**d)
+
+    make_reject(out, "rej_n0", var(N=0))
+    make_reject(out, "rej_n65536", var(N=65536))
+    make_reject(out, "rej_k1032", var(K=1032, s={"A": Slot(0x1000, 4128), "C": Slot(0x80000, 2064)}))
+    make_reject(out, "rej_k12", var(K=12))
+    make_reject(out, "rej_b65536", var(B=65536))
+    make_reject(out, "rej_flag_resid", var(flags=C.F_QOUT | 0x4))
+    make_reject(out, "rej_flag_sum", var(flags=C.F_QOUT | 0x8))
+    make_reject(out, "rej_flag_bias", var(flags=C.F_QOUT | C.F_BIAS))
+    make_reject(out, "rej_eps0", var(p={C.P_EPS: 0}))
+    make_reject(out, "rej_eps1", var(p={C.P_EPS: contract.f32bits(1.0)}))
+    make_reject(out, "rej_shift9", var(p={C.P_SHIFT: 9}))
+    make_reject(out, "rej_seg64", var(p={C.P_SEG: 64}, K=768))
+    make_reject(out, "rej_a_misaligned", var(s={"A": Slot(0x1008, 2944)}))
+    make_reject(out, "rej_c_pitch", var(s={"C": Slot(0x80000, 1424)}))
+    make_reject(out, "rej_slot_b", var(s={"B": Slot(0x9000)}))
+    make_reject(out, "rej_f32_np", var(flags=0, s={"C": Slot(0x80000, 2880), "F": Slot()}, p={C.P_NP: 52}))
+    make_reject(out, "rej_f32_fslot", var(flags=0, s={"C": Slot(0x80000, 2880)}))
+    make_reject(out, "rej_addr40", var(s={"A": Slot(1 << 40, 2944)}))
+    make_reject(out, "rej_magic", var(), corrupt=lambda r: r.__setitem__(1, 0xC5))
+    make_reject(out, "rej_check", var(), corrupt=lambda r: r.__setitem__(20, r[20] ^ 1))
+
+    def bad_version(r):
+        f = list(struct.unpack("<64I", bytes(r)))
+        f[C.FLD_VERSION] ^= 1
+        f[C.CHECK_FIELD] ^= 1
+        r[:] = struct.pack("<64I", *f)
+
+    make_reject(out, "rej_version", var(), corrupt=bad_version)
+
+
+def synth_cases(out):
+    rng = np.random.default_rng(1)
 
     def rnd(*shape, scale=1.0, off=0.0):
-        return (torch.randn(*shape) * scale + off).float()
+        return (rng.standard_normal(shape) * scale + off).astype(np.float32)
 
-    # vision LN, residual stream with an outlier channel and a mean offset
-    K = 768
+    def gam(K, lo=0.3):
+        return (rng.random(K) + lo).astype(np.float32)
+
+    K = 768  # vision LN, residual stream with an outlier channel and a mean offset
     A = rnd(1, 64, K, scale=3.0, off=0.7)
     A[..., 11] *= 30
-    Bm = rnd(1, 64, K, scale=0.5)
-    g, beta = (torch.rand(K) + 0.3).float(), rnd(K, scale=0.2)
-    make_case(out / "ln768_resid.bin", "ln768_resid", A, Bm, g, beta, 1e-6, True, True, True, True)
-    # LM RMSNorm
-    K = 960
-    A, Bm = rnd(1, 81, K, scale=2.0), rnd(1, 81, K, scale=0.3)
+    make_case(out, "ln768_q", A, gam(K), rnd(K, scale=0.2), 1e-6, True, True)
+    K = 960  # LM RMSNorm, 45 prefix rows
+    A = rnd(1, 45, K, scale=2.0)
     A[..., 5] += 80
-    g = (torch.rand(K) * 2).float()
-    make_case(out / "rms960_resid.bin", "rms960_resid", A, Bm, g, None, 1e-5, False, True, True, True)
-    # expert RMSNorm, two batch items, padded pitches and strides (per-row bursts)
-    K = 720
-    A, Bm = rnd(2, 50, K, scale=1.5), rnd(2, 50, K, scale=0.4)
-    g = (torch.rand(K) + 0.5).float()
-    make_case(out / "rms720_batch_pad.bin", "rms720_batch_pad", A, Bm, g, None, 1e-5, False, True, True, True,
-              pad=(2, 1, 3, 1))
-    # post_layernorm: FP32 z out, no sum out
-    K = 768
-    A, Bm = rnd(1, 32, K, scale=4.0, off=-0.3), rnd(1, 32, K)
-    g, beta = (torch.rand(K) + 0.3).float(), rnd(K, scale=0.2)
-    make_case(out / "ln768_post_f32.bin", "ln768_post_f32", A, Bm, g, beta, 1e-6, True, True, False, False)
-    # first layer: no residual, no sum
-    K = 720
-    A = rnd(1, 50, K, scale=0.8)
-    g = (torch.rand(K) + 0.5).float()
-    make_case(out / "rms720_first.bin", "rms720_first", A, None, g, None, 1e-5, False, False, False, True)
-    # edge rows (N = 13: the last scale word is partial)
+    make_case(out, "rms960_q", A, (rng.random(K) * 2).astype(np.float32), None, 1e-5, False, True)
+    K = 720  # expert RMSNorm: rows of the 736-wide residual stream (flat read, 4 gap words a row), 2 items
+    make_case(
+        out,
+        "rms720_b2_gap",
+        rnd(2, 50, K, scale=1.5),
+        gam(K, 0.5),
+        None,
+        1e-5,
+        False,
+        True,
+        a_pad=64,
+        a_gap_item=48,
+        c_gap_item=32,
+        f_gap_item=16,
+    )
+    K = 768  # post_layernorm: FP32 z out
+    make_case(
+        out, "ln768_f32", rnd(1, 32, K, scale=4.0, off=-0.3), gam(K), rnd(K, scale=0.2), 1e-6, True, False
+    )
+    K = 720  # A gap over half a row (one burst a row) and C rows with a gap (one write burst a row), 2 items
+    make_case(
+        out,
+        "rms720_rowio",
+        rnd(2, 20, K),
+        gam(K, 0.5),
+        None,
+        1e-5,
+        False,
+        True,
+        a_pad=4 * K // 2 + 16,
+        c_pad=32,
+        c_gap_item=64,
+    )
+    make_case(
+        out,
+        "ln720_rowio_f32",
+        rnd(2, 9, K),
+        gam(K),
+        rnd(K, scale=0.1),
+        1e-6,
+        True,
+        False,
+        a_pad=2048,
+        c_pad=16,
+    )
+    K = 720  # two writer chunks (N > 256), zero rows [N, NP) with scale 1.0, a scale shift (the Q rule's -3)
+    make_case(
+        out, "rms720_n300_np304_sh", rnd(1, 300, K), gam(K), None, 1e-5, False, True, np_extra=4, shift=-3
+    )
+    make_case(
+        out,
+        "ln768_n257_np260_sh5",
+        rnd(1, 257, 768, off=2),
+        gam(768),
+        rnd(768),
+        1e-6,
+        True,
+        True,
+        np_extra=3,
+        shift=5,
+    )
+    K = 1024  # the longest row
+    make_case(out, "ln1024", rnd(1, 9, K, scale=2.0, off=1.0), gam(K), rnd(K, scale=0.2), 1e-6, True, True)
+    make_case(out, "rms1024_f32", rnd(1, 7, K), gam(K), None, 1e-5, False, False)
+    K = 8  # the shortest rows (scalar-bound: the per-row processes, not io, set the pace)
+    make_case(out, "rms8_q", rnd(1, 37, K), gam(K), None, 1e-5, False, True, np_extra=3)
+    make_case(out, "ln8_f32", rnd(3, 5, K, off=1.0), gam(K), rnd(K), 1e-6, True, False)
+    # all-equal LayerNorm rows (review: the double-rounded mean gave +-32767 noise; torch gives beta)
+    for K in (768, 960, 720):
+        vals = [-1e4, 2.0, 3.7, 0.1, -7.25, 1e-3, 123456.79, -0.3333333, 0.0]
+        A = np.stack([np.full(K, v, np.float32) for v in vals])[None]
+        z = make_case(out, f"const_ln{K}", A, gam(K), rnd(K, scale=0.2), 1e-6, True, True)
+        bz = make_case(out, f"const_ln{K}_f32", A, gam(K), np.zeros(K, np.float32), 1e-6, True, False)
+        assert np.abs(bz).max() == 0.0, "constant LN rows must normalize to exactly 0 (z = beta = 0)"
+        del z
+    # edge rows (K = 64, N = 16: the last scale word is partial with NP = 18)
     K = 64
-    rows = []
-    rows.append(torch.zeros(K))                                    # zero row
-    rows.append(torch.full((K,), 3.25))                            # constant row (var 0)
-    rows.append(1e4 + torch.randn(K) * 1e-2)                       # huge mean, small spread
-    rows.append(torch.randn(K) * 1e-20)                            # tiny values
-    rows.append(torch.randn(K) * 1e15)                             # huge values
-    r = torch.randn(K)
-    r[3] = 1e9
-    rows.append(r)                                                 # exponents spanning > 2^25
-    oh = torch.zeros(K)
-    oh[7] = -2.5
-    rows.append(oh)                                                # one-hot
-    rows.append(torch.tensor([(-1) ** i * 2.0 ** (i % 30 - 15) for i in range(K)]))  # powers of two
-    rows.append(torch.randn(K) * 1e-3 + 5e-4)                      # small, offset
-    rows.append(torch.full((K,), -7.0) + (torch.arange(K) % 2) * 2 ** -20)  # tiny spread at -7
-    for _ in range(3):
-        rows.append(torch.randn(K) * torch.rand(1) * 10)
-    A = torch.stack(rows).float().unsqueeze(0)
-    Bz = torch.zeros_like(A)
-    Bz[0, 2] = torch.randn(K) * 1e-3
-    g, beta = (torch.rand(K) + 0.3).float(), rnd(K, scale=0.2)
-    make_case(out / "edge_ln64.bin", "edge_ln64", A, Bz, g, beta, 1e-6, True, True, True, True)
-    make_case(out / "edge_rms64.bin", "edge_rms64", A, Bz, g, None, 1e-5, False, True, True, True)
-    make_case(out / "edge_ln64_f32.bin", "edge_ln64_f32", A, Bz, g, beta, 1e-6, True, True, True, False)
-    # record layouts (the fast path the sequencer should use): output records, record-layout A input,
-    # N > 256 (two write chunks, two scale bursts), and a batch of records with item strides
-    K = 720
-    A, Bm = rnd(1, 300, K, scale=1.5), rnd(1, 300, K, scale=0.4)
-    g = (torch.rand(K) + 0.5).float()
-    make_case(out / "rec720_n300.bin", "rec720_n300", A, Bm, g, None, 1e-5, False, True, True, True,
-              rec_out=True, a_gap=K // 8)
-    K = 768
-    A, Bm = rnd(2, 40, K, scale=2.0, off=0.3), rnd(2, 40, K, scale=0.5)
-    g, beta = (torch.rand(K) + 0.3).float(), rnd(K, scale=0.2)
-    make_case(out / "rec768_batch.bin", "rec768_batch", A, Bm, g, beta, 1e-6, True, True, True, True,
-              pad=(0, 0, 0, 0), rec_out=True, a_gap=K // 8)
-    make_case(out / "rec768_f32.bin", "rec768_f32", A, Bm, g, beta, 1e-6, True, True, True, False, rec_out=True)
-    # A with a gap too large for the flat read (per-row bursts), contiguous C (WM_C), N = 257
-    K = 960
-    A = rnd(1, 257, K, scale=1.0)
-    g = (torch.rand(K) * 2).float()
-    make_case(out / "gap960_n257.bin", "gap960_n257", A, None, g, None, 1e-5, False, False, False, True,
-              a_gap=K // 4)
-    # the longest row
-    K = 1024
-    A, Bm = rnd(1, 9, K, scale=2.0, off=1.0), rnd(1, 9, K)
-    g, beta = (torch.rand(K) + 0.3).float(), rnd(K, scale=0.2)
-    make_case(out / "ln1024.bin", "ln1024", A, Bm, g, beta, 1e-6, True, True, True, True)
+    rows = [
+        np.zeros(K),  # zero row
+        np.full(K, 3.25),  # constant row (var 0)
+        1e4 + rng.standard_normal(K) * 1e-2,  # huge mean, small spread
+        rng.standard_normal(K) * 1e-20,  # tiny values (var flushes to 0)
+        rng.standard_normal(K) * 1e15,  # huge values
+        np.r_[rng.standard_normal(K - 1), 1e9],  # exponents spanning more than 2^25
+        np.eye(K)[7] * -2.5,  # one-hot
+        np.array([(-1) ** i * 2.0 ** (i % 30 - 15) for i in range(K)]),  # powers of two
+        rng.standard_normal(K) * 1e-3 + 5e-4,  # small, offset
+        np.full(K, -7.0) + (np.arange(K) % 2) * 2**-20,  # tiny spread at -7
+        rng.standard_normal(K) * 1e-39,  # denormals only (the cores flush them: a zero row)
+        np.r_[rng.standard_normal(K // 2) * 1e-40, rng.standard_normal(K // 2)],  # half denormal
+        np.r_[rng.standard_normal(K - 1), 2e20],  # LN var overflows FP32: rstd = 0, z = beta
+        rng.standard_normal(K) * 3.0,
+        rng.standard_normal(K) * 0.7 - 0.2,
+        np.full(K, -0.0),  # negative zeros
+    ]
+    A = np.stack(rows).astype(np.float32)[None]
+    g, beta = gam(K), rnd(K, scale=0.2)
+    g[3] = 1e-39  # a denormal gamma lane (flushed)
+    make_case(out, "edge_ln64", A, g, beta, 1e-6, True, True, np_extra=2)
+    make_case(out, "edge_rms64", A, g, None, 1e-5, False, True, np_extra=2, shift=-8)
+    make_case(out, "edge_ln64_f32", A, g, beta, 1e-6, True, False)
+    make_case(out, "eps_denormal", A[:, :4], g, beta, 1e-45, True, True)  # eps flushes to 0: the 2^-126 clamp
+    # 64-bit addressing: images that straddle 4 GB and sit in high DDR (0x8_0000_0000, the KR260's upper bank)
+    make_case(
+        out, "rms720_at_4g", rnd(2, 50, 720), gam(720), None, 1e-5, False, True, a_pad=64, base=0xFFFF_0000
+    )
+    make_case(out, "ln768_hi_ddr", rnd(1, 40, 768), gam(768), rnd(768), 1e-6, True, True, base=0x8_7000_0000)
+    make_case(
+        out, "rms960_64g", rnd(1, 12, 960), gam(960), None, 1e-5, False, True, base=(1 << 36) - (1 << 19)
+    )  # word indices past 2^32
 
 
-def real_cases(out: pathlib.Path):
-    """Real norm inputs of -12392 frame 0: one call per group, y = the module input (A), no residual operand."""
+def real_cases(out):
+    """Real norm inputs of -12392 frame 0: one command per group, A = the module input, contract layouts."""
     import policy_check as pc
+    import torch
     from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 
     p = SmolVLAPolicy.from_pretrained(str(pc.CKPT)).to("cpu").eval().float()
@@ -254,12 +403,13 @@ def real_cases(out: pathlib.Path):
         "real_expert_l3_post": (vwe.lm_expert.layers[3].post_attention_layernorm, False),
         "real_expert_final": (vwe.lm_expert.norm, False),
     }
-    got = {}
-    hooks = []
-    for name, (mod, ln) in want.items():
+    got, hooks = {}, []
+    for name, (mod, _) in want.items():
+
         def hook(m, inp, outp, name=name):
             if name not in got:
                 got[name] = inp[0].detach().reshape(-1, inp[0].shape[-1]).float().clone()
+
         hooks.append(mod.register_forward_hook(hook))
     frames = sorted(pc.BATCHES.glob("frame_*.pt"))
     d = torch.load(frames[0], weights_only=False)
@@ -269,13 +419,13 @@ def real_cases(out: pathlib.Path):
     for h in hooks:
         h.remove()
     for name, (mod, ln) in want.items():
-        y = got[name]
-        A = y.unsqueeze(0)
-        g = mod.weight.detach().float()
-        beta = mod.bias.detach().float() if ln else None
+        y = got[name].numpy()
+        g = mod.weight.detach().float().numpy()
+        beta = mod.bias.detach().float().numpy() if ln else None
         eps = mod.eps if ln else mod.variance_epsilon
         qout = name != "real_vision_post"
-        make_case(out / f"{name}.bin", name, A, None, g, beta, eps, ln, False, False, qout)
+        pad = 64 if y.shape[1] == 720 else 0  # the expert's residual rows hold 736 FP32 (contract_plan.py)
+        make_case(out, name, y[None], g, beta, eps, ln, qout, a_pad=pad)
 
 
 def main():
@@ -285,6 +435,9 @@ def main():
     a = ap.parse_args()
     out = pathlib.Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
+    for f in out.glob("*.bin"):
+        f.unlink()
+    reject_cases(out)
     synth_cases(out)
     if a.real:
         real_cases(out)

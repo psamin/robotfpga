@@ -1,4 +1,5 @@
-# Vitis HLS 2022.2 synthesis (csynth only; the C model is checked by tb_rope.cpp with g++) of the RoPE kernel.
+# Vitis HLS 2022.2 synthesis (csynth only; the C model is checked by tb_rope.cpp with g++) of the ROPE mode
+# (rope_mode.h) inside its standalone top (rope_top.cpp: float_top's hp0 / io bundles, one record fetch + decode).
 #   ROPE_PERIOD=4.0     clock period in ns (default 4.0 = 250 MHz)
 #   vitis_hls -f fpga/kernels/rope/run_rope_hls.tcl      -> fpga/kernels/rope/build/rope_p<period>/sol1
 set here [file dirname [file normalize [info script]]]
@@ -11,7 +12,7 @@ file mkdir "$here/build"
 cd "$here/build"
 open_project -reset $proj
 set_top rope_top
-add_files "$here/rope_top.cpp" -cflags "-std=c++14"
+add_files "$here/rope_top.cpp" -cflags "-std=c++14 -I$here -I$here/.. -I$here/../quantize"
 open_solution -reset sol1 -flow_target vivado
 set_part xck26-sfvc784-2LV-c
 create_clock -period $period -name default

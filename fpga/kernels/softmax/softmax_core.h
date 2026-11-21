@@ -1,871 +1,580 @@
-// Row softmax kernel for SmolVLA attention on the KR260 (K26), header-only core (README.md has the contract).
+// SOFTMAX unit of the SmolVLA float_top (integration contract 1.0, fpga/kernels/CONTRACT.md; README.md here).
 //
-// One call = one 128-byte command record (the float_top sequencer's record format, opcode SOFTMAX 0x40) over
-// B batch items of N rows x L keys of FP32 scores. Two layouts:
-//   rows   (default): scores A[item][row][key] row-major with a pitch -> q C[item][row][key] int16 rows with a
-//                     pitch + one FP32 scale per row F[item][row]; or FP32 probabilities C (F_QOUT clear)
-//   engine (F_ENGINE): scores = the int16 engine's output tiling Y[Mk/32][Np][32] FP32 (Mk = pad32(L) keys as
-//                     output channels, Np = pad32(N) rows as tokens) -> P as the engine's X operand of the P V
-//                     call: X[Np/32][L][32 rows] int16 + s_tok[Np] FP32 (the xmem sections of int16_linear.h)
-// q_j in [0, 32767], scale = RN(1 / sum_j q_j), so P_j = q_j * scale. Masks: key k visible to row n iff
-// 0 <= E[k] <= D[n] (int32 rank vectors, F_MASK); a fully masked row is zero (or uniform with F_EMPTY_UNIFORM,
-// torch's softmax of equal finfo.min scores).
+// Mode function:  uint32_t smx::softmax_mode(const ctr::Cmd& c, const Word* xmem, Word* ymem)
+//   called from the sequencer's dispatch switch (one call site, INLINE off) after ctr::decode and
+//   ctr::validate_hw. Reads only through xmem and writes only through ymem (the io bundle); no own m_axi
+//   adapter, no own decode, no register. Returns ME_OK (0), or ME_DIMS if K / N / B / NP are outside the
+//   contract limits (validate_hw has already rejected those: the check only keeps a bad call from hanging).
 //
-// The arithmetic is integer from the score bits to the scale bits (fixed-point 2^x tables, an exact divider);
-// smx_emu.py emulates it bit for bit. Structure: one DATAFLOW region, every loop pipelined at II = 1:
-//   pass1     hp0: one burst per item in memory order; masks; row max on FP32 order keys       (4 lanes)
-//   pass2     hp1: the same words again; 2^((x - max) c) in fixed point, q, row sums            (4 lanes)
-//   recip     RN(1 / sum): normalised restoring division, two 1-bit units, 13 cycles per row
-//   shaper    rows: 8 q per word / FP32 words; engine: 32 x 32 transposes (ping-pong, LUTRAM)
-//   writer    io: data words in bursts, scales 4 per word
-// Reading the scores twice (two ports) replaces a row buffer and makes the engine layout possible at all:
-// there a row's keys are spread over Mk/32 groups of the item, so its max is known only after the whole item.
+// Record (CONTRACT.md 3.3, opcode SOFTMAX 0x40): K = L keys per row (8..256, L % 8 == 0), N rows per item,
+// B items, flags F_QOUT (required) | F_MASK | F_YIELD (the sequencer's), p0 = score multiplier (FP32 bits),
+// p5 = NP rows written (0 = N). Slots, every address absolute (row n of item b at addr + b stride + n pitch):
+//   A  scores FP32 rows, L values          C  P int16 rows, L values (rows [N, NP) are zero)
+//   F  scales FP32 [pad4(NP)]: 1/sum q per row; rows [N, NP), fully masked rows and pad lanes 1.0
+//   D  rank_q int32 [pad4(N)] per item     E  rank_k int32 [L] per item (F_MASK; stride 0 = shared)
+// Mask: key k visible to row n iff 0 <= E[k] <= D[n] (int32, exact).
 //
-// Plain C++ on the host (g++ with the Vitis HLS include directory): the processes run one after the other on
-// unbounded hls::stream FIFOs; every operation is ap_int except the FP32-output multiply and the descriptor's
-// c = p0 * log2(e), which are IEEE single multiplies on both sides.
+// Arithmetic (exact definition: smx_emu.py; integer from the score bits to the scale bits):
+//   c = fl32(max(p0, 2^-126) * fl32(log2 e)) = Mc 2^(ec - 16)    (integer RNE product, in the prologue)
+//   m = row max over the visible keys (FP32 total-order keys)
+//   u = min(fix(m) - fix(x), 2^26 - 1), fix(x) = trunc(x 2^(ec + 21)) on 47 bits, saturating
+//   t = u Mc (Q.37); e23 = T23[t.ix] - (S13[t.ix] flo >> 13); h = 2 e23 >> I; q = (h + 257) >> 9 (0 if I >= 17)
+//   q = 0 for masked keys; scale = RN(1 / sum q) (exact divider), 1.0 when the sum is 0.
+//   These are the bits of the pre-contract kernel (q = (round(e23 / 2^I) + 128) >> 8).
+//
+// Structure: one DATAFLOW region, every loop II = 1 (scale words II = 4), one io read stream:
+//   reader   xmem: rank tables, then each block of <= 256 rows as one burst (one burst per row if the A
+//            pitch is not 4 L); masks, the row max; the words + visibility bits into a BRAM row FIFO
+//   compute  per row: 1 setup cycle (the max through lane 0's fix shifter), then L/4 words: 4 lanes of
+//            2^x, q, the row sum; rows [N, NP) and the pad lanes of the scale vector give q = 0, sum 0
+//   divider  RN(1 / sum), one radix-4 restoring unit, one row per 14 cycles (each scale out before the next
+//            sum is read: no lookahead, no deadlock)
+//   writer   ymem: P rows per block of 256 rows (one burst, or one per row if the C pitch is not 2 L),
+//            then the block's scale words
+//
+// Host builds (g++ with the Vitis HLS include directory) run the HLS source: by default the processes
+// one after the other on unbounded streams; with -DSMX_DFSIM and tb_dfsim/ first on the include path
+// (tb_dfsim/hls_stream.h) as threads on FIFOs bounded at the depths below (deadlock check).
 #pragma once
 #include <ap_int.h>
 #include <hls_stream.h>
 #include <stdint.h>
-#include <string.h>
 
+#include "../contract.h"
 #include "softmax_tables.h"
 
-#ifndef SMX_L_MAX
-#define SMX_L_MAX 256  // keys per row at most (E table, FP32-mode row FIFO)
-#endif
-#ifndef SMX_FP32_OUT
-#define SMX_FP32_OUT 0  // 1 adds the FP32 output (rows layout): 4 fmul + a row FIFO behind the shaper
-#endif
-#ifndef SMX_ENGINE
-#define SMX_ENGINE 1  // 0 removes the engine layout (row state RAMs, transposer)
+#if defined(SMX_DFSIM) && !defined(__SYNTHESIS__)
+#include <thread>
 #endif
 
 namespace smx {
 
 typedef ap_uint<128> Word;
-typedef ap_uint<36> WAddr;  // 128-bit word index = byte address >> 4 (40-bit addresses)
+typedef ap_uint<36> WAddr;  // 128-bit word index = byte address >> 4 (addresses < 2^40: validate_hw)
+typedef ap_uint<132> XW;    // reader -> compute: 4 FP32 scores, visibility of lane l at bit 128 + l
 
-constexpr int L_MAX = SMX_L_MAX;
-static_assert(L_MAX % 32 == 0 && L_MAX >= 32 && L_MAX <= 2048, "SMX_L_MAX: multiple of 32 in [32, 2048]");
-constexpr int R_MAX = 256;                               // rows per item: engine Np, masked rows layout
-constexpr int EW = L_MAX / 4;                            // E table entries (4 ranks of 16 bits)
-constexpr int DW = R_MAX / 4;                            // D table entries
-constexpr int NSTEP = 13;                                // divider cycles per row and unit pair
-constexpr int BCFIFO = SMX_FP32_OUT ? L_MAX / 4 + 64 : 32;
-constexpr int BRW = 256;                                 // rows layout: rows per scale block
-constexpr int KMIN = (int)0x80000000;                    // order key below every FP32 key
+constexpr int L_MAX = (int)ctr::SMX_L_MAX;  // 256 keys
+constexpr int W_MAX = L_MAX / 4;            // 64 input words per row
+constexpr int BLK = 256;                    // rows per block: one D chunk, one scale burst
+// FIFO depths (pragmas and the bounded host model use these numbers)
+// (SMX_XS_DEPTH / SMX_RQ_DEPTH override them only for the deadlock model's negative controls)
+#ifndef SMX_XS_DEPTH
+#define SMX_XS_DEPTH W_MAX  // one row of 256 keys (LUTRAM): >= W_MAX is the deadlock bound
+#endif
+#ifndef SMX_RQ_DEPTH
+#define SMX_RQ_DEPTH (BLK + 32)  // >= BLK: the writer reads a block's scales after its rows (deadlock bound)
+#endif
+constexpr int XS_DEPTH = SMX_XS_DEPTH;
+constexpr int MX_DEPTH = 4;
+constexpr int EQ_DEPTH = 16;
+constexpr int SQ_DEPTH = 4;
+constexpr int RQ_DEPTH = SMX_RQ_DEPTH;
+constexpr uint32_t LOG2E_MANT = 0xB8AA3B;  // significand of fl32(log2 e) = 0x3FB8AA3B
+constexpr uint32_t ONE = ctr::ONE_BITS;
 
-// ---- record (fpga/kernels/sequencer/seq_format.h layout)
-constexpr uint32_t OP_SOFTMAX = 0x40;
-constexpr uint32_t REC_MAGIC = 0xC5;
-constexpr uint32_t F_QOUT = 0x0002;           // int16 q + FP32 scales (else FP32 probabilities, rows only)
-constexpr uint32_t F_MASK = 0x0100;           // key k visible to row n iff 0 <= E[k] <= D[n]
-constexpr uint32_t F_ENGINE = 0x1000;         // engine layouts (Y tiling in, X interleave + s_tok out)
-constexpr uint32_t F_EMPTY_UNIFORM = 0x2000;  // fully masked row: uniform over its L keys (else zero)
-constexpr uint32_t LOG2E_BITS = 0x3FB8AA3B;   // fl32(log2(e))
-enum Status { ST_OK = 0, ST_DIMS = 1, ST_ALIGN = 2, ST_OPCODE = 3 };
+typedef hls::stream<XW, XS_DEPTH> XStream;
+typedef hls::stream<ap_uint<32>, MX_DEPTH> MStream;
+typedef hls::stream<Word, EQ_DEPTH> QStream;
+typedef hls::stream<ap_uint<23>, SQ_DEPTH> SStream;
+typedef hls::stream<ap_uint<32>, RQ_DEPTH> RStream;
 
 struct Params {
-  int B, N, L;                 // items, rows per item, keys per row
-  bool engine, qout, mask, uniform;
-  ap_uint<32> c_bits;          // c = fl32(p0 * fl32(log2 e)), positive normal
-  int a_pitch, c_pitch;        // rows layout: row pitch of A / C in words
-  WAddr a_off, c_off, d_off, e_off, f_off;
-  WAddr a_stride, c_stride, d_stride, e_stride, f_stride;  // per item, words
-  // derived once by decode() (so the processes need no multipliers of their own)
-  int G;         // key groups: engine Mk/32, rows 1
-  int NR;        // rows per group: engine Np, rows N
-  int SW;        // words per row segment: engine 8, rows a_pitch
-  int wlast;     // last data word of a segment: engine 7, rows ceil(L/4) - 1
-  int nw;        // input words per item (one burst)
-  int rows_all;  // rows through the divider: B * NR
-  int ent_rows;  // rows layout: pass-2 entries of the call, B * N * ceil(L/4)
-  int tiles;     // engine: 32 x 32 tiles per item, G * NR / 32
+  ap_uint<17> B, N, NP, NP4;  // items, rows, rows written, pad4(NP) scales (each <= 65536)
+  ap_uint<7> W;               // input words per row, L / 4 (2..64)
+  ap_uint<6> W2;              // output words per row, L / 8 (1..32)
+  bool mask, a_contig, c_contig;
+  ap_uint<17> mc;             // c = mc 2^(ec - 16)
+  ap_int<11> kc;              // 153 - ec: fix() shifts M << 24 right by kc - exponent
+  WAddr a, c, d, e, f;        // item 0
+  ap_uint<28> ap, cp;         // row pitches (words)
+  ap_uint<28> as, cs, ds, es, fs;  // item strides (words)
 };
 
-struct MX {  // pass1 -> pass2: one row's max
-  ap_uint<32> bits;
-  bool any;
-};
-struct DN {  // pass2 -> recip: the row sum S normalised, d = S << (34 - p), p = msb(S); zero = (S == 0)
-  ap_uint<35> d;
-  ap_uint<6> p;
-  bool zero;
-};
-typedef ap_uint<92> EQ;  // pass2 -> shaper: 4 lanes of 23 bits (2^x values, or q in uint16 mode)
-
-static inline float u2f(uint32_t u) {
+// ------------------------------------------------------------------ prologue: Cmd -> Params
+// c = fl32(p0' * fl32(log2 e)), p0' = max(p0, 2^-126) (p0 > 0 by validate_hw), as an exact integer RNE product,
+// then Mc = c's significand rounded half up to 17 bits.
+static inline void c_params(uint32_t p0, ap_uint<17>& mc, ap_int<10>& ec) {
 #pragma HLS INLINE
-  float f;
-  memcpy(&f, &u, sizeof f);
-  return f;
-}
-static inline uint32_t f2u(float f) {
-#pragma HLS INLINE
-  uint32_t u;
-  memcpy(&u, &f, sizeof u);
-  return u;
-}
-
-// ------------------------------------------------------------------ geometry of one item
-static inline void derive(Params& p) {
-#pragma HLS INLINE
-  if (SMX_ENGINE && p.engine) {
-    p.G = (p.L + 31) >> 5;
-    p.NR = (p.N + 31) & ~31;
-    p.SW = 8;
-    p.wlast = 7;
-  } else {
-    p.G = 1;
-    p.NR = p.N;
-    p.SW = p.a_pitch;
-    p.wlast = ((p.L + 3) >> 2) - 1;
+  const ap_uint<32> pb = p0;
+  ap_uint<8> e0 = pb.range(30, 23);
+  ap_uint<24> m0 = (ap_uint<24>)pb.range(22, 0) | (ap_uint<24>)0x800000;
+  if (e0 == 0) {  // below the normal range: 2^-126 (softmax of x c is uniform at that c anyway)
+    e0 = 1;
+    m0 = 0x800000;
   }
-  p.nw = p.G * p.NR * p.SW;
-  p.rows_all = p.B * p.NR;
-  p.ent_rows = p.B * p.N * (p.wlast + 1);
-  p.tiles = p.G * (p.NR >> 5);
-}
-struct Geo {
-  int G, NR, SW, wlast, nw;
-};
-static inline Geo geometry(const Params& p) {
-#pragma HLS INLINE
-  Geo g;
-  g.G = p.G;
-  g.NR = p.NR;
-  g.SW = p.SW;
-  g.wlast = p.wlast;
-  g.nw = p.nw;
-  return g;
+  const ap_uint<24> ml = LOG2E_MANT;
+  ap_uint<48> pr = m0 * ml;  // [2^46, 2^48)
+#pragma HLS BIND_OP variable = pr op = mul impl = dsp
+  const bool hi = pr[47];
+  const ap_uint<24> s24 = hi ? (ap_uint<24>)pr.range(47, 24) : (ap_uint<24>)pr.range(46, 23);
+  const bool rb = hi ? pr[23] : pr[22];
+  const bool st = hi ? pr.range(22, 0) != 0 : pr.range(21, 0) != 0;
+  const ap_uint<25> sr = (ap_uint<25>)s24 + (ap_uint<25>)(rb && (st || s24[0]));
+  const bool cy = sr[24];                                        // rounded up to 2^24
+  const ap_uint<24> sig = cy ? (ap_uint<24>)0x800000 : (ap_uint<24>)sr.range(23, 0);
+  const int be = (int)e0 + (hi ? 1 : 0) + (cy ? 1 : 0);           // biased exponent of c (< 255: p0 < 1e30)
+  const ap_uint<18> mcr = ((ap_uint<18>)(sig >> 6) + 1) >> 1;    // round half up to 17 bits
+  const bool cup = mcr[17];
+  mc = cup ? (ap_uint<17>)(mcr >> 1) : (ap_uint<17>)mcr;
+  ec = (ap_int<10>)(be - 127 + (cup ? 1 : 0));
 }
 
-// ------------------------------------------------------------------ record decode and checks
-static inline uint32_t field(const Word* rec, int j) {
+static inline void make_params(const ctr::Cmd& c, Params& p) {
 #pragma HLS INLINE
-  return (uint32_t)rec[j >> 2].range(32 * (j & 3) + 31, 32 * (j & 3));
-}
-// slot s (A 0 .. F 5): byte address (40 bits), pitch (bytes), batch stride (bytes) -> words; misaligned -> false
-static inline bool slot(const Word* rec, int s, WAddr& off, int& pitch, WAddr& stride) {
-#pragma HLS INLINE
-  const uint32_t w0 = field(rec, 6 + 3 * s), w1 = field(rec, 7 + 3 * s), w2 = field(rec, 8 + 3 * s);
-  const ap_uint<40> addr = ((ap_uint<40>)(w1 & 0xFF) << 32) | w0;
-  const uint32_t pb = w1 >> 8;
-  off = addr >> 4;
-  pitch = (int)(pb >> 4);
-  stride = (WAddr)(w2 >> 4);
-  return (addr & 15) == 0 && (pb & 15) == 0 && (w2 & 15) == 0;
-}
-// decode the 8-word record at rec (opcode, magic and check word are the sequencer's business; checked here
-// only for the opcode), then check the dimensions. Returns a Status.
-static int decode(const Word* rec, Params& p) {
-  const uint32_t f0 = field(rec, 0);
-  const uint32_t flags = f0 >> 16;
-  p.L = (int)field(rec, 3);
-  p.N = (int)field(rec, 4);
-  const uint32_t b = field(rec, 5) & 0xFFFF;
-  p.B = b == 0 ? 1 : (int)b;
-  p.engine = SMX_ENGINE && (flags & F_ENGINE);
-  p.qout = flags & F_QOUT;
-  p.mask = flags & F_MASK;
-  p.uniform = flags & F_EMPTY_UNIFORM;
-  const float c = u2f(field(rec, 24)) * u2f(LOG2E_BITS);  // one IEEE FP32 multiply per call
-  p.c_bits = f2u(c);
-  int pa, pc, pd, pe, pf;
-  bool al = slot(rec, 0, p.a_off, pa, p.a_stride);
-  al &= slot(rec, 2, p.c_off, pc, p.c_stride);
-  al &= slot(rec, 3, p.d_off, pd, p.d_stride);
-  al &= slot(rec, 4, p.e_off, pe, p.e_stride);
-  al &= slot(rec, 5, p.f_off, pf, p.f_stride);
-  p.a_pitch = pa;
-  p.c_pitch = pc;
-  if ((f0 & 0xFF) != OP_SOFTMAX) return ST_OPCODE;
-  if (!al) return ST_ALIGN;
-  const ap_uint<32> cb = p.c_bits;
-  const int ce = cb.range(30, 23);
-  if (cb[31] || ce == 0 || ce == 255) return ST_DIMS;  // c must be a positive normal
-  if (p.L < 1 || p.L > L_MAX || p.N < 1) return ST_DIMS;
-  const int L4 = (p.L + 3) >> 2;
-  if ((flags & F_ENGINE) && !SMX_ENGINE) return ST_DIMS;
-  if (p.engine) {
-    if (((p.N + 31) & ~31) > R_MAX || !p.qout) return ST_DIMS;
-  } else {
-    if (p.a_pitch < L4 || p.c_pitch < (p.qout ? (p.L + 7) >> 3 : L4)) return ST_DIMS;
-    if (!p.qout && !SMX_FP32_OUT) return ST_DIMS;
-    if (p.mask && p.N > R_MAX) return ST_DIMS;
-  }
-  derive(p);
-  return ST_OK;
+  const ctr::Slot &A = c.s[ctr::SLOT_A], &C = c.s[ctr::SLOT_C], &D = c.s[ctr::SLOT_D], &E = c.s[ctr::SLOT_E],
+                  &F = c.s[ctr::SLOT_F];
+  const uint32_t np = c.p[ctr::P_NP] ? c.p[ctr::P_NP] : c.N;
+  p.B = c.B;
+  p.N = c.N;
+  p.NP = np;
+  p.NP4 = (np + 3) & ~3u;
+  p.W = c.K >> 2;
+  p.W2 = c.K >> 3;
+  p.mask = (c.flags & ctr::F_MASK) != 0;
+  ap_int<10> ec;
+  c_params(c.p[ctr::P_EPS], p.mc, ec);
+  p.kc = (ap_int<11>)153 - (ap_int<11>)ec;
+  p.a = (WAddr)(A.addr >> 4);
+  p.c = (WAddr)(C.addr >> 4);
+  p.d = (WAddr)(D.addr >> 4);
+  p.e = (WAddr)(E.addr >> 4);
+  p.f = (WAddr)(F.addr >> 4);
+  p.ap = A.pitch >> 4;
+  p.cp = C.pitch >> 4;
+  p.as = A.stride >> 4;
+  p.cs = C.stride >> 4;
+  p.ds = D.stride >> 4;
+  p.es = E.stride >> 4;
+  p.fs = F.stride >> 4;
+  p.a_contig = p.ap == p.W;
+  p.c_contig = p.cp == p.W2;
 }
 
-// ------------------------------------------------------------------ arithmetic
-// FP32 total-order integer key: monotonic in the float value; its own inverse on the bit pattern.
-static inline ap_int<32> fkey(ap_uint<32> b) {
+// ------------------------------------------------------------------ arithmetic helpers
+static inline ap_uint<32> lane32(const ap_uint<128>& w, int l) {
 #pragma HLS INLINE
-  ap_uint<32> k = b[31] ? (ap_uint<32>)(b ^ 0x7FFFFFFFu) : b;
-  return (ap_int<32>)k;
+  return w.range(32 * l + 31, 32 * l);
 }
 
-// |x| * 2^ec on the Q.21 grid as a 47-bit magnitude, truncated toward zero, saturating at 2^47 - 1 (also inf/NaN);
-// e == 0 (zero/denormal) -> 0.
-static inline ap_uint<47> fixmag(ap_uint<32> b, ap_int<10> ec) {
+// FP32 total-order integer key (monotonic in the value; its own inverse on the bit pattern); KMIN if not valid.
+static inline ap_int<32> okey(ap_uint<32> b, bool valid) {
+#pragma HLS INLINE
+  const ap_uint<32> k = b[31] ? (ap_uint<32>)(b ^ 0x7FFFFFFFu) : b;
+  return valid ? (ap_int<32>)k : (ap_int<32>)(ap_uint<32>)0x80000000u;
+}
+
+// ~G(x) on 48 bits for the FP32 bits b, where G(x) = fix(x) + 2^47 for x >= 0 and fix(x) + 2^47 - 1 for x < 0,
+// fix(x) = sign(x) trunc(|x| 2^(e - 150 + ec + 21)) on 47 bits (|.| saturating at 2^47 - 1, e == 0 -> 0):
+// the magnitude is M << 24 >> (kc - e), M = 1.mantissa. Then fix(m) - fix(x) = G(m) + ~G(x) + (s_m | !s_x)
+// whenever x <= m (only one 48-bit adder per lane).
+static inline ap_uint<48> neg_g(ap_uint<32> b, ap_int<11> kc) {
 #pragma HLS INLINE
   const ap_uint<8> e = b.range(30, 23);
   const ap_uint<48> m = ((ap_uint<48>)((ap_uint<24>)b.range(22, 0) | (ap_uint<24>)0x800000)) << 24;
-  const ap_int<12> k = (ap_int<12>)153 - (ap_int<12>)e - (ap_int<12>)ec;  // right shift of M << 24
-  ap_uint<47> v;
+  const ap_int<11> k = kc - (ap_int<11>)(ap_uint<11>)e;  // right shift of M << 24
+  ap_uint<47> mag;
   if (e == 0 || k >= 48)
-    v = 0;
+    mag = 0;
   else if (k <= 0 || e == 255)
-    v = (ap_uint<47>)0x7FFFFFFFFFFFULL;
+    mag = (ap_uint<47>)0x7FFFFFFFFFFFULL;
   else
-    v = (ap_uint<47>)(m >> (int)k);
-  return v;
-}
-static inline ap_int<48> fix(ap_uint<32> b, ap_int<10> ec) {
-#pragma HLS INLINE
-  const ap_uint<47> v = fixmag(b, ec);
-  return b[31] ? (ap_int<48>)(-(ap_int<48>)v) : (ap_int<48>)v;
+    mag = (ap_uint<47>)(m >> (unsigned)k);
+  // G = s ? (0, ~mag) : (1, mag)  ->  ~G = s ? (1, mag) : (0, ~mag)
+  const bool s = b[31];
+  const ap_uint<47> lo = s ? mag : (ap_uint<47>)~mag;
+  return ((ap_uint<48>)(s ? 1 : 0) << 47) | (ap_uint<48>)lo;
 }
 
-// c = Mc * 2^ec, Mc = round(significand * 2^16) in [2^16, 2^17)
-static inline void cparams(ap_uint<32> cb, ap_uint<17>& mc, ap_int<10>& ec) {
-#pragma HLS INLINE
-  const ap_uint<24> cm = (ap_uint<24>)cb.range(22, 0) | (ap_uint<24>)0x800000;
-  const ap_uint<18> mcr = ((ap_uint<18>)(cm >> 6) + 1) >> 1;
-  const bool cup = mcr[17];
-  mc = cup ? (ap_uint<17>)(mcr >> 1) : (ap_uint<17>)mcr;
-  ec = (ap_int<10>)((int)cb.range(30, 23) - 127 + (cup ? 1 : 0));
-}
-
-// 2^(-t) * 32767/32768 * 2^23 for t = u * Mc in Q.37 (u: Q.21 distance to the max, Mc: Q1.16 of c's significand).
-// One table copy (1024 x 36 bits, one BRAM36, two ports) per pair of lanes.
+// q of two lanes from their distances u (Q.21) to the row max: one 1024 x 36-bit table (one BRAM36, two read
+// ports) per pair of lanes. q = (h + 257) >> 9 with h = 2 e23 >> I, I = integer part of u Mc (0 when I >= 17).
 template <int PAIR>
-static inline void exp_pair(ap_uint<26> u0, ap_uint<26> u1, ap_uint<17> mc, ap_uint<23>& e0, ap_uint<23>& e1) {
+static inline void q_pair(ap_uint<26> u0, ap_uint<26> u1, ap_uint<17> mc, ap_uint<15>& q0, ap_uint<15>& q1) {
 #pragma HLS INLINE
   static const ap_uint<36> TAB[1024] = SMX_TAB_INIT;
 #pragma HLS BIND_STORAGE variable = TAB type = rom_2p impl = bram
   ap_uint<26> u[2] = {u0, u1};
-  ap_uint<23> e[2];
+  ap_uint<15> q[2];
   for (int l = 0; l < 2; l++) {
 #pragma HLS UNROLL
-    const ap_uint<43> t = (ap_uint<43>)u[l] * mc;
+    ap_uint<43> t = (ap_uint<43>)u[l] * mc;
+#pragma HLS BIND_OP variable = t op = mul impl = dsp
     const ap_uint<6> I = t.range(42, 37);
     const ap_uint<10> ix = t.range(36, 27);
     const ap_uint<13> flo = t.range(26, 14);
     const ap_uint<36> te = TAB[ix];
     const ap_uint<23> T = te.range(35, 13);
     const ap_uint<13> S = te.range(12, 0);
-    const ap_uint<26> corr = S * flo;
+    ap_uint<26> corr = S * flo;
+#pragma HLS BIND_OP variable = corr op = mul impl = dsp
     const ap_uint<23> e23 = T - (ap_uint<23>)corr.range(25, 13);
-    const ap_uint<24> h = ((ap_uint<24>)e23 << 1) >> (int)I;  // round(e23 / 2^I), half up
-    e[l] = (I >= 24) ? (ap_uint<23>)0 : (ap_uint<23>)((h + 1) >> 1);
+    const ap_uint<24> h = ((ap_uint<24>)e23 << 1) >> (unsigned)I.range(4, 0);
+    const ap_uint<24> r = h + (ap_uint<24>)257;
+    q[l] = I >= 17 ? (ap_uint<15>)0 : (ap_uint<15>)r.range(23, 9);
   }
-  e0 = e[0];
-  e1 = e[1];
+  q0 = q[0];
+  q1 = q[1];
 }
 
-// Exact FP32 bits of an integer 0 <= v < 2^23 (every such value is representable).
-static inline ap_uint<32> u23_to_f32(ap_uint<23> v) {
+// ------------------------------------------------------------------ reader (xmem)
+// One burst of nw words at base, one call site for every read of the unit (so one m_axi read path):
+//   KIND_E  the rank_k table (W words)          KIND_D  the block's rank_q table (ceil(rows / 4) words)
+//   KIND_X  scores: row max (two partial maxima of alternating words, so the running compare has two
+//           clocks) and visibility; data + visibility to xs, each row's max bits to mx after its last word.
+enum { KIND_X = 0, KIND_E = 1, KIND_D = 2 };
+static void read_burst(const Word* xm, WAddr base, ap_uint<15> nw, ap_uint<2> kind, ap_uint<7> W, bool mask,
+                       ap_uint<9>& n, ap_uint<128> etab[W_MAX], ap_uint<128> dtab[BLK / 4], XStream& xs,
+                       MStream& mx) {
 #pragma HLS INLINE
-  int msb = 0;
-  for (int i = 0; i < 23; i++) {
-#pragma HLS UNROLL
-    if (v[i]) msb = i;
-  }
-  const ap_uint<23> mant = (ap_uint<23>)(v << (23 - msb));
-  const ap_uint<8> ex = (ap_uint<8>)(127 + msb);
-  return v == 0 ? (ap_uint<32>)0 : (ap_uint<32>)((ap_uint<9>)ex, mant);
-}
-
-// lane s (16 bits) of a 64-bit entry: a 4:1 mux of fixed slices (a variable range() costs a 64-bit shifter)
-static inline ap_uint<16> lane16(ap_uint<64> x, ap_uint<2> s) {
-#pragma HLS INLINE
-  const ap_uint<16> a = x.range(15, 0), b = x.range(31, 16), c = x.range(47, 32), d = x.range(63, 48);
-  return s[1] ? (s[0] ? d : c) : (s[0] ? b : a);
-}
-
-// ------------------------------------------------------------------ rank tables (per pass, from its own port)
-// E: ranks of keys 4i..4i+3 in entry i (16 bits each), clamped: E < 0 or E >= 0x7FFF -> 0x7FFF (never visible).
-// D: ranks of rows 4i..4i+3, clamped to [-1, 0x7FFE]. Visible iff (int16) E <= (int16) D.
-static inline ap_uint<16> clamp_e(ap_uint<32> v) {
-#pragma HLS INLINE
-  const ap_int<32> e = (ap_int<32>)v;
-  return (e < 0 || e >= 0x7FFF) ? (ap_uint<16>)0x7FFF : (ap_uint<16>)e;
-}
-static inline ap_uint<16> clamp_d(ap_uint<32> v) {
-#pragma HLS INLINE
-  const ap_int<32> d = (ap_int<32>)v;
-  return d < 0 ? (ap_uint<16>)0xFFFF : d > 0x7FFE ? (ap_uint<16>)0x7FFE : (ap_uint<16>)d;
-}
-static void load_tables(const Word* mem, WAddr eoff, WAddr doff, int L, int N, ap_uint<64> etab[EW],
-                        ap_uint<64> dtab[DW]) {
-  const int ne = (L + 3) >> 2;
-  const int nd = N < R_MAX ? (N + 3) >> 2 : DW;
-ld_e:
-  for (int i = 0; i < ne; i++) {
+  ap_uint<7> w = 0;
+  ap_int<32> pm1 = 0, pm2 = 0;  // partial max of the previous word's parity / of this word's parity
+words_r:
+  for (ap_uint<15> i = 0; i < nw; i++) {
 #pragma HLS PIPELINE II = 1
-#pragma HLS LOOP_TRIPCOUNT max = 64
-    const Word v = mem[eoff + i];
-    ap_uint<64> t;
+#pragma HLS LOOP_TRIPCOUNT max = 16384
+#pragma HLS DEPENDENCE variable = etab inter false
+#pragma HLS DEPENDENCE variable = dtab inter false
+    const Word v = xm[base + i];
+    if (kind == KIND_E) etab[i.range(5, 0)] = v;
+    if (kind == KIND_D) dtab[i.range(5, 0)] = v;
+    const ap_uint<128> ev = etab[w.range(5, 0)];
+    const ap_uint<128> dw = dtab[n.range(7, 2)];
+    const ap_uint<2> nl = n.range(1, 0);
+    const ap_uint<32> dv = nl == 0 ? lane32(dw, 0) : nl == 1 ? lane32(dw, 1) : nl == 2 ? lane32(dw, 2) : lane32(dw, 3);
+    ap_uint<4> vis;
+    ap_int<32> k[4];
     for (int l = 0; l < 4; l++) {
 #pragma HLS UNROLL
-      t.range(16 * l + 15, 16 * l) = clamp_e(v.range(32 * l + 31, 32 * l));
+      // 0 <= E <= D in int32: D >= 0 and E <= D as unsigned (a negative E is >= 2^31 unsigned)
+      vis[l] = !mask || (!dv[31] && lane32(ev, l) <= dv);
+      k[l] = okey(lane32(v, l), vis[l]);
     }
-    etab[i] = t;
-  }
-ld_d:
-  for (int i = 0; i < nd; i++) {
-#pragma HLS PIPELINE II = 1
-#pragma HLS LOOP_TRIPCOUNT max = 64
-    const Word v = mem[doff + i];
-    ap_uint<64> t;
-    for (int l = 0; l < 4; l++) {
-#pragma HLS UNROLL
-      t.range(16 * l + 15, 16 * l) = clamp_d(v.range(32 * l + 31, 32 * l));
+    const ap_int<32> k01 = k[1] > k[0] ? k[1] : k[0], k23 = k[3] > k[2] ? k[3] : k[2];
+    const ap_int<32> k4 = k23 > k01 ? k23 : k01;
+    const ap_int<32> prev = w < 2 ? (ap_int<32>)(ap_uint<32>)0x80000000u : pm2;
+    const ap_int<32> nm = k4 > prev ? k4 : prev;
+    if (kind == KIND_X) {
+      xs.write(((XW)vis << 128) | (XW)v);
+      if (w == W - 1) {
+        const ap_int<32> fm = nm > pm1 ? nm : pm1;  // W is even: pm1 holds the other parity's max
+        const ap_uint<32> fb = fm;
+        mx.write(fb[31] ? (ap_uint<32>)(fb ^ 0x7FFFFFFFu) : fb);  // the key's own bit pattern
+      }
     }
-    dtab[i] = t;
+    if (w == W - 1) {
+      w = 0;
+      n++;
+    } else {
+      w++;
+    }
+    pm2 = pm1;
+    pm1 = nm;
   }
 }
 
-// validity of the 4 lanes of data word w of row n in group g (keys kw * 4 + l, kw = engine ? 8 g + w : w)
-static inline ap_uint<4> lanes_valid(const Params& p, ap_uint<9> kw, int n, bool rowv, const ap_uint<64>* etab,
-                                     const ap_uint<64>* dtab) {
-#pragma HLS INLINE
-  const ap_uint<64> ev = etab[kw];
-  const ap_uint<64> dv4 = dtab[(n >> 2) & (DW - 1)];
-  const ap_int<16> dv = (ap_int<16>)lane16(dv4, (ap_uint<2>)(n & 3));
-  ap_uint<4> val = 0;
-  for (int l = 0; l < 4; l++) {
-#pragma HLS UNROLL
-    const bool vis = !p.mask || (ap_int<16>)ev.range(16 * l + 15, 16 * l) <= dv;
-    val[l] = rowv && ((ap_uint<12>)(kw * 4 + l) < (ap_uint<12>)p.L) && vis;
-  }
-  return val;
-}
-
-// ------------------------------------------------------------------ pass 1: row max (hp0)
-static void pass1(const Word* mem, hls::stream<MX>& mx, Params p) {
-  ap_uint<64> etab[EW], dtab[DW];
+static void reader(const Word* xm, XStream& xs, MStream& mx, const Params p) {
+  ap_uint<128> etab[W_MAX];   // rank_k of keys 4i..4i+3
+  ap_uint<128> dtab[BLK / 4];  // rank_q of the block's rows 4i..4i+3
 #pragma HLS BIND_STORAGE variable = etab type = ram_s2p impl = lutram
 #pragma HLS BIND_STORAGE variable = dtab type = ram_s2p impl = lutram
-  ap_uint<33> mst[R_MAX];  // engine: (any, max key) of each row between its segments
-#pragma HLS BIND_STORAGE variable = mst type = ram_s2p impl = bram
-  const Geo geo = geometry(p);
-  WAddr abase = p.a_off, ebase = p.e_off, dbase = p.d_off;
-items1:
-  for (int it = 0; it < p.B; it++) {
-#pragma HLS LOOP_TRIPCOUNT max = 16
-    if (p.mask && (it == 0 || p.e_stride != 0 || p.d_stride != 0)) load_tables(mem, ebase, dbase, p.L, p.N, etab, dtab);
-    ap_uint<6> g = 0;
-    int n = 0;
-    ap_uint<24> w = 0;
-    ap_int<32> km = KMIN;
-    bool any = false;
-  words1:
-    for (int i = 0; i < geo.nw; i++) {
-#pragma HLS PIPELINE II = 1
-#pragma HLS LOOP_TRIPCOUNT max = 65536
-#pragma HLS DEPENDENCE variable = mst inter false
-      const Word v = mem[abase + i];
-      if (w <= (ap_uint<24>)geo.wlast) {
-        const ap_uint<9> kw = (p.engine ? (ap_uint<9>)(g * 8) : (ap_uint<9>)0) + (ap_uint<9>)w;
-        const ap_uint<4> val = lanes_valid(p, kw, n, n < p.N, etab, dtab);
-        ap_int<32> k[4];
-        for (int l = 0; l < 4; l++) {
-#pragma HLS UNROLL
-          k[l] = val[l] ? fkey(v.range(32 * l + 31, 32 * l)) : (ap_int<32>)KMIN;
+  WAddr ia = p.a, ie = p.e, id = p.d;
+items_r:
+  for (ap_uint<17> b = 0; b < p.B; b++) {
+#pragma HLS LOOP_TRIPCOUNT max = 24
+    const bool load_e = p.mask && (b == 0 || p.es != 0);
+    WAddr ra = ia, rd = id;
+  blocks_r:
+    for (ap_uint<17> r0 = 0; r0 < p.N; r0 += BLK) {
+#pragma HLS LOOP_TRIPCOUNT max = 1
+      const ap_uint<17> left = p.N - r0;
+      const ap_uint<9> rows = left > BLK ? (ap_uint<9>)BLK : (ap_uint<9>)left;
+      // bursts of the block: [rank_k (first block of an item that needs it)] [rank_q (F_MASK)] then the scores:
+      // one burst if the rows are contiguous (A pitch = 4 L), else one per row
+      const bool e_here = load_e && r0 == 0;
+      const ap_uint<2> pre = (ap_uint<2>)(e_here ? 1 : 0) + (ap_uint<2>)(p.mask ? 1 : 0);
+      const ap_uint<9> nb = p.a_contig ? (ap_uint<9>)1 : rows;
+      const ap_uint<15> nw = p.a_contig ? (ap_uint<15>)(rows * p.W) : (ap_uint<15>)p.W;
+      const ap_uint<28> step = p.a_contig ? (ap_uint<28>)((ap_uint<28>)p.W << 8) : p.ap;
+      ap_uint<9> n = 0;
+    bursts_r:
+      for (ap_uint<10> j = 0; j < nb + pre; j++) {
+#pragma HLS LOOP_TRIPCOUNT max = 3
+        ap_uint<2> kind = KIND_X;
+        WAddr base = ra;
+        ap_uint<15> len = nw;
+        if (j < pre) {
+          const bool is_e = e_here && j == 0;
+          kind = is_e ? KIND_E : KIND_D;
+          base = is_e ? ie : rd;
+          len = is_e ? (ap_uint<15>)p.W : (ap_uint<15>)((rows + 3) >> 2);
         }
-        const ap_int<32> k01 = k[1] > k[0] ? k[1] : k[0], k23 = k[3] > k[2] ? k[3] : k[2];
-        const ap_int<32> k4 = k23 > k01 ? k23 : k01;
-        ap_int<32> kin = km;
-        bool ain = any;
-        if (w == 0) {
-          kin = KMIN;
-          ain = false;
-#if SMX_ENGINE
-          const ap_uint<33> s = mst[n & (R_MAX - 1)];
-          if (g != 0) {
-            kin = (ap_int<32>)s.range(31, 0);
-            ain = s[32];
-          }
-#endif
-        }
-        const ap_int<32> kn = k4 > kin ? k4 : kin;
-        const bool an = ain || val != 0;
-        km = kn;
-        any = an;
-        if (w == (ap_uint<24>)geo.wlast) {
-          if (g == geo.G - 1) {
-            MX m;
-            m.bits = (ap_uint<32>)fkey((ap_uint<32>)kn);  // the key's own bit pattern
-            m.any = an;
-            mx.write(m);
-          } else {
-#if SMX_ENGINE
-            mst[n & (R_MAX - 1)] = ((ap_uint<1>)an, (ap_uint<32>)kn);
-#endif
-          }
+        ap_uint<9> nn = kind == KIND_X ? n : (ap_uint<9>)0;
+        read_burst(xm, base, len, kind, p.W, p.mask, nn, etab, dtab, xs, mx);
+        if (kind == KIND_X) {
+          n = nn;
+          ra += step;
         }
       }
-      if (w == (ap_uint<24>)(geo.SW - 1)) {
-        w = 0;
-        if (n == geo.NR - 1) {
-          n = 0;
-          g++;
-        } else {
-          n++;
-        }
+      rd += BLK / 4;
+    }
+    ia += p.as;
+    ie += p.es;
+    id += p.ds;
+  }
+}
+
+// ------------------------------------------------------------------ compute
+static void compute(XStream& xs, MStream& mx, QStream& eq, SStream& sq, const Params p) {
+items_c:
+  for (ap_uint<17> b = 0; b < p.B; b++) {
+#pragma HLS LOOP_TRIPCOUNT max = 24
+    ap_uint<17> n = 0;
+    ap_uint<7> w = 0;  // 0: setup (the row max), 1..W: data words
+    ap_uint<48> gm = 0;
+    bool sm = false;
+    ap_uint<23> sum = 0;
+    ap_uint<64> pend = 0;
+    bool last = false;
+  rows_c:
+    while (!last) {
+#pragma HLS PIPELINE II = 1
+#pragma HLS LOOP_TRIPCOUNT max = 16640
+      const bool setup = w == 0, real = n < p.N;
+      // x / mb: this iteration's FIFO data; their value when not read is never used (no hold register)
+      XW x;
+      ap_uint<32> mb;
+      if (real) {
+        if (setup)
+          mb = mx.read();
+        else
+          x = xs.read();
+      }
+      const ap_uint<32> b0 = setup ? mb : lane32(x, 0);
+      ap_uint<48> ng[4];
+      ng[0] = neg_g(b0, p.kc);
+      for (int l = 1; l < 4; l++) {
+#pragma HLS UNROLL
+        ng[l] = neg_g(lane32(x, l), p.kc);
+      }
+      ap_uint<26> u[4];
+      for (int l = 0; l < 4; l++) {
+#pragma HLS UNROLL
+        const bool sx = x[32 * l + 31];
+        // G(m) + ~G(x) + carry as one 49-bit adder: (2 G(m) + 1) + (2 ~G(x) + carry), then >> 1
+        const ap_uint<49> d2 = (((ap_uint<49>)gm << 1) | 1) + (((ap_uint<49>)ng[l] << 1) | (ap_uint<49>)(sm || !sx));
+        const ap_uint<48> d = d2.range(48, 1);
+        u[l] = d.range(47, 26) != 0 ? (ap_uint<26>)0x3FFFFFF : (ap_uint<26>)d.range(25, 0);
+      }
+      ap_uint<15> q[4];
+      q_pair<0>(u[0], u[1], p.mc, q[0], q[1]);
+      q_pair<1>(u[2], u[3], p.mc, q[2], q[3]);
+      ap_uint<64> q4 = 0;
+      ap_uint<17> s4 = 0;
+      for (int l = 0; l < 4; l++) {
+#pragma HLS UNROLL
+        const ap_uint<15> ql = (real && x[128 + l]) ? q[l] : (ap_uint<15>)0;
+        q4.range(16 * l + 15, 16 * l) = ql;
+        s4 += ql;
+      }
+      const ap_uint<23> ns = sum + s4;
+      if (setup) {
+        gm = ~ng[0];  // G(m)
+        sm = mb[31];
+        sum = 0;
       } else {
-        w++;
-      }
-    }
-    abase += p.a_stride;
-    ebase += p.e_stride;
-    dbase += p.d_stride;
-  }
-}
-
-// ------------------------------------------------------------------ pass 2: exp, q, row sums (hp1)
-static void pass2(const Word* mem, hls::stream<MX>& mx, hls::stream<EQ>& eq, hls::stream<DN>& sq, Params p) {
-  ap_uint<64> etab[EW], dtab[DW];
-#pragma HLS BIND_STORAGE variable = etab type = ram_s2p impl = lutram
-#pragma HLS BIND_STORAGE variable = dtab type = ram_s2p impl = lutram
-  ap_uint<84> rst[R_MAX];  // engine: (any, max on the Q.21 grid, partial sum) of each row between its segments
-#pragma HLS BIND_STORAGE variable = rst type = ram_s2p impl = bram
-  const Geo geo = geometry(p);
-  const bool fp32 = SMX_FP32_OUT && !p.qout;
-  ap_uint<17> mc;
-  ap_int<10> ec;
-  cparams(p.c_bits, mc, ec);
-  WAddr abase = p.a_off, ebase = p.e_off, dbase = p.d_off;
-items2:
-  for (int it = 0; it < p.B; it++) {
-#pragma HLS LOOP_TRIPCOUNT max = 16
-    if (p.mask && (it == 0 || p.e_stride != 0 || p.d_stride != 0)) load_tables(mem, ebase, dbase, p.L, p.N, etab, dtab);
-    ap_uint<6> g = 0;
-    int n = 0;
-    ap_uint<24> w = 0;
-    ap_int<48> xm = 0;
-    bool any = false;
-    ap_uint<35> sum = 0;
-  words2:
-    for (int i = 0; i < geo.nw; i++) {
-#pragma HLS PIPELINE II = 1
-#pragma HLS LOOP_TRIPCOUNT max = 65536
-#pragma HLS DEPENDENCE variable = rst inter false
-      const Word v = mem[abase + i];
-      if (w <= (ap_uint<24>)geo.wlast) {
-        const bool rowv = n < p.N;
-        const ap_uint<9> kw = (p.engine ? (ap_uint<9>)(g * 8) : (ap_uint<9>)0) + (ap_uint<9>)w;
-        const ap_uint<4> val = lanes_valid(p, kw, n, rowv, etab, dtab);
-        ap_int<48> xmi = xm;
-        bool ai = any;
-        ap_uint<35> si = sum;
-        if (w == 0) {
-          if (g == 0) {
-            const MX m = mx.read();
-            xmi = fix(m.bits, ec);
-            ai = m.any;
-            si = 0;
-          } else {
-#if SMX_ENGINE
-            const ap_uint<84> s = rst[n & (R_MAX - 1)];
-            ai = s[83];
-            xmi = (ap_int<48>)s.range(82, 35);
-            si = s.range(34, 0);
-#endif
-          }
-        }
-        ap_uint<26> u[4];
-        for (int l = 0; l < 4; l++) {
-#pragma HLS UNROLL
-          const ap_uint<32> b = v.range(32 * l + 31, 32 * l);
-          const ap_uint<47> mag = fixmag(b, ec);
-          const ap_int<49> d = b[31] ? (ap_int<49>)((ap_int<49>)xmi + (ap_int<49>)mag)
-                                     : (ap_int<49>)((ap_int<49>)xmi - (ap_int<49>)mag);
-          u[l] = (!ai || d <= 0) ? (ap_uint<26>)0 : (d >= (1 << 26)) ? (ap_uint<26>)0x3FFFFFF : (ap_uint<26>)d;
-        }
-        ap_uint<23> e[4];
-        exp_pair<0>(u[0], u[1], mc, e[0], e[1]);
-        exp_pair<1>(u[2], u[3], mc, e[2], e[3]);
-        EQ o = 0;
-        ap_uint<26> s4 = 0;
-        for (int l = 0; l < 4; l++) {
-#pragma HLS UNROLL
-          const bool inr = (ap_uint<12>)(kw * 4 + l) < (ap_uint<12>)p.L;
-          const bool use = rowv && (ai ? (bool)val[l] : (inr && p.uniform));
-          const ap_uint<23> el = use ? e[l] : (ap_uint<23>)0;
-          const ap_uint<23> ql = (el + 128) >> 8;  // q in [0, 32767]
-          const ap_uint<23> ol = fp32 ? el : ql;
-          o.range(23 * l + 22, 23 * l) = ol;
-          s4 += ol;
-        }
-        eq.write(o);
-        const ap_uint<35> ns = si + s4;
-        xm = xmi;
-        any = ai;
         sum = ns;
-        if (w == (ap_uint<24>)geo.wlast) {
-          if (g == geo.G - 1) {
-            int msb = 0;
-            for (int bb = 0; bb < 35; bb++) {
-#pragma HLS UNROLL
-              if (ns[bb]) msb = bb;
-            }
-            DN dn;
-            dn.d = ns << (34 - msb);
-            dn.p = msb;
-            dn.zero = ns == 0;
-            sq.write(dn);
-          } else {
-#if SMX_ENGINE
-            rst[n & (R_MAX - 1)] = ((ap_uint<1>)ai, (ap_uint<48>)xmi, ns);
-#endif
-          }
-        }
+        if (w[0])
+          pend = q4;
+        else
+          eq.write(((Word)q4 << 64) | (Word)pend);
+        if (w == p.W) sq.write(ns);
       }
-      if (w == (ap_uint<24>)(geo.SW - 1)) {
+      last = n == p.NP - 1 && w == p.W;
+      if (w == p.W) {
         w = 0;
-        if (n == geo.NR - 1) {
-          n = 0;
-          g++;
-        } else {
-          n++;
-        }
+        n++;
       } else {
         w++;
       }
     }
-    abase += p.a_stride;
-    ebase += p.e_stride;
-    dbase += p.d_stride;
+  pad_c:
+    for (ap_uint<17> r = p.NP; r < p.NP4; r++) {  // the scale vector's pad lanes: sum 0 -> 1.0
+#pragma HLS PIPELINE II = 1
+#pragma HLS LOOP_TRIPCOUNT max = 3
+      sq.write(0);
+    }
   }
 }
 
-// ------------------------------------------------------------------ RN(1 / S), FP32 bits (0 for S = 0)
-// Restoring division of 2^34 by d = S << (34 - p): q = floor(2^(25 + p) / S) in (2^24, 2^25], 26 quotient bits,
-// then round to nearest even with the remainder as sticky bit. Two units, one bit per cycle each, take the rows
-// in turn (unit 0 loads at s = 0, unit 1 at s = 13 of a 26-cycle frame): one row every 13 cycles.
-struct DivState {
-  ap_uint<36> r;
-  ap_uint<35> d;
-  ap_uint<26> q;
-  ap_uint<6> p;
-  bool zero, act;
-};
-static inline ap_uint<32> div_finish(const DivState& u) {
+// ------------------------------------------------------------------ divider: RN(1 / S) as FP32 bits (1.0 for S == 0)
+// S < 2^23 normalised to d = S << (22 - p) (p = msb S); q = floor(2^47 / d) in (2^24, 2^25] by restoring division,
+// two quotient bits per clock (radix 4: 2r against d, 2d, 3d, i.e. two radix-2 steps); round to nearest even
+// with the remainder as sticky bit. One unit, 14 clocks per row (load + 13 steps); each row's scale is written
+// before the next sum is read, so the unit never waits on a later row (no lookahead, no deadlock).
+static inline ap_uint<32> div_finish(ap_uint<26> q, bool sticky, ap_uint<5> pe, bool zero) {
 #pragma HLS INLINE
   ap_uint<32> bits;
-  if (u.zero) {
-    bits = 0;
-  } else if (u.q[25]) {  // S = 2^p
-    bits = (ap_uint<32>)(127 - u.p) << 23;
+  if (zero) {
+    bits = ONE;
+  } else if (q[25]) {  // S = 2^p
+    bits = (ap_uint<32>)(127 - pe) << 23;
   } else {
-    const bool up = u.q[0] && (u.r != 0 || u.q[1]);
-    const ap_uint<25> sig = (ap_uint<25>)(u.q >> 1) + (ap_uint<25>)up;
-    const ap_uint<8> ex = (ap_uint<8>)(126 - u.p) + (ap_uint<8>)sig[24];
+    const bool up = q[0] && (sticky || q[1]);
+    const ap_uint<25> sig = (ap_uint<25>)(q >> 1) + (ap_uint<25>)up;
+    const ap_uint<8> ex = (ap_uint<8>)(126 - pe) + (ap_uint<8>)sig[24];
     bits = ((ap_uint<9>)ex, (ap_uint<23>)sig.range(22, 0));
   }
   return bits;
 }
-static inline void div_step(DivState& u) {
-#pragma HLS INLINE
-  const ap_int<37> t = (ap_int<37>)u.r - (ap_int<37>)u.d;
-  const bool bit = t >= 0;
-  const ap_uint<36> rr = bit ? (ap_uint<36>)t : u.r;
-  u.q = (u.q << 1) | (ap_uint<26>)bit;
-  u.r = rr << 1;
-}
-static void recip(hls::stream<DN>& sq, hls::stream<ap_uint<32> >& rq, Params p) {
-  const int rows = p.rows_all;  // every row of every item (engine: padding rows too)
-  const int total = (rows + 1) * NSTEP;
-  DivState u0, u1;
-  u0.act = false;
-  u1.act = false;
-  u0.r = u1.r = 0;
-  u0.d = u1.d = 0;
-  u0.q = u1.q = 0;
-  u0.p = u1.p = 0;
-  u0.zero = u1.zero = false;
-  ap_uint<5> s = 0;
-  int loaded = 0;
-divide:
-  for (int i = 0; i < total; i++) {
-#pragma HLS PIPELINE II = 1
-#pragma HLS LOOP_TRIPCOUNT max = 3342336
-    const bool slot0 = s == 0, slot1 = s == 13;
-    const bool ld = (slot0 || slot1) && loaded < rows;
-    DN v;
-    v.d = 0;
-    v.p = 0;
-    v.zero = true;
-    if (ld) {
-      v = sq.read();
-      loaded++;
-    }
-    if (slot0) {
-      u0.act = ld;
-      u0.d = v.d;
-      u0.p = v.p;
-      u0.zero = v.zero;
-      u0.r = (ap_uint<36>)1 << 34;
-      u0.q = 0;
-    }
-    if (slot1) {
-      u1.act = ld;
-      u1.d = v.d;
-      u1.p = v.p;
-      u1.zero = v.zero;
-      u1.r = (ap_uint<36>)1 << 34;
-      u1.q = 0;
-    }
-    div_step(u0);
-    div_step(u1);
-    const bool f0 = s == 25 && u0.act, f1 = s == 12 && u1.act;
-    if (f0 || f1) rq.write(div_finish(f0 ? u0 : u1));
-    s = s == 25 ? (ap_uint<5>)0 : (ap_uint<5>)(s + 1);
-  }
-}
-
-// ------------------------------------------------------------------ shaper: output words in DDR order
-static void shaper(hls::stream<EQ>& eq, hls::stream<Word>& bc, Params p) {
-  const Geo geo = geometry(p);
-  if (!p.engine) {
-    const bool fp32 = SMX_FP32_OUT && !p.qout;
-    const int L4 = geo.wlast + 1;
-    const int total = p.ent_rows;
-    ap_uint<10> w = 0;
-    ap_uint<64> pend = 0;
-  rows_s:
-    for (int i = 0; i < total; i++) {
-#pragma HLS PIPELINE II = 1
-#pragma HLS LOOP_TRIPCOUNT max = 262144
-      const EQ e = eq.read();
-      Word o = 0;
-      ap_uint<64> q4 = 0;
-      for (int l = 0; l < 4; l++) {
-#pragma HLS UNROLL
-        o.range(32 * l + 22, 32 * l) = e.range(23 * l + 22, 23 * l);
-        q4.range(16 * l + 15, 16 * l) = e.range(23 * l + 15, 23 * l);
-      }
-      const bool last = w == (ap_uint<10>)(L4 - 1);
-      if (fp32) {
-        bc.write(o);
-      } else if (w[0]) {
-        bc.write((q4, pend));
-      } else if (last) {
-        bc.write((ap_uint<64>(0), q4));
-      } else {
-        pend = q4;
-      }
-      w = last ? (ap_uint<10>)0 : (ap_uint<10>)(w + 1);
-    }
-  }
-#if SMX_ENGINE
-  else {
-    // tile (g, b): rows 32 b .. 32 b + 31, keys 32 g .. 32 g + Kg - 1, 256 entries in (row, word) order in;
-    // out Kg x 4 words, word qd of key k = rows 8 qd .. 8 qd + 7 (one per bank) of key k.
-    // Banks by row % 8, entry (pp, row / 8 % 4, word) holds the 4 keys of that word: 8 x 64 x 64 bits.
-    ap_uint<64> xb[8][64];
-#pragma HLS ARRAY_PARTITION variable = xb complete dim = 1
-#pragma HLS BIND_STORAGE variable = xb type = ram_s2p impl = lutram
-    const int tiles = p.tiles;
-  items_s:
-    for (int it = 0; it < p.B; it++) {
-#pragma HLS LOOP_TRIPCOUNT max = 16
-      const int total = (tiles + 1) * 256;
-      int t = 0;
-      ap_uint<8> j = 0;
-      ap_uint<1> pp = 0;
-      ap_uint<6> gd = 0;  // group of the tile being drained
-      ap_uint<4> bd = 0;  // its row block
-      int nout = 0;       // words of the tile being drained
-    tiles_s:
-      for (int i = 0; i < total; i++) {
-#pragma HLS PIPELINE II = 1
-#pragma HLS LOOP_TRIPCOUNT max = 41216
-#pragma HLS DEPENDENCE variable = xb inter false
-        if (t < tiles) {
-          const EQ e = eq.read();
-          ap_uint<64> q4;
-          for (int l = 0; l < 4; l++) {
-#pragma HLS UNROLL
-            q4.range(16 * l + 15, 16 * l) = e.range(23 * l + 15, 23 * l);
-          }
-          const ap_uint<5> nl = j >> 3;  // row in the block
-          const ap_uint<6> a = ((ap_uint<6>)pp << 5) | ((ap_uint<6>)(nl >> 3) << 3) | (ap_uint<6>)(j & 7);
-          xb[nl & 7][a] = q4;
-        }
-        const ap_uint<7> kq = j >> 1;  // output word of the drained tile: key kq / 4, quad kq % 4
-        if (t > 0 && j[0] && (int)kq < nout) {
-          const ap_uint<5> kl = kq >> 2;
-          const ap_uint<2> qd = kq & 3;
-          const ap_uint<6> a = ((ap_uint<6>)(~pp) << 5) | ((ap_uint<6>)qd << 3) | (ap_uint<6>)(kl >> 2);
-          Word o;
-          for (int b8 = 0; b8 < 8; b8++) {
-#pragma HLS UNROLL
-            const ap_uint<64> x = xb[b8][a];
-            o.range(16 * b8 + 15, 16 * b8) = lane16(x, (ap_uint<2>)(kl & 3));
-          }
-          bc.write(o);
-        }
-        if (j == 255) {
-          // the tile just filled becomes the drained one: its group / block and key count
-          const int kg = p.L - 32 * (int)gd;
-          nout = 4 * (kg < 32 ? kg : 32);
-          if ((int)bd == (geo.NR >> 5) - 1) {
-            bd = 0;
-            gd++;
-          } else {
-            bd++;
-          }
-          pp = ~pp;
-          t++;
-        }
-        j++;
-      }
-    }
-  }
-#endif
-}
-
-// ------------------------------------------------------------------ writer (io)
-static void writer(hls::stream<Word>& bc, hls::stream<ap_uint<32> >& rq, Word* io, Params p) {
-  const Geo geo = geometry(p);
-  const bool fp32 = SMX_FP32_OUT && !p.qout;
-  const int L4 = (p.L + 3) >> 2;
-  const ap_uint<10> wd = fp32 ? L4 : (p.L + 7) >> 3;  // data words per output row (rows layout)
-  WAddr cbase = p.c_off, fbase = p.f_off;
-items_w:
-  for (int it = 0; it < p.B; it++) {
-#pragma HLS LOOP_TRIPCOUNT max = 16
-    if (!p.engine) {
-      WAddr dbase = cbase, sbase = fbase;
-    blocks_w:
-      for (int r0 = 0; r0 < p.N; r0 += BRW) {
+constexpr int DSTEPS = 13;  // radix-4 steps per row
+static void divider(SStream& sq, RStream& rq, const Params p) {
+items_d:
+  for (ap_uint<17> b = 0; b < p.B; b++) {
 #pragma HLS LOOP_TRIPCOUNT max = 24
-        const int rows = p.N - r0 < BRW ? p.N - r0 : BRW;
-        const int total = rows * p.c_pitch;
-        ap_uint<24> w = 0;
-        ap_uint<32> rr = 0;
-      rows_w:
-        for (int i = 0; i < total; i++) {
+    const ap_uint<21> tot = ((ap_uint<21>)p.NP4 << 4) - ((ap_uint<21>)p.NP4 << 1);  // NP4 * (DSTEPS + 1)
+    ap_uint<4> k = 0;
+    ap_uint<24> r = 0;  // partial remainder, < 2 d
+    ap_uint<23> d = 0;
+    ap_uint<25> d3 = 0;
+    ap_uint<26> q = 0;
+    ap_uint<5> pe = 0;
+    bool zero = false;
+  divide:
+    for (ap_uint<21> i = 0; i < tot; i++) {
 #pragma HLS PIPELINE II = 1
-#pragma HLS LOOP_TRIPCOUNT max = 65536
-          if (fp32 && w == 0) rr = rq.read();
-          Word o = 0;
-          if (w < wd) {
-            const Word v = bc.read();
-            if (fp32) {
-#if SMX_FP32_OUT
-              const float sc = u2f((uint32_t)rr);
-              for (int l = 0; l < 4; l++) {
+#pragma HLS LOOP_TRIPCOUNT max = 3584
+      if (k == 0) {
+        const ap_uint<23> v = sq.read();
+        ap_uint<5> msb = 0;
+        for (int j = 0; j < 23; j++) {
 #pragma HLS UNROLL
-                const float f = u2f((uint32_t)u23_to_f32((ap_uint<23>)v.range(32 * l + 22, 32 * l)));
-                o.range(32 * l + 31, 32 * l) = f2u(f * sc);
-              }
-#endif
-            } else {
-              o = v;
-            }
-          }
-          io[dbase + i] = o;
-          w = (w == (ap_uint<24>)(p.c_pitch - 1)) ? (ap_uint<24>)0 : (ap_uint<24>)(w + 1);
+          if (v[j]) msb = j;
         }
-        dbase += total;
-        if (!fp32) {
-          const int nsw = (rows + 3) >> 2;
-        scales_w:
-          for (int k = 0; k < nsw; k++) {
-#pragma HLS PIPELINE II = 4
-#pragma HLS LOOP_TRIPCOUNT max = 64
-            Word o = 0;
-            for (int l = 0; l < 4; l++) {
-              if (4 * k + l < rows) o.range(32 * l + 31, 32 * l) = rq.read();
-            }
-            io[sbase + k] = o;
-          }
-          sbase += BRW / 4;
+        d = v << (22 - msb);
+        d3 = (ap_uint<25>)d + ((ap_uint<25>)d << 1);
+        r = (ap_uint<24>)1 << 22;
+        q = 0;
+        pe = msb;
+        zero = v == 0;
+      } else {
+        const ap_uint<25> R = (ap_uint<25>)r << 1;  // < 4 d
+        const ap_int<26> t1 = (ap_int<26>)R - (ap_int<26>)d, t2 = (ap_int<26>)R - ((ap_int<26>)d << 1),
+                         t3 = (ap_int<26>)R - (ap_int<26>)d3;
+        ap_uint<2> dig;
+        ap_uint<24> rem;
+        if (t3 >= 0) {
+          dig = 3;
+          rem = t3;
+        } else if (t2 >= 0) {
+          dig = 2;
+          rem = t2;
+        } else if (t1 >= 0) {
+          dig = 1;
+          rem = t1;
+        } else {
+          dig = 0;
+          rem = R;
         }
+        r = rem << 1;
+        q = (q << 2) | (ap_uint<26>)dig;
+        if (k == DSTEPS) rq.write(div_finish(q, r != 0, pe, zero));
       }
+      k = k == DSTEPS ? (ap_uint<4>)0 : (ap_uint<4>)(k + 1);
     }
-#if SMX_ENGINE
-    else {
-      const int nb = geo.NR >> 5;
-    groups_w:
-      for (int g = 0; g < geo.G; g++) {
-#pragma HLS LOOP_TRIPCOUNT max = 8
-        const int kg = p.L - 32 * g < 32 ? p.L - 32 * g : 32;
-        const int n = 4 * kg;
-        WAddr tbase = cbase + (WAddr)(128 * g);
-      blocks_e:
-        for (int b = 0; b < nb; b++) {
-#pragma HLS LOOP_TRIPCOUNT max = 8
-        tile_w:
-          for (int i = 0; i < n; i++) {
+  }
+}
+
+// ------------------------------------------------------------------ writer (ymem)
+static void writer(QStream& eq, RStream& rq, Word* ym, const Params p) {
+  WAddr ic = p.c, iff = p.f;
+items_w:
+  for (ap_uint<17> b = 0; b < p.B; b++) {
+#pragma HLS LOOP_TRIPCOUNT max = 24
+    WAddr rc = ic, rf = iff;
+  blocks_w:
+    for (ap_uint<17> r0 = 0; r0 < p.NP; r0 += BLK) {
+#pragma HLS LOOP_TRIPCOUNT max = 1
+      const ap_uint<17> left = p.NP - r0, left4 = p.NP4 - r0;
+      const ap_uint<9> rows = left > BLK ? (ap_uint<9>)BLK : (ap_uint<9>)left;
+      const ap_uint<7> nsw = left4 > BLK ? (ap_uint<7>)(BLK / 4) : (ap_uint<7>)(left4 >> 2);
+      // contiguous rows (C pitch = 2 L): the block is one burst; otherwise one burst per row (pad words of
+      // the pitch are never written)
+      const ap_uint<9> nb = p.c_contig ? (ap_uint<9>)1 : rows;
+      const ap_uint<14> nw = p.c_contig ? (ap_uint<14>)(rows * p.W2) : (ap_uint<14>)p.W2;
+      const ap_uint<28> step = p.c_contig ? (ap_uint<28>)((ap_uint<28>)p.W2 << 8) : p.cp;
+    bursts_w:
+      for (ap_uint<9> j = 0; j < nb; j++) {
+#pragma HLS LOOP_TRIPCOUNT max = 1
+      data_w:
+        for (ap_uint<14> i = 0; i < nw; i++) {
 #pragma HLS PIPELINE II = 1
-#pragma HLS LOOP_TRIPCOUNT max = 128
-            io[tbase + i] = bc.read();
-          }
-          tbase += (WAddr)(4 * p.L);
+#pragma HLS LOOP_TRIPCOUNT max = 8192
+          ym[rc + i] = eq.read();
         }
+        rc += step;
       }
-    stok_w:
-      for (int k = 0; k < (geo.NR >> 2); k++) {
+    scales_w:
+      for (ap_uint<7> k = 0; k < nsw; k++) {
 #pragma HLS PIPELINE II = 4
 #pragma HLS LOOP_TRIPCOUNT max = 64
         Word o;
         for (int l = 0; l < 4; l++) o.range(32 * l + 31, 32 * l) = rq.read();
-        io[fbase + k] = o;
+        ym[rf + k] = o;
       }
+      rf += BLK / 4;
     }
-#endif
-    cbase += p.c_stride;
-    fbase += p.f_stride;
+    ic += p.cs;
+    iff += p.fs;
   }
 }
 
-// ------------------------------------------------------------------ the kernel
-// hp0, hp1: read-only views of DDR (scores, rank tables); io: the output view. Word offsets in p.
-static void softmax_core(const Word* hp0, const Word* hp1, Word* io, Params p) {
+// ------------------------------------------------------------------ the unit
+static void softmax_df(const Word* xm, Word* ym, const Params p) {
 #pragma HLS DATAFLOW
-  hls::stream<MX> mx("smx_mx");
-  hls::stream<EQ> eq("smx_eq");
-  hls::stream<DN> sq("smx_sq");
-  hls::stream<ap_uint<32> > rq("smx_rq");
-  hls::stream<Word> bc("smx_bc");
-#pragma HLS STREAM variable = mx depth = 32
-#pragma HLS BIND_STORAGE variable = mx type = fifo impl = srl
-#pragma HLS STREAM variable = eq depth = 16
+#pragma HLS STABLE variable = p
+  XStream xs("smx_xs");
+  MStream mx("smx_mx");
+  QStream eq("smx_eq");
+  SStream sq("smx_sq");
+  RStream rq("smx_rq");
+#pragma HLS STREAM variable = xs depth = XS_DEPTH
+#pragma HLS BIND_STORAGE variable = xs type = fifo impl = lutram
+#pragma HLS STREAM variable = mx depth = MX_DEPTH
+#pragma HLS STREAM variable = eq depth = EQ_DEPTH
 #pragma HLS BIND_STORAGE variable = eq type = fifo impl = srl
-#pragma HLS STREAM variable = sq depth = 8
-#pragma HLS STREAM variable = rq depth = 288
+#pragma HLS STREAM variable = sq depth = SQ_DEPTH
+#pragma HLS STREAM variable = rq depth = RQ_DEPTH
 #pragma HLS BIND_STORAGE variable = rq type = fifo impl = bram
-#pragma HLS STREAM variable = bc depth = BCFIFO
-#if !SMX_FP32_OUT
-#pragma HLS BIND_STORAGE variable = bc type = fifo impl = srl
+#if defined(SMX_DFSIM) && !defined(__SYNTHESIS__)
+  std::thread t0([&] { reader(xm, xs, mx, p); });
+  std::thread t1([&] { compute(xs, mx, eq, sq, p); });
+  std::thread t2([&] { divider(sq, rq, p); });
+  std::thread t3([&] { writer(eq, rq, ym, p); });
+  t0.join();
+  t1.join();
+  t2.join();
+  t3.join();
+#else
+  reader(xm, xs, mx, p);
+  compute(xs, mx, eq, sq, p);
+  divider(sq, rq, p);
+  writer(eq, rq, ym, p);
 #endif
-  pass1(hp0, mx, p);
-  pass2(hp1, mx, eq, sq, p);
-  recip(sq, rq, p);
-  shaper(eq, bc, p);
-  writer(bc, rq, io, p);
 }
 
-// One SOFTMAX record at word offset rec_off of hp0's view: decode, check, run. Returns a Status.
-static int softmax_record(const Word* hp0, const Word* hp1, Word* io, WAddr rec_off) {
-  Word rec[8];
-  for (int i = 0; i < 8; i++) {
-#pragma HLS PIPELINE II = 1
-    rec[i] = hp0[rec_off + i];
-  }
+// The mode function (one call site in the dispatch switch). Returns ME_OK, or ME_DIMS without touching memory.
+static uint32_t softmax_mode(const ctr::Cmd& c, const Word* xmem, Word* ymem) {
+#pragma HLS INLINE off
+  // validate_hw has checked all of this; the guard only keeps a call that bypassed it from hanging the unit:
+  // K in {8, 16, .., 256}, 1 <= N <= 65535, B <= 65535 (decode makes B >= 1), N <= NP <= 65535
+  const ap_uint<32> K = c.K, N = c.N, B = c.B, P5 = c.p[ctr::P_NP];
+  const bool k_bad = K.range(2, 0) != 0 || K.range(31, 9) != 0 || K.range(8, 3) == 0 || (K[8] && K.range(7, 3) != 0);
+  const bool n_bad = N.range(31, 16) != 0 || N.range(15, 0) == 0 || B.range(31, 16) != 0 || B.range(15, 0) == 0;
+  const bool np_bad = P5 != 0 && (P5.range(31, 16) != 0 || P5.range(15, 0) < N.range(15, 0));
+  if (k_bad || n_bad || np_bad) return ctr::ME_DIMS;
   Params p;
-  const int st = decode(rec, p);
-  if (st == ST_OK) softmax_core(hp0, hp1, io, p);
-  return st;
+  make_params(c, p);
+  softmax_df(xmem, ymem, p);
+  return ctr::ME_OK;
 }
 
 }  // namespace smx

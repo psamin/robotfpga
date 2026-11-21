@@ -20,6 +20,7 @@ Call structure per chunk (flags as the sequencer issues them, fpga/kernels/seque
 Layouts: "records" = residual stream written as records [y FP32 row | q int16 row] (WM_REC) and read back flat
 by the next call's A; "separate" = D and C in separate regions (WM_ROW: two bursts per row).
 """
+
 from __future__ import annotations
 
 import argparse
@@ -50,8 +51,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--json", default=str(HERE / "policy_check.json"))
     ap.add_argument("--layout", default="records", choices=["records", "separate"])
-    ap.add_argument("--seg_ovh", type=float, default=6, help="csynth: clocks per burst helper besides its words")
-    ap.add_argument("--l_scal", type=float, default=126, help="csynth: row scalar latency (stats -> mean, rstd)")
+    ap.add_argument(
+        "--seg_ovh", type=float, default=6, help="csynth: clocks per burst helper besides its words"
+    )
+    ap.add_argument(
+        "--l_scal", type=float, default=126, help="csynth: row scalar latency (stats -> mean, rstd)"
+    )
     ap.add_argument("--l_qscal", type=float, default=103, help="csynth: row quant scalar latency")
     ap.add_argument("--l_pipe", type=float, default=90, help="csynth: sum of the flat loops' pipeline depths")
     ap.add_argument("--wresp", type=float, default=60, help="ASSUMED: write-response wait per burst (clocks)")
@@ -93,12 +98,18 @@ def main():
         tot_calls += n
         print(f"{name:28s} {K:4d} {rows:5d} {n:5d} {row:8.1f} {clk / 1e6:7.3f} {el / clk:6.2f}")
     ms = tot_clk / a.mhz / 1e3
-    print(f"total: {tot_calls} calls, {tot_el / 1e6:.2f} M elements, {tot_clk / 1e6:.2f} M clocks = {ms:.1f} ms at "
-          f"{a.mhz:.0f} MHz ({tot_el / tot_clk:.2f} elements / clock, {tot_clk / tot_el:.3f} clocks / element)")
-    print(f"assumed (not measured on the board): wresp = {a.wresp:.0f}, ddr_lat = {a.ddr_lat:.0f}, "
-          f"call_ovh = {a.call_ovh:.0f} clocks")
+    print(
+        f"total: {tot_calls} calls, {tot_el / 1e6:.2f} M elements, {tot_clk / 1e6:.2f} M clocks = {ms:.1f} ms at "
+        f"{a.mhz:.0f} MHz ({tot_el / tot_clk:.2f} elements / clock, {tot_clk / tot_el:.3f} clocks / element)"
+    )
+    print(
+        f"assumed (not measured on the board): wresp = {a.wresp:.0f}, ddr_lat = {a.ddr_lat:.0f}, "
+        f"call_ovh = {a.call_ovh:.0f} clocks"
+    )
     elem_check = sum(c["elements"] for c in js["counts"])
-    print(f"policy_check counted {elem_check / 1e6:.2f} M norm elements per chunk (this model {tot_el / 1e6:.2f} M)")
+    print(
+        f"policy_check counted {elem_check / 1e6:.2f} M norm elements per chunk (this model {tot_el / 1e6:.2f} M)"
+    )
 
 
 if __name__ == "__main__":

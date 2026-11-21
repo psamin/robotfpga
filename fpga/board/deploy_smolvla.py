@@ -5,11 +5,15 @@
     python fpga/board/deploy_smolvla.py --bit fpga/hls/build/float_tp4.bit --clock-mhz 250 \
         --model build/ckpt/smolvla-9604/smolvla-so101_medicine_bottle_pickplace-9604 \
         --batches build/ckpt/smolvla-9604/batches [--serve]   # push, engine check, selftest, serve
+    # int16 engine (bitstream float_tp?_int16.bit from float_top built with -DFSTREAM_ARITH=16):
+    python fpga/board/deploy_smolvla.py --arith int16 --bit <dir>/float_tp4_int16.bit --clock-mhz 250
+        --model <256-px checkpoint -12392 dir> --batches <its frame_*.pt dir>   (one command line)
 
 What it does on the board (docs/run-smolvla-on-kr260.md §1–3). Uploads land in the Jupyter root
 (/root/jupyter_notebooks/<remote>/) and are mirrored to /home/<user>/smolvla/, owned by <user>, because the
 policy server must run as that user while PYNQ needs root:
   push      fpga/ code, the bitstream (.bit + .hwh), the checkpoint, the replay batches, engine test cases
+            (build/stream/float, or build/stream/int16 with --arith int16: make -C fpga/hls test-int16)
   engine    fpga/board/check_engine.py with the bitstream (root): every case PASS + weight bandwidth
   servers   engine_server.py (PYNQ's Python, root) in the background, socket handed to <user>;
             serve_policy_fpga.py --selftest as <user> (3.12 venv): max |chunk - PyTorch|, seconds per chunk
@@ -101,7 +105,7 @@ if {marker!r} not in text:
     return jb.run(code, timeout=seconds + 30)
 
 
-def push(rem: str, bit: Path, hwh: Path, model: Path, name: str, frames: list[Path]) -> None:
+def push(rem: str, bit: Path, hwh: Path, model: Path, name: str, frames: list[Path], cases: str) -> None:
     for rel in CODE:
         jb.put(str(ROOT / rel), f"{rem}/{rel}")
     jb.put(str(bit), f"{rem}/{bit.name}")
@@ -121,9 +125,9 @@ def push(rem: str, bit: Path, hwh: Path, model: Path, name: str, frames: list[Pa
         for p in sorted((model / "tokenizer").glob("*")):
             if not p.name.startswith("."):  # skip macOS ._* metadata from tars made on a Mac
                 jb.put(str(p), f"{rem}/ckpt/{name}/tokenizer/{p.name}")
-    for d in sorted((ROOT / "build" / "stream" / "float").glob("case_*")):
+    for d in sorted((ROOT / "build" / "stream" / cases).glob("case_*")):
         for p in sorted(d.glob("*")):
-            jb.put(str(p), f"{rem}/build/stream/float/{d.name}/{p.name}")
+            jb.put(str(p), f"{rem}/build/stream/{cases}/{d.name}/{p.name}")
 
 
 def board_config(model: Path) -> tuple[Path, str]:
@@ -218,6 +222,13 @@ def main():
     ap.add_argument(
         "--legacy-y", action="store_true", help="bitstream built from float_linear.h v3 (row-major Y)"
     )
+    ap.add_argument(
+        "--arith", choices=["fp32", "int16"], default="fp32",
+        help="the bitstream's arithmetic: int16 = float_tp?_int16.bit (float_top with -DFSTREAM_ARITH=16)",
+    )  # fmt: skip
+    ap.add_argument(
+        "--no-keep-fp32", action="store_true", help="the checkpoint's FP32 layers on the engine too"
+    )
     args = ap.parse_args()
 
     jb.login()
@@ -252,6 +263,18 @@ def main():
     if not (args.bit and args.model and args.batches):
         sys.exit("--bit, --model and --batches are required (or --setup)")
     bit, model, batches = Path(args.bit), Path(args.model).expanduser(), Path(args.batches).expanduser()
+    # the FP32 and the int16 IP have identical registers: the bitstream name says which one this is (the
+    # runtime's probe call on the board catches a mismatch too)
+    if (args.arith == "int16") != ("int16" in bit.name):
+        sys.exit(
+            f"--arith {args.arith} with bitstream {bit.name}: int16 bitstreams are named float_tp?_int16.bit"
+        )
+    if args.arith == "int16" and (args.engine != "xrt" or args.legacy_y):
+        sys.exit("--arith int16 needs --engine xrt (engine_server.py is FP32 only) and no --legacy-y")
+    cases = "int16" if args.arith == "int16" else "float"
+    if not sorted((ROOT / "build" / "stream" / cases).glob("case_*")):
+        target = "test-int16" if cases == "int16" else "test"
+        sys.exit(f"no engine test cases in build/stream/{cases}: make -C fpga/hls {target}")
     hwh = bit.with_suffix(".hwh")
     frames = sorted(batches.glob("frame_*.pt"))
     for f in [bit, hwh] + [model / c for c in CKPT]:
@@ -266,7 +289,7 @@ def main():
     if not args.skip_push:
         print(f"== push to {upload}, mirror to {home}", flush=True)
         t0 = time.time()
-        push(rem, bit, hwh, model, name, frames)
+        push(rem, bit, hwh, model, name, frames, cases)
         if not mirror(upload, home, args.user):
             sys.exit("mirror failed")
         print(f"   {time.time() - t0:.0f} s", flush=True)
@@ -282,7 +305,9 @@ def main():
     clock = f" --clock-mhz {args.clock_mhz}" if args.clock_mhz else ""
     # the policy process: the user's 3.12 venv, Hugging Face fully offline from the pushed cache
     hf = f"HF_HOME={home}/hfcache HF_HUB_OFFLINE=1" + (" FSTREAM_LEGACY_Y=1" if args.legacy_y else "")
-    threads = f" --threads {args.threads}"
+    threads = f" --threads {args.threads} --arith {args.arith}" + (
+        " --no-keep-fp32" if args.no_keep_fp32 else ""
+    )
     if args.engine == "xrt":  # root: the engine maps CMA buffers and the IP registers in this process
         policy = f"env {hf} {venv_py} fpga/board/serve_policy_fpga.py --engine xrt{threads}"
     else:
@@ -304,7 +329,8 @@ def main():
         legacy = "FSTREAM_LEGACY_Y=1 " if args.legacy_y else ""
         shell(
             home,
-            f"{legacy}{PYNQ_PY} fpga/board/check_engine.py --bit {bit.name}{clock} build/stream/float",
+            f"{legacy}{PYNQ_PY} fpga/board/check_engine.py --bit {bit.name}{clock} --arith {args.arith}"
+            f" build/stream/{cases}",
             "check_engine.log",
         )
 

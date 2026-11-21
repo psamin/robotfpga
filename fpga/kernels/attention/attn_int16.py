@@ -1,54 +1,58 @@
-"""SmolVLA attention through the int16 linear engine: exact torch emulation of the arithmetic, the engine model,
-the DDR layouts of the engine's DRIVER CONTRACT (fpga/hls/int16_linear.h) and the attn_pack descriptors
-(fpga/kernels/attention, README.md).
+"""SmolVLA attention under the float_top integration contract (fpga/kernels/CONTRACT.md 2, 5): exact torch emulation
+of the arithmetic the hardware runs, used by the full-policy check (check_policy.py) and checked bit for bit against
+the record-level chain (make_vectors.py + tb_attn.cpp).
 
-Arithmetic (bit for bit what attn_pack.h + the int16 engine do):
+Per attention site, per KV head j (one GEMM item; G = H / Hkv query heads per KV head, head dim 64):
 
-  quantize one row x (FP32) to int16 with one FP32 scale: the project's shared quantizer
-  (fpga/kernels/quantize/quant_int16.h == build/brief/precision_emulation.py quant_sym):
-      s = fl32(max(max|x|, 1e-30f) / 32767)        one correctly rounded FP32 division per row (1.0 if max|x| == 0)
-      q = clamp(rne(fl32(x / s)), -32767, 32767)   correctly rounded FP32 division, round half to even
-  Q is quantized with s_q = s * 2^-3 (the 1/sqrt(64) of the attention, exact: a power of two), so the
-  engine's Q K^T output already is the scaled score.
-  pow2 variant: s = 2^e, e = ceil(log2(max|x| / 32767)): q = rne(x * 2^-e) (what the RoPE kernel's
-  ROPE_QM = 0 mode emits for Q and K).
+  Q      row unit (QUANT_X, or ROPE with F_QOUT): per (head, query) the contract quantizer with p4 = -3, so the
+         stored scale is s / 8 (exact) and the Q.K^T GEMM output already is the scaled score. Head-major
+         Q[h][TqP][64], TqP = pad4(Tq); rows [Tq, TqP) zero with scale 1.0. The G heads of KV head j are rows
+         t = g * TqP + i of item j.
+  K      QUANT_W (attn_kv.h; ROPE F_KW is the same writer): per (KV head, key) the contract quantizer, the KW weight
+         tiling, Mk = pad32(keys) rows; expert self-attention: prefix keys in rows [0, pad32(45)), suffix keys from
+         row pad32(45) on. Pad rows zero with scale 1.0.
+  Q.K^T  GEMM: acc exact, y = fmul(fmul(fl(acc), s_row = s_k), s_tok = s_q / 8), FP32 cores, denormals flushed
+         with the sign kept (contract.gemm_out).
+  P      SOFTMAX unit (fpga/kernels/softmax/smx_emu.kernel, c = fl32(p0 log2 e), p0 = 1): int16 q in [0, 32767]
+         with scale RN(1 / sum q), a fully masked row q = 0 with scale 1.0. Masks: int32 rank vectors, key k visible
+         to row n iff 0 <= E[k] <= D[n] (CONTRACT.md 5, step 4 table; checked against SmolVLA's own mask on every
+         call).
+  V      QUANT_WT (attn_kv.h): V^T per (KV head, channel) over the part's keys, the VW tiling, keys [N, pad32(N))
+         zero. The expert self-attention has two parts (prefix V^T written by the LM, suffix V^T every step), each
+         with its own channel scales.
+  P.V    GEMM, K = pad32(keys of the part), X = P's columns of the part; the expert's suffix part adds onto the
+         prefix part's output (F_ACC: y = fadd(y_suffix, O)). Output rows t = g * TqP + i go to O[i][(G j + g) 64]
+         through the C row groups (R = TqP, P1 = 256 B): O is [Tq][H * 64], the o_proj input order.
 
-  engine call (int16_linear.h): acc = sum_k Xq[n][k] Wq[m][k] exact (int48 in the DSP; here FP64 of integers
-  below 2^53), y = ftz(ftz(fl32(acc) * s_row[m]) * s_tok[n]) (two FP32 multiplies, denormals flushed).
+The prefix is compacted to its valid tokens (the contract's list has 45 prefix tokens: 2 x 16 image tokens,
+12 language tokens, the state); padding queries get a zero output (no valid query or key depends on them).
 
-Attention of one layer (B = 1, H query heads, Hkv KV heads, G = H / Hkv, head dim D = 64), per KV head j
-(one head iteration of a head-batched engine call):
-  Q K^T : W = K_j (Tk x 64, keys are the engine's output channels, s_row = per-key scale, M = pad32(Tk)),
-          X = the G query heads of KV head j stacked along the token axis (row t = g * Tq + i, N = G * Tq),
-          s_tok = per (head, query) scale * 2^-3  ->  scores Y[M/32][Np][32] FP32
-  mask  : in the softmax kernel (n_valid / causal / bitmap, README.md "Masks"); keys no query may attend are
-          also zeroed in K and V by attn_pack (krank == 0x7FFF), so nothing of them can leak.
-  softmax: FP32 (variant 'smx': the softmax kernel's own arithmetic, fpga/kernels/softmax/smx_emu.py), then
-          P quantized per row with the shared quantizer (int16 >= 0, s_tok per row).
-  P V   : W = V_j^T (64 x Tk: channels are the output channels, s_row = per-channel scale over the keys),
-          X = P (N x Tk, K = Tk exactly)  ->  O_j Y[2][Np][32] FP32, row t = g * Tq + i
-  o_proj: attn_pack mode OX gathers row i of every head h (O_{h / G}, row (h % G) Tq + i) into o_proj's X
-          (Tq x H * 64) with one scale per query over all H * 64 values.
+The pre-contract design (`attention`, the attn_pack era: one V^T scale over prefix + suffix, P from a torch FP32
+softmax or the old softmax arithmetic) stays for comparison; its ftz now keeps the sign as the FP32 cores do.
 """
 
 from __future__ import annotations
 
 import math
+import sys
+from pathlib import Path
 
 import numpy as np
 import torch
+
+_K = Path(__file__).resolve().parents[1]
+for _p in (_K, _K / "softmax"):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+import contract as CT  # noqa: E402
+import smx_emu  # noqa: E402
 
 QMAX = 32767
 QMAX_F = torch.tensor(float(QMAX), dtype=torch.float32)
 TINY = float(np.float32(1e-30))
 HEAD_DIM = 64
-LANES = 32  # engine output channels per group (4 hp ports x 8 int16)
-PORTS = 4
-FL = 8  # int16 per 128-bit word
-TB = 32  # engine tokens per block: N is padded to a multiple of TB
-KRANK_NEVER = 0x7FFF  # key rank of a key no query may attend
-FLT_MIN = float(np.finfo(np.float32).tiny)
-NONE = 0xFFFFFFFF
+Q_SHIFT = -3  # p4 of Q: the attention's 1 / sqrt(64)
+C_SMX = smx_emu.c_from_mult(1.0)  # the SOFTMAX record's p0 = 1.0: the scores already carry the 1/8
 
 
 def pad_to(n: int, m: int) -> int:
@@ -56,21 +60,184 @@ def pad_to(n: int, m: int) -> int:
 
 
 # ----------------------------------------------------------------------------------------------------
-# quantizers
+# contract arithmetic in torch (= contract.quant_rows / contract.gemm_out, bit for bit)
+def ftz(x: torch.Tensor) -> torch.Tensor:
+    """The Xilinx FP32 cores: a denormal input or result is flushed to zero, keeping its sign."""
+    e = (x.view(torch.int32) >> 23) & 0xFF
+    return torch.where(e == 0, torch.copysign(torch.zeros_like(x), x), x)
+
+
+def fmul_hw(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    return ftz(ftz(a) * ftz(b))
+
+
+def fadd_hw(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    return ftz(ftz(a) + ftz(b))
+
+
+def quant_c(x: torch.Tensor, dim: int = -1, shift: int = 0):
+    """The contract quantizer along `dim`: (q integer-valued FP32, stored scale FP32 keepdim). s = fl32(max(amax,
+    1e-30) / 32767), q = clamp(rne(fl32(x / s)), +-32767); stored = s * 2^shift, 1.0 for an all-zero row."""
+    x = x.to(torch.float32)
+    amax = x.abs().amax(dim, keepdim=True)
+    zero = amax == 0
+    s = torch.where(zero, torch.ones_like(amax), amax.clamp_min(TINY) / QMAX_F)
+    q = torch.round(x / s).clamp_(-QMAX, QMAX)
+    stored = torch.where(zero, torch.ones_like(s), torch.ldexp(s, torch.tensor(shift, dtype=torch.int32)))
+    return q, stored
+
+
+def gemm_out(xq: torch.Tensor, wq: torch.Tensor, s_row: torch.Tensor, s_tok: torch.Tensor, addend=None):
+    """GEMM epilogue: xq (..., N, K), wq (..., M, K) integer-valued; s_row (..., 1, M), s_tok (..., N, 1)."""
+    acc = torch.matmul(xq.double(), wq.double().transpose(-1, -2))  # exact: |acc| <= K 2^30 < 2^53
+    y = fmul_hw(fmul_hw(acc.float(), s_row), s_tok)
+    return y if addend is None else fadd_hw(y, addend)
+
+
+# ----------------------------------------------------------------------------------------------------
+# rank masks (CONTRACT.md 5, step 4)
+def contract_ranks(site: str, tq: int, tqp: int, nkeys, mk: int, key_rows):
+    """(D (tqp,) query-row ranks, E (mk,) key ranks) int32 of the contract table. nkeys: valid keys per part,
+    key_rows: blob row of each part's first key. Pad rows / keys: -1."""
+    D = torch.full((tqp,), -1, dtype=torch.int32)
+    E = torch.full((mk,), -1, dtype=torch.int32)
+    if site == "prefix":  # image / language 0, the state (last prefix token) 1
+        D[:tq] = 0
+        D[tq - 1] = 1
+        E[: nkeys[0]] = 0
+        E[nkeys[0] - 1] = 1
+    elif site == "expert_self":  # query i: 2 + i; prefix keys 0 (state 1); suffix key j: 2 + j
+        D[:tq] = 2 + torch.arange(tq, dtype=torch.int32)
+        E[: nkeys[0]] = 0
+        E[nkeys[0] - 1] = 1
+        E[key_rows[1] : key_rows[1] + nkeys[1]] = 2 + torch.arange(nkeys[1], dtype=torch.int32)
+    elif site == "expert_cross":  # every valid query sees every valid prefix key
+        D[:tq] = 0
+        E[: nkeys[0]] = 0
+    else:
+        raise ValueError(site)
+    return D, E
+
+
+def site_geometry(site: str, tk: int, n_suffix: int = 0):
+    """Key parts of a site: [(first key, keys, blob row)], Mk. Expert self: prefix keys + n_suffix suffix keys."""
+    if site == "expert_self":
+        npre = tk - n_suffix
+        lp = pad_to(npre, 32)
+        return [(0, npre, 0), (npre, n_suffix, lp)], lp + pad_to(n_suffix, 32)
+    return [(0, tk, 0)], pad_to(tk, 32)
+
+
+def attention_contract(q, k, v, mask, site: str, n_suffix: int = 0, record: dict | None = None):
+    """q (B, H, Tq, D), k / v (B, Hkv, Tk, D) FP32 (k post-RoPE), mask None (vision) or (B, Tq, Tk) bool.
+    Returns (B, H, Tq, D) FP32: the contract's attention output for the valid queries, 0 for padding queries.
+    record: if given, filled with the intermediates of batch 0 (make_vectors.py)."""
+    B, H, Tq, D = q.shape
+    out = torch.zeros(B, H, Tq, D, dtype=torch.float32)
+    for b in range(B):
+        if mask is None:
+            qv = torch.ones(Tq, dtype=torch.bool)
+            kv = torch.ones(k.shape[2], dtype=torch.bool)
+        else:
+            m = mask[b].bool()
+            qv, kv = m.any(1), m.any(0)
+        qc, kc, vc = q[b][:, qv].float(), k[b][:, kv].float(), v[b][:, kv].float()
+        o = _attention_one(
+            qc,
+            kc,
+            vc,
+            None if mask is None else mask[b].bool()[qv][:, kv],
+            site,
+            n_suffix,
+            record if b == 0 else None,
+        )
+        out[b][:, qv] = o
+    return out
+
+
+def _attention_one(q, k, v, mc, site, n_suffix, rec):
+    H, tq, D = q.shape
+    hkv, tk = k.shape[0], k.shape[1]
+    G = H // hkv
+    tqp = pad_to(tq, 4)
+    parts, mk = site_geometry(site, tk, n_suffix)
+    # ---- Q: head-major, rows [tq, tqp) zero (stored scale 1.0)
+    qp = torch.zeros(H, tqp, D)
+    qp[:, :tq] = q
+    qq, sq = quant_c(qp, -1, Q_SHIFT)  # (H, tqp, D), (H, tqp, 1)
+    x = qq.reshape(hkv, G * tqp, D)  # item j, row t = g * tqp + i
+    sx = sq.reshape(hkv, G * tqp, 1)
+    # ---- K: blob rows, pad rows zero (scale 1.0)
+    kb = torch.zeros(hkv, mk, D)
+    for k0, nk, r0 in parts:
+        kb[:, r0 : r0 + nk] = k[:, k0 : k0 + nk]
+    kq, sk = quant_c(kb, -1)  # (hkv, mk, D), (hkv, mk, 1)
+    scores = gemm_out(x, kq, sk.transpose(-1, -2), sx)  # (hkv, G tqp, mk)
+    # ---- softmax unit with rank masks
+    if site == "vision":
+        valid = None
+        assert mc is None and mk == tk
+    else:
+        Dq, Ek = contract_ranks(site, tq, tqp, [p[1] for p in parts], mk, [p[2] for p in parts])
+        rv = smx_emu.rank_valid(Ek, Dq)  # (tqp, mk)
+        # the contract's ranks reproduce SmolVLA's mask on every valid (query, key)
+        cols = torch.cat([torch.arange(r0, r0 + nk) for _, nk, r0 in parts])
+        assert torch.equal(rv[:tq][:, cols], mc), f"{site}: contract ranks != SmolVLA mask"
+        valid = rv.repeat(G, 1)  # row t = g * tqp + i has query i's rank
+    pq, sp = smx_emu.kernel(scores, C_SMX, valid)  # q int64 (hkv, G tqp, mk), scale (hkv, G tqp, 1)
+    pq = pq.to(torch.float32)
+    # ---- P.V per key part (V^T per channel over the part's keys), the suffix part accumulates
+    y = None
+    vts = []
+    for k0, nk, r0 in parts:
+        npv = pad_to(nk, 32)
+        vt = v[:, k0 : k0 + nk].transpose(-1, -2)  # (hkv, D, nk)
+        vq, sv = quant_c(vt, -1)  # (hkv, D, nk), (hkv, D, 1)
+        vqp = torch.zeros(hkv, D, npv)
+        vqp[:, :, :nk] = vq
+        vts.append((vqp, sv))
+        y = gemm_out(pq[:, :, r0 : r0 + npv], vqp, sv.transpose(-1, -2), sp, y)
+    o = y.reshape(hkv, G, tqp, D)[:, :, :tq].reshape(H, tq, D)
+    if rec is not None:
+        rec.update(
+            dict(
+                tq=tq,
+                tqp=tqp,
+                mk=mk,
+                parts=parts,
+                G=G,
+                hkv=hkv,
+                qq=qq,
+                sq=sq,
+                kq=kq,
+                sk=sk,
+                scores=scores,
+                pq=pq,
+                sp=sp,
+                vts=vts,
+                y=y,
+                out=o,
+                ranks=None if site == "vision" else (Dq, Ek),
+            )
+        )
+    return o
+
+
+# ----------------------------------------------------------------------------------------------------
+# the pre-contract design (attn_pack era), kept for comparison
 def quant(x: torch.Tensor, dim: int, scale_mul: float = 1.0, pow2: bool = False):
-    """FP32 x -> (q, s): integer-valued FP32 q in [-32767, 32767] and FP32 scale s (keepdim along `dim`),
-    x ~= q * s / scale_mul, exactly as attn_pack.h (quant_int16.h) computes them (module doc)."""
+    """FP32 x -> (q, s), the shared quantizer (or power-of-two scales); s * scale_mul (a power of two)."""
     x = x.to(torch.float32)
     amax = x.abs().amax(dim, keepdim=True)
     if pow2:
         r = amax.clamp_min(TINY) / QMAX_F
-        m, e = torch.frexp(r)  # r = m * 2^e, m in [0.5, 1)
-        e = torch.where(m == 0.5, e - 1, e)
+        mnt, e = torch.frexp(r)
+        e = torch.where(mnt == 0.5, e - 1, e)
         s = torch.ldexp(torch.ones_like(amax), e)
         q = torch.round(torch.ldexp(x, -e)).clamp_(-QMAX, QMAX)
     else:
         s = amax.clamp_min(TINY) / QMAX_F
-        s = torch.where(amax == 0, torch.ones_like(s), s)  # all-zero row: s = 1.0 (pack_float / quant_int16.h)
+        s = torch.where(amax == 0, torch.ones_like(s), s)
         q = torch.round(x / s).clamp_(-QMAX, QMAX)
     if scale_mul != 1.0:
         assert math.frexp(scale_mul)[0] == 0.5, "scale_mul must be a power of two (exact)"
@@ -78,158 +245,76 @@ def quant(x: torch.Tensor, dim: int, scale_mul: float = 1.0, pow2: bool = False)
     return q, s
 
 
-def ftz(x: torch.Tensor) -> torch.Tensor:
-    return torch.where(x.abs() < FLT_MIN, torch.zeros_like(x), x)
-
-
-def engine(xq: torch.Tensor, s_tok: torch.Tensor, wq: torch.Tensor, s_row: torch.Tensor) -> torch.Tensor:
-    """The int16 engine: xq (..., N, K), s_tok (..., N, 1), wq (..., M, K), s_row (..., 1, M) -> (..., N, M) FP32."""
-    acc = torch.matmul(xq.double(), wq.double().transpose(-1, -2))  # exact: |acc| <= K 2^30 < 2^53
-    return ftz(ftz(acc.float() * s_row) * s_tok)
+def engine(xq, s_tok, wq, s_row):
+    """The int16 engine: xq (..., N, K), s_tok (..., N, 1), wq (..., M, K), s_row (..., 1, M) -> (..., N, M)."""
+    acc = torch.matmul(xq.double(), wq.double().transpose(-1, -2))
+    return fmul_hw(fmul_hw(acc.float(), s_row), s_tok)
 
 
 def bf16(x: torch.Tensor) -> torch.Tensor:
     return x.to(torch.bfloat16).to(torch.float32)
 
 
-# ----------------------------------------------------------------------------------------------------
-# masks
-def rank_descriptor(mask: torch.Tensor):
-    """mask (B, Tq, Tk) bool (True = may attend) -> (krank (B, Tk), qrank (B, Tq), ok): mask ==
-    (krank[None, :] <= qrank[:, None]) iff the rows' allowed key sets are nested, which every SmolVLA mask is.
-    krank == KRANK_NEVER marks keys no query may attend (attn_pack zeroes them)."""
-    m = mask.bool()
-    qrank = m.sum(-1)
-    cand = torch.where(m, qrank[:, :, None].expand(m.shape), torch.full_like(qrank[:, :, None], KRANK_NEVER))
-    krank = cand.amin(1)
-    ok = bool(torch.equal(krank[:, None, :] <= qrank[:, :, None], m))
-    return krank, qrank, ok
-
-
-# ----------------------------------------------------------------------------------------------------
-# attention
-def attention(q, k, v, scale: float, mask=None, qk: str = "int16", pv: str = "int16", pow2: bool = False,
-              qk_pow2: bool = False, p_mode: str = "quant"):
-    """q (B, H, Tq, D), k / v (B, Hkv, Tk, D) FP32 (k post-RoPE, not repeated over the G query heads);
-    mask None or (B, Tq, Tk) bool. qk / pv: 'int16' (engine arithmetic), 'bf16' (BF16 operands, FP32 sums),
-    'fp32'. pow2: power-of-two scales for every operand; qk_pow2: for Q and K only (the RoPE kernel's output).
-    p_mode: 'quant' (FP32 softmax, shared quantizer) or 'smx' (the softmax kernel's q and 1/sum scale).
-    Returns (B, H, Tq, D) FP32."""
+def attention(
+    q,
+    k,
+    v,
+    scale: float,
+    mask=None,
+    qk: str = "int16",
+    pv: str = "int16",
+    pow2: bool = False,
+    p_mode: str = "quant",
+):
+    """Pre-contract design: q (B, H, Tq, D), k / v (B, Hkv, Tk, D) FP32, mask None or (B, Tq, Tk) bool.
+    qk / pv: 'int16', 'bf16' or 'fp32'; p_mode 'quant' (FP32 softmax + quantizer) or 'smx' (softmax unit)."""
     B, H, Tq, D = q.shape
     Hkv, Tk = k.shape[1], k.shape[2]
     G = H // Hkv
     q, k, v = q.float(), k.float(), v.float()
-    if mask is not None:  # attn_pack zeroes the keys of rank KRANK_NEVER
+    if mask is not None:
         kval = mask.any(1)[:, None, :, None].float()
         k = k * kval
         v = v * kval
     if qk == "int16":
-        qq, sq = quant(q, -1, scale, pow2 or qk_pow2)  # per (head, query)
-        kq, sk = quant(k, -1, 1.0, pow2 or qk_pow2)  # per (kv head, key)
-        x = qq.reshape(B, Hkv, G * Tq, D)  # row t = g * Tq + i
-        sx = sq.reshape(B, Hkv, G * Tq, 1)
-        scores = engine(x, sx, kq, sk.transpose(-1, -2)).reshape(B, H, Tq, Tk)
+        qq, sq = quant(q, -1, scale, pow2)
+        kq, sk = quant(k, -1, 1.0, pow2)
+        scores = engine(
+            qq.reshape(B, Hkv, G * Tq, D), sq.reshape(B, Hkv, G * Tq, 1), kq, sk.transpose(-1, -2)
+        ).reshape(B, H, Tq, Tk)
     else:
         kk = k.repeat_interleave(G, dim=1)
-        if qk == "bf16":
-            scores = (bf16(q) @ bf16(kk).transpose(-1, -2)) * scale
-        else:
-            scores = (q @ kk.transpose(-1, -2)) * scale
+        scores = (
+            (bf16(q) @ bf16(kk).transpose(-1, -2)) if qk == "bf16" else (q @ kk.transpose(-1, -2))
+        ) * scale
     if p_mode == "smx" and pv == "int16":
-        import smx_bridge
-
-        pq, sp = smx_bridge.softmax_q(scores, None if mask is None else mask[:, None].expand(B, H, Tq, Tk))
+        valid = None if mask is None else mask[:, None].expand(B, H, Tq, Tk)
+        pq, sp = smx_emu.kernel(scores, C_SMX, valid)
+        pq = pq.to(torch.float32)
     else:
         if mask is not None:
             scores = torch.where(mask[:, None, :, :], scores, torch.finfo(torch.float32).min)
         p = torch.softmax(scores, dim=-1)
         if pv == "int16":
-            pq, sp = quant(p, -1, 1.0, pow2)  # per (head, query) row over the keys
+            pq, sp = quant(p, -1, 1.0, pow2)
     if pv == "int16":
-        vq, sv = quant(v, -2, 1.0, pow2)  # per (kv head, channel) over the keys: (B, Hkv, 1, D)
-        x = pq.reshape(B, Hkv, G * Tq, Tk)
-        sx = sp.reshape(B, Hkv, G * Tq, 1)
-        out = engine(x, sx, vq.transpose(-1, -2), sv).reshape(B, H, Tq, D)
+        vq, sv = quant(v, -2, 1.0, pow2)
+        out = engine(
+            pq.reshape(B, Hkv, G * Tq, Tk), sp.reshape(B, Hkv, G * Tq, 1), vq.transpose(-1, -2), sv
+        ).reshape(B, H, Tq, D)
     else:
         vv = v.repeat_interleave(G, dim=1)
         out = (bf16(p) @ bf16(vv)) if pv == "bf16" else (p @ vv)
     return out
 
 
-# ----------------------------------------------------------------------------------------------------
-# DDR layouts of the int16 engine (int16_linear.h DRIVER CONTRACT), numpy little-endian, as uint32 arrays
-def xmem_image(s_row: np.ndarray, s_tok: np.ndarray, xq: np.ndarray) -> np.ndarray:
-    """One head iteration's xmem: s_row (M FP32), s_tok (padded to Np = pad32(N), pad value given by the caller
-    in s_tok's length or 1.0), Xq as [Np/32 blocks][K][32 tokens] int16. uint32 words."""
-    m = len(s_row)
-    n, kk = xq.shape
-    npad = pad_to(n, TB)
-    assert m % LANES == 0
-    st = np.ones(npad, np.float32)
-    st[: len(s_tok)] = s_tok
-    xi = np.zeros((npad, kk), np.int16)
-    xi[:n] = xq
-    xi = np.ascontiguousarray(xi.reshape(npad // TB, TB, kk).transpose(0, 2, 1))  # [b][k][a]
-    return np.concatenate([np.asarray(s_row, np.float32).view(np.uint32), st.view(np.uint32),
-                           xi.reshape(-1).view(np.uint32)])
-
-
-def xmem_words(m: int, n: int, kk: int) -> int:
-    npad = pad_to(n, TB)
-    return m // 4 + npad // 4 + npad * kk // 8
-
-
-def w_ports(w: np.ndarray) -> np.ndarray:
-    """int16 W (M, K), M a multiple of 32 -> the four port arrays [p][M/32][K] words of 8 lanes
-    W[32 g + 8 p + l][k] (pack_float.pack of the int16 bits), as one uint32 array [p][g][k][4]."""
-    m, kk = w.shape
-    assert m % LANES == 0
-    g = np.ascontiguousarray(w.astype(np.int16)).reshape(m // LANES, PORTS, FL, kk)  # [g][p][l][k]
-    return np.ascontiguousarray(g.transpose(1, 0, 3, 2)).view(np.uint32).reshape(-1)  # [p][g][k][l]
-
-
-def y_tiled(y: np.ndarray) -> np.ndarray:
-    """FP32 Y (Np, M) -> the engine's output Y[M/32][Np][32] as uint32 (rows must already be padded)."""
-    n, m = y.shape
-    assert m % LANES == 0 and n % TB == 0
-    return np.ascontiguousarray(np.asarray(y, np.float32).reshape(n, m // LANES, LANES).transpose(1, 0, 2)
-                                ).reshape(-1).view(np.uint32)
-
-
-# ----------------------------------------------------------------------------------------------------
-# attn_pack descriptors (README.md "attn_pack descriptor"): 96 uint32 = 24 io words
-MODE = dict(QX=0, KW=1, VW=2, OX=3)
-
-
-def f32bits(x: float) -> int:
-    return int(np.float32(x).view(np.uint32))
-
-
-def region(off: int, row_stride: int, half_stride: int, segtab):
-    """A source of FP32 rows: segment h's row i, FP32 word w (0..15) at
-    off + segtab[h] + i * row_stride + (w // 8) * half_stride + w % 8 (words)."""
-    return dict(off=off, row_stride=row_stride, half_stride=half_stride, segtab=list(segtab))
-
-
-def region_rowmajor(off: int, nseg: int):
-    """Row-major FP32 rows of nseg * 64 values (the KV cache, a host buffer)."""
-    return region(off, 16 * nseg, 8, [16 * s for s in range(nseg)])
-
-
-def region_ytiled(off: int, npad: int, nseg: int):
-    """An engine output Y[2 nseg][Np][32]: segment s = 64 channels = groups 2s, 2s + 1."""
-    return region(off, 8, npad * 8, [2 * s * npad * 8 for s in range(nseg)])
-
-
-def desc(mode: str, n_img: int, n_rows: int, n_out: int, rows_per_seg: int, segs_per_img: int, nseg_row: int,
-         scale_mul: float, krank_off: int, n_split: int, regions, out_off: int, out_img: int, out_q: int,
-         sc_off: int, sc_img: int) -> np.ndarray:
-    u = np.zeros(96, np.uint32)
-    u[0:10] = [MODE[mode], n_img, n_rows, n_out, rows_per_seg, segs_per_img, nseg_row, f32bits(scale_mul),
-               krank_off, n_split]
-    regs = list(regions) + [regions[-1]] * (2 - len(regions))
-    for r, reg in enumerate(regs):
-        u[10 + 3 * r: 13 + 3 * r] = [reg["off"], reg["row_stride"], reg["half_stride"]]
-        u[32 + 32 * r: 32 + 32 * r + len(reg["segtab"])] = reg["segtab"]
-    u[16:21] = [out_off, out_img, out_q, sc_off, sc_img]
-    return u
+__all__ = [
+    "attention_contract",
+    "attention",
+    "quant_c",
+    "gemm_out",
+    "ftz",
+    "contract_ranks",
+    "site_geometry",
+    "CT",
+]

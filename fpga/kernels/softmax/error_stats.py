@@ -1,5 +1,6 @@
-"""Error of the softmax kernel's arithmetic (smx_emu.py, bit-exact to softmax_core.h) against FP64 torch.softmax on
-the real -12392 score rows (build/real_scores.pt from policy_check.py --dump-scores: 2 heads of every site, frame 0).
+"""Error of the SOFTMAX unit's arithmetic (smx_emu.py, bit-exact to softmax_core.h) against FP64
+torch.softmax on the real -12392 score rows (build/real_scores.pt from policy_check.py --dump-scores:
+2 heads of every site, frame 0), fed the contract's way: scores x 1/8 (exact), p0 = 1.
 
     python error_stats.py      -> table + build/error_stats.json
 """
@@ -9,9 +10,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import torch
-
 import smx_emu as E
+import torch
 
 HERE = Path(__file__).resolve().parent
 
@@ -33,22 +33,23 @@ def stats(p_hat: torch.Tensor, ref: torch.Tensor) -> dict:
 
 def main():
     real = torch.load(HERE / "build/real_scores.pt", weights_only=False)
-    c = E.c_from_mult(0.125)
+    c = E.c_from_mult(1.0)
     out = {}
     for k, v in real.items():
-        x, valid = v["scores"], v.get("valid")
+        x, valid = v["scores"].float() * 0.125, v.get("valid")
         vv = torch.ones_like(x, dtype=torch.bool) if valid is None else valid
         xs = torch.where(vv, x.double() * (c / E.LOG2E), torch.full_like(x.double(), -1e300))
         ref = torch.softmax(xs, -1)
         ref = torch.where(vv.any(-1, keepdim=True), ref, torch.zeros_like(ref))
-        q, s = E.kernel(x, c, valid, empty="zero")
-        u16 = stats(q.double() * s.double(), ref)
-        f32 = stats(E.kernel(x, c, valid, fp32_out=True, empty="zero").double(), ref)
-        out[k] = dict(rows=x.shape[0], L=x.shape[1], u16=u16, f32=f32)
-        for m, st in (("u16", u16), ("f32", f32)):
-            print(f"{k:13s} {m}: rows {x.shape[0]:4d} L {x.shape[1]:3d}  max|p-p64| {st['max_abs']:.2e}  mean {st['mean_abs']:.1e}"
-                  f"  /rowmax {st['max_abs_over_rowmax']:.2e}  rel(p>1e-3) max {st['max_rel_p_gt_1e3']:.2e} mean "
-                  f"{st['mean_rel_p_gt_1e3']:.1e}  |rowsum-1| {st['max_rowsum_err']:.1e}")
+        q, s = E.kernel(x, c, valid)
+        st = stats(q.double() * s.double(), ref)
+        out[k] = dict(rows=x.shape[0], L=x.shape[1], int16=st)
+        print(
+            f"{k:13s} rows {x.shape[0]:4d} L {x.shape[1]:3d}  max|p-p64| {st['max_abs']:.2e}"
+            f"  mean {st['mean_abs']:.1e}  /rowmax {st['max_abs_over_rowmax']:.2e}"
+            f"  rel(p>1e-3) max {st['max_rel_p_gt_1e3']:.2e} mean {st['mean_rel_p_gt_1e3']:.1e}"
+            f"  |rowsum-1| {st['max_rowsum_err']:.1e}"
+        )
     (HERE / "build/error_stats.json").write_text(json.dumps(out, indent=1))
 
 

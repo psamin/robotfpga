@@ -1,13 +1,19 @@
-"""Test vectors for tb_attn.cpp from real SmolVLA -12392 attention calls (check_policy.py --dump).
+"""Contract command lists for tb_attn.cpp from real SmolVLA -12392 attention calls (check_policy.py --dump).
 
-For every site (vision layer 0 image 0, LM prefix layer 0, expert self-attention and cross-attention of step 0)
-this writes one DDR image (vectors/<site>/mem.bin) holding FP32 Q, K, V as the projections (or the KV cache)
-leave them, the key-rank vector of the mask, the attn_pack descriptors and the int16 P of the softmax (torch FP32
-softmax + the shared quantizer here: the softmax kernel is not part of this test), plus the expected bits of every
-operand and output from the torch emulation (attn_int16.py), and script.txt:
-  pack Q / K / V  ->  engine Q K^T (all KV heads, one call)  ->  [P placed]  ->  engine P V  ->  pack o_proj input
-with a bit-exact check after each step. The chain is also asserted equal to attn_int16.attention (the function the
-full-policy check runs), so the layouts carry exactly the arithmetic whose policy error check_policy.py measures.
+For every site (vision layer 0, LM prefix layer 0, the expert's self- and cross-attention of step 0; prefix
+compacted to its 45 valid tokens) this writes vectors/<site>/:
+
+  mem.bin, meta.txt  a DDR image at a 40-bit base (0x8_0000_0000, 0xFF_0000_0000, 0x4000_0000, 0xFF_8000_0000) holding
+                     the FP32 Q / K / V rows as the projections leave them, the rank vectors and a list of contract
+                     records (CONTRACT.md 5): QUANT_X Q (p4 = -3, head-major) -> QUANT_W K (KW blob) -> QUANT_WT V
+                     (VW blob; expert self: prefix and suffix parts) -> GEMM Q.K^T -> SOFTMAX -> GEMM P.V (C row
+                     groups R = TqP, P1 = 256 B; expert self: the suffix part with F_ACC) -> QUANT_X O (o_proj input)
+                     -> END. Every record passes contract.validate.
+  script.txt         check lines (expected bytes after a record) and load lines (the SOFTMAX record's P and scales,
+                     computed by the softmax unit's golden executor smx_emu.run_cmd on the expected scores)
+  exp_*.bin          the expected bytes, from contract.py's reference arithmetic (numpy: quant_rows, pack_w,
+                     gemm_out) independently of attn_int16; asserted equal, bit for bit, to
+                     attn_int16.attention_contract (the function the full-policy check runs).
 
     C:\\kp\\lerobot-venv\\Scripts\\python.exe fpga\\kernels\\attention\\make_vectors.py [vectors/calls.pt]
 """
@@ -25,189 +31,374 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import attn_int16 as A  # noqa: E402
 
-SUFFIX = 50  # action tokens: expert self-attention keys = prefix KV cache + these
-O_PROJ_M = {"vision": 768, "prefix": 960, "expert_self": 720, "expert_cross": 720}  # o_proj outputs (s_row)
+CT = A.CT
+C = CT.C
+import smx_emu  # noqa: E402  (on sys.path through attn_int16)
+
+D = 64
+BASES = {
+    "vision": 0x8_0000_0000,
+    "prefix": 0xFF_0000_0000,
+    "expert_self": 0x4000_0000,
+    "expert_cross": 0xFF_8000_0000,
+}
 
 
-def u32(a) -> np.ndarray:
-    return np.frombuffer(np.ascontiguousarray(a).tobytes(), np.uint32)
+class Img:
+    """Bump allocator over a byte image at a physical base."""
 
+    def __init__(self, base: int):
+        self.base, self.top, self.data = base, base, bytearray()
 
-class Mem:
-    """Bump allocator of 128-bit words; regions start on 16-word boundaries with 16 words of slack."""
+    def alloc(self, nbytes: int, align: int = 64) -> int:
+        a = (self.top + align - 1) // align * align
+        self.top = a + nbytes
+        if len(self.data) < self.top - self.base:
+            self.data.extend(bytes(self.top - self.base - len(self.data)))
+        return a
 
-    def __init__(self):
-        self.top = 16
-        self.regions = []
+    def put(self, addr: int, arr) -> None:
+        b = np.ascontiguousarray(arr).tobytes()
+        o = addr - self.base
+        self.data[o : o + len(b)] = b
 
-    def alloc(self, nwords: int, data=None) -> int:
-        off = self.top
-        self.top += A.pad_to(nwords, 16) + 16
-        if data is not None:
-            d = u32(data)
-            assert d.size <= 4 * nwords, (d.size, nwords)
-            self.regions.append((off, d))
-        return off
-
-    def image(self) -> np.ndarray:
-        m = np.zeros(self.top * 4, np.uint32)
-        for off, d in self.regions:
-            m[4 * off: 4 * off + d.size] = d
-        return m
-
-
-def ytiled_input(mem: Mem, x2d: torch.Tensor, nseg: int):
-    """x2d (T, nseg * 64) FP32 as an engine call writes it (Y[2 nseg][Np][32]) -> region."""
-    t = x2d.shape[0]
-    npad = A.pad_to(t, A.TB)
-    full = torch.zeros(npad, x2d.shape[1])
-    full[:t] = x2d
-    off = mem.alloc(npad * x2d.shape[1] // 4, A.y_tiled(full.numpy()))
-    return A.region_ytiled(off, npad, nseg)
-
-
-def rowmajor_input(mem: Mem, x2d: torch.Tensor, nseg: int):
-    off = mem.alloc(x2d.numel() // 4, x2d.contiguous().numpy().astype(np.float32))
-    return A.region_rowmajor(off, nseg)
+    def array(self) -> np.ndarray:
+        return np.frombuffer(bytes(self.data), np.uint8).copy()
 
 
 def build(site: str, rec: dict, out: Path) -> dict:
     out.mkdir(parents=True, exist_ok=True)
-    q, k, v = rec["q"][0].float(), rec["k"][0].float(), rec["v"][0].float()  # (H, Tq, D), (Hkv, Tk, D)
-    mask = None if rec["mask"] is None else rec["mask"][0].bool()
-    scale = float(rec["scale"])
-    H, Tq, D = q.shape
-    Hkv, Tk = k.shape[0], k.shape[1]
-    G = H // Hkv
-    assert D == 64 and scale == 0.125
-    N = G * Tq  # stacked rows per KV head
-    Np = A.pad_to(N, A.TB)
-    Mk = A.pad_to(Tk, A.TB)
-    XS_qk, WS_qk = A.xmem_words(Mk, N, 64), Mk // 32 * 64
-    XS_pv, WS_pv = A.xmem_words(64, N, Tk), 2 * Tk
-    YS_qk, YS_pv = Mk * Np // 4, 64 * Np // 4
-    mem = Mem()
-    script, info = [], dict(site=site, H=H, Hkv=Hkv, G=G, Tq=Tq, Tk=Tk, N=N, Np=Np, Mk=Mk)
+    for f in out.glob("*"):
+        f.unlink()
+    q, k, v = rec["q"].float(), rec["k"].float(), rec["v"].float()
+    mask = rec["mask"]
+    assert q.shape[0] == 1 and float(rec["scale"]) == 0.125
+    n_suf = q.shape[2] if site == "expert_self" else 0
+    trec: dict = {}
+    t_out = A.attention_contract(q, k, v, mask, site, n_suf, record=trec)  # the policy-check emulation
+    if mask is None:
+        qc, kc, vc = q[0], k[0], v[0]
+    else:
+        m = mask[0].bool()
+        qv, kv = m.any(1), m.any(0)
+        qc, kc, vc = q[0][:, qv], k[0][:, kv], v[0][:, kv]
+    qc, kc, vc = qc.numpy(), kc.numpy(), vc.numpy()
+    H, tq, _ = qc.shape
+    hkv, tk = kc.shape[0], kc.shape[1]
+    G = H // hkv
+    tqp = CT.pad4(tq)
+    NQ = G * tqp
+    parts, mk = A.site_geometry(site, tk, n_suf)
+    img = Img(BASES[site])
+    lst = img.alloc(256 * 16, 4096)
+    # ---------------- inputs: FP32 rows as the projections leave them
+    rowq = (
+        H * D + 2 * hkv * D
+    )  # fused q | k | v row (prefix, vision); expert: q rows, and k | v rows per part
+    if site in ("vision", "prefix"):
+        qkv = np.concatenate(
+            [
+                qc.transpose(1, 0, 2).reshape(tq, H * D),
+                kc.transpose(1, 0, 2).reshape(tk, hkv * D),
+                vc.transpose(1, 0, 2).reshape(tk, hkv * D),
+            ],
+            1,
+        ).astype(np.float32)
+        a_qkv = img.alloc(qkv.nbytes)
+        img.put(a_qkv, qkv)
+        q_src = (a_qkv, 4 * rowq)
+        kv_src = [(a_qkv + 4 * H * D, a_qkv + 4 * (H + hkv) * D, 4 * rowq)]
+    else:
+        qr = qc.transpose(1, 0, 2).reshape(tq, H * D).astype(np.float32)
+        a_q = img.alloc(qr.nbytes)
+        img.put(a_q, qr)
+        q_src = (a_q, 4 * H * D)
+        kv_src = []
+        for k0, nk, _ in parts:
+            kvr = np.concatenate(
+                [
+                    kc[:, k0 : k0 + nk].transpose(1, 0, 2).reshape(nk, hkv * D),
+                    vc[:, k0 : k0 + nk].transpose(1, 0, 2).reshape(nk, hkv * D),
+                ],
+                1,
+            ).astype(np.float32)
+            a = img.alloc(kvr.nbytes)
+            img.put(a, kvr)
+            kv_src.append((a, a + 4 * hkv * D, 4 * 2 * hkv * D))
+    # ---------------- buffers
+    Qh, sQ = img.alloc(H * tqp * 2 * D), img.alloc(4 * H * tqp)
+    kitem = (mk // 32) * D * 16
+    kport = hkv * kitem
+    KWw, KWs = img.alloc(4 * kport, 4096), img.alloc(4 * hkv * mk)
+    VW = []
+    for _, nk, _ in parts:
+        npv = CT.pad32(nk)
+        vitem = (D // 32) * npv * 16
+        VW.append((img.alloc(4 * hkv * vitem, 4096), img.alloc(4 * hkv * D), vitem, hkv * vitem, npv))
+    S = img.alloc(4 * hkv * NQ * mk)
+    Pm, sP = img.alloc(2 * hkv * NQ * mk), img.alloc(4 * hkv * NQ)
+    O = img.alloc(4 * tqp * H * D)
+    Xo, sXo = img.alloc(2 * tq * H * D), img.alloc(4 * CT.pad4(tq))
+    rq = rk = None
+    if site != "vision":
+        Dq, Ek = trec["ranks"]
+        rq, rk = img.alloc(4 * NQ), img.alloc(4 * mk)
+        img.put(rq, np.tile(Dq.numpy().astype(np.int32), G))
+        img.put(rk, Ek.numpy().astype(np.int32))
+    # ---------------- the list
+    cmds: list[CT.Cmd] = []
+    Sl = CT.Slot
+    cmds.append(
+        CT.Cmd(
+            C.OP_QUANT_X,
+            C.F_QOUT,
+            0,
+            0,
+            H * D,
+            tq,
+            1,
+            {"A": Sl(q_src[0], q_src[1]), "C": Sl(Qh, 2 * D), "F": Sl(sQ)},
+            {
+                C.P_SEG: 64,
+                C.P_SEGC: tqp * 2 * D,
+                C.P_SEGF: 4 * tqp,
+                C.P_SHIFT: (-3) & 0xFFFFFFFF,
+                C.P_NP: tqp,
+            },
+            "q",
+        )
+    )
+    for (k0, nk, r0), (ka, va, pitch) in zip(parts, kv_src):
+        cmds.append(
+            CT.Cmd(
+                C.OP_QUANT_W,
+                0,
+                0,
+                0,
+                hkv * D,
+                nk,
+                1,
+                {"A": Sl(ka, pitch), "C": Sl(KWw + (r0 // 32) * D * 16, kport), "F": Sl(KWs + 4 * r0)},
+                {C.P_SEG: 64, C.P_SEGC: kitem, C.P_SEGF: 4 * mk, C.P_NP: CT.pad32(nk)},
+                f"k{r0}",
+            )
+        )
+    for (k0, nk, r0), (ka, va, pitch), (vw, vs, vitem, vport, npv) in zip(parts, kv_src, VW):
+        cmds.append(
+            CT.Cmd(
+                C.OP_QUANT_WT,
+                0,
+                0,
+                0,
+                hkv * D,
+                nk,
+                1,
+                {"A": Sl(va, pitch), "C": Sl(vw, vport), "F": Sl(vs)},
+                {C.P_SEG: 64, C.P_SEGC: vitem, C.P_SEGF: 4 * D, C.P_NP: npv},
+                f"v{r0}",
+            )
+        )
+    i_qk = len(cmds)
+    cmds.append(
+        CT.Cmd(
+            C.OP_GEMM,
+            0,
+            0,
+            mk,
+            D,
+            NQ,
+            hkv,
+            {
+                "A": Sl(Qh, 2 * D, NQ * 2 * D),
+                "B": Sl(KWw, kport, kitem),
+                "C": Sl(S, 4 * mk, NQ * 4 * mk),
+                "E": Sl(KWs, 0, 4 * mk),
+                "F": Sl(sQ, 0, 4 * NQ),
+            },
+            {},
+            "qk",
+        )
+    )
+    i_smx = len(cmds)
+    s_smx = {"A": Sl(S, 4 * mk, NQ * 4 * mk), "C": Sl(Pm, 2 * mk, NQ * 2 * mk), "F": Sl(sP, 0, 4 * NQ)}
+    fl = C.F_QOUT
+    if rq is not None:
+        fl |= C.F_MASK
+        s_smx["D"], s_smx["E"] = Sl(rq), Sl(rk)
+    cmds.append(CT.Cmd(C.OP_SOFTMAX, fl, 0, 0, mk, NQ, hkv, s_smx, {C.P_EPS: CT.f32bits(1.0)}, "softmax"))
+    for pi, ((k0, nk, r0), (vw, vs, vitem, vport, npv)) in enumerate(zip(parts, VW)):
+        cmds.append(
+            CT.Cmd(
+                C.OP_GEMM,
+                C.F_ACC if pi else 0,
+                0,
+                D,
+                npv,
+                NQ,
+                hkv,
+                {
+                    "A": Sl(Pm + 2 * r0, 2 * mk, NQ * 2 * mk),
+                    "B": Sl(vw, vport, vitem),
+                    "C": Sl(O, 4 * H * D, G * 4 * D),
+                    "E": Sl(vs, 0, 4 * D),
+                    "F": Sl(sP, 0, 4 * NQ),
+                },
+                {C.P_SEGC: tqp, C.P_SEGF: 4 * D},
+                f"pv{pi}",
+            )
+        )
+    i_pv = len(cmds) - 1
+    cmds.append(
+        CT.Cmd(
+            C.OP_QUANT_X,
+            C.F_QOUT,
+            0,
+            0,
+            H * D,
+            tq,
+            1,
+            {"A": Sl(O, 4 * H * D), "C": Sl(Xo, 2 * H * D), "F": Sl(sXo)},
+            {},
+            "o.in",
+        )
+    )
+    cmds.append(CT.Cmd(C.OP_END))
+    for i, c in enumerate(cmds):
+        c.tag = i
+    bad = CT.validate_list(cmds)
+    assert not bad, bad
+    assert len(cmds) <= 16
+    img.put(lst, np.frombuffer(CT.encode_list(cmds), np.uint8))
+    # ---------------- expected bytes (contract.py, numpy)
+    script = []
 
-    def expect(name, off, arr, f32=0):
-        d = u32(arr)
-        assert d.size % 4 == 0
+    def expect(after: int, name: str, addr: int, arr) -> None:
+        b = np.ascontiguousarray(arr).tobytes()
         fn = f"exp_{name}.bin"
-        d.tofile(out / fn)
-        script.append(f"check {name} {off} {d.size // 4} {fn} {f32}")
+        (out / fn).write_bytes(b)
+        script.append(f"check {after} {name} {addr:x} {len(b)} {fn}")
 
-    # ---- inputs as the previous calls leave them
-    reg_q = ytiled_input(mem, q.permute(1, 0, 2).reshape(Tq, H * D), H)
-    k2d, v2d = k.permute(1, 0, 2).reshape(Tk, Hkv * D), v.permute(1, 0, 2).reshape(Tk, Hkv * D)
-    if site == "expert_self":  # keys = the prefix KV cache (row-major host buffer) + this step's suffix (Y tiles)
-        nsplit = Tk - SUFFIX
-        reg_k = [rowmajor_input(mem, k2d[:nsplit], Hkv), ytiled_input(mem, k2d[nsplit:], Hkv)]
-        reg_v = [rowmajor_input(mem, v2d[:nsplit], Hkv), ytiled_input(mem, v2d[nsplit:], Hkv)]
-    else:
-        nsplit = Tk
-        reg_k, reg_v = [ytiled_input(mem, k2d, Hkv)], [ytiled_input(mem, v2d, Hkv)]
-    if mask is not None:
-        krank, qrank, ok = A.rank_descriptor(mask[None])
-        assert ok
-        kr = np.full(A.pad_to(Tk, 8), A.KRANK_NEVER, np.int16)
-        kr[:Tk] = krank[0].numpy().astype(np.int16)
-        krank_off = mem.alloc(kr.size // 8, kr)
-        kval = mask.any(0).float()
-    else:
-        krank_off = A.NONE
-        kval = torch.ones(Tk)
-
-    # ---- the engine buffers: xmem images (one per KV head), port arrays [p][head][g][k], outputs
-    x_qk = mem.alloc(Hkv * XS_qk)
-    w_qk = mem.alloc(4 * Hkv * WS_qk)
-    y_qk = mem.alloc(Hkv * YS_qk)
-    x_pv = mem.alloc(Hkv * XS_pv)
-    w_pv = mem.alloc(4 * Hkv * WS_pv)
-    y_pv = mem.alloc(Hkv * YS_pv)
-    stok_qk = x_qk + Mk // 4
-    d_qx = A.desc("QX", Hkv, N, Np, Tq, G, 1, scale, A.NONE, Tq, [reg_q], stok_qk + Np // 4, XS_qk, 1, stok_qk, XS_qk)
-    d_kw = A.desc("KW", Hkv, Tk, Mk, Tk, 1, 1, 1.0, krank_off, nsplit, reg_k, w_qk, WS_qk, Hkv * WS_qk, x_qk, XS_qk)
-    d_vw = A.desc("VW", Hkv, Tk, Tk, Tk, 1, 1, 1.0, krank_off, nsplit, reg_v, w_pv, WS_pv, Hkv * WS_pv, x_pv, XS_pv)
-    desc_off = mem.alloc(3 * 24, np.concatenate([d_qx, d_kw, d_vw]))
-    script.append(f"pack {desc_off} 3")
-
-    # ---- expected operands (attn_int16.quant: the function the policy check uses), padded rows are zeros
-    k0, v0 = k * kval[None, :, None], v * kval[None, :, None]
-    qs = torch.zeros(Hkv, Np, D)
-    qs[:, :N] = q.reshape(Hkv, N, D)  # row t = g * Tq + i of KV head j
-    qq, sq = A.quant(qs, -1, scale)
-    kp = torch.zeros(Hkv, Mk, D)
-    kp[:, :Tk] = k0
-    kq, sk = A.quant(kp, -1)
-    vq, sv = A.quant(v0, -2)  # (Hkv, Tk, D), (Hkv, 1, D)
-    img_qk = [A.xmem_image(sk[j, :, 0].numpy(), sq[j, :, 0].numpy(), qq[j].numpy()) for j in range(Hkv)]
-    expect("x_qk", x_qk, np.concatenate(img_qk))
-    wk = [A.w_ports(kq[j].numpy()).reshape(4, -1) for j in range(Hkv)]
-    expect("w_qk", w_qk, np.concatenate([wk[j][p] for p in range(4) for j in range(Hkv)]))
-    wv = [A.w_ports(vq[j].T.numpy()).reshape(4, -1) for j in range(Hkv)]
-    expect("w_pv", w_pv, np.concatenate([wv[j][p] for p in range(4) for j in range(Hkv)]))
-
-    # ---- engine Q K^T: all KV heads in one call
-    script.append(f"engine {Mk} 64 {N | (Hkv - 1) << 16} " + " ".join(str(w_qk + p * Hkv * WS_qk) for p in range(4))
-                  + f" {x_qk} {y_qk}")
-    scores = A.engine(qq, sq, kq, sk.transpose(-1, -2))  # (Hkv, Np, Mk)
-    expect("scores", y_qk, np.concatenate([A.y_tiled(scores[j].numpy()) for j in range(Hkv)]), 1)
-
-    # ---- softmax (torch FP32 here) -> int16 P per row, written as the softmax kernel would: the X / s_tok sections
-    s4 = scores[:, :N, :Tk].reshape(H, Tq, Tk)
-    if mask is not None:
-        s4 = torch.where(mask[None], s4, torch.finfo(torch.float32).min)
-    p = torch.softmax(s4, -1)
-    pp = torch.zeros(Hkv, Np, Tk)
-    pp[:, :N] = p.reshape(Hkv, N, Tk)
-    pq, sp = A.quant(pp, -1)
-    for j in range(Hkv):
-        img = A.xmem_image(np.zeros(64, np.float32), sp[j, :, 0].numpy(), pq[j].numpy())
-        mem.regions.append((x_pv + j * XS_pv + 16, img[64:]))  # behind the 16 s_row words attn_pack writes
-    img_pv_srow = [sv[j, 0].numpy().astype(np.float32) for j in range(Hkv)]
-    for j in range(Hkv):
-        script.append(f"check srow_pv{j} {x_pv + j * XS_pv} 16 exp_srow_pv{j}.bin 0")
-        u32(img_pv_srow[j]).tofile(out / f"exp_srow_pv{j}.bin")
-
-    # ---- engine P V
-    script.append(f"engine 64 {Tk} {N | (Hkv - 1) << 16} " + " ".join(str(w_pv + p * Hkv * WS_pv) for p in range(4))
-                  + f" {x_pv} {y_pv}")
-    o = A.engine(pq, sp, vq.transpose(-1, -2), sv)  # (Hkv, Np, 64)
-    expect("out", y_pv, np.concatenate([A.y_tiled(o[j].numpy()) for j in range(Hkv)]), 1)
-    o_heads = o[:, :N].reshape(H, Tq, D)
-    ref = A.attention(q[None], k[None], v[None], scale, None if mask is None else mask[None])[0]
-    same = bool(torch.equal(o_heads, ref))
-    print(f"{site}: layout chain == attn_int16.attention (the policy emulation) bit for bit: {same}")
-    assert same
-
-    # ---- pack the o_proj input: X [pad32(Tq)/32][H*64][32] + s_tok, one scale per query over all heads
-    Mo = A.pad_to(O_PROJ_M[site], 32)
-    XS_o = A.xmem_words(Mo, Tq, H * D)
-    x_o = mem.alloc(XS_o)
-    npo = A.pad_to(Tq, A.TB)
-    reg_o = A.region(y_pv, 8, Np * 8, [(h // G) * YS_pv + (h % G) * Tq * 8 for h in range(H)])
-    d_ox = A.desc("OX", 1, Tq, npo, Tq, 0, H, 1.0, A.NONE, Tq, [reg_o], x_o + Mo // 4 + npo // 4, 0, 1,
-                  x_o + Mo // 4, 0)
-    dox_off = mem.alloc(24, d_ox)
-    script.append(f"pack {dox_off} 1")
-    op = torch.zeros(npo, H * D)
-    op[:Tq] = o_heads.permute(1, 0, 2).reshape(Tq, H * D)
-    oq, so = A.quant(op, -1)
-    img_o = A.xmem_image(np.zeros(Mo, np.float32), so[:, 0].numpy(), oq.numpy())
-    expect("x_o", x_o + Mo // 4, img_o[Mo:])  # s_tok + X (the s_row section is the o_proj weights', host-written)
-
-    mem.image().tofile(out / "mem.bin")
+    # Q: head-major, pad rows zero / 1.0
+    qp = np.zeros((H, tqp, D), np.float32)
+    qp[:, :tq] = qc
+    qq, sq = CT.quant_rows(qp, shift=-3)  # (H, tqp, D) int16, (H, tqp)
+    expect(0, "Qh", Qh, qq)
+    expect(0, "sQ.f32", sQ, sq.astype(np.float32))
+    # K: KW blob
+    kb = np.zeros((hkv, mk, D), np.float32)
+    for k0, nk, r0 in parts:
+        kb[:, r0 : r0 + nk] = kc[:, k0 : k0 + nk]
+    kq, sk = CT.quant_rows(kb)
+    blob = np.zeros((4, hkv, kitem // 2), np.uint16)
+    for j in range(hkv):
+        blob[:, j] = CT.pack_w(kq[j]).reshape(4, -1)
+    i_kw = len(parts)  # the last QUANT_W record
+    expect(i_kw, "KW", KWw, blob)
+    expect(i_kw, "KWs.f32", KWs, sk.astype(np.float32))
+    # V: VW blobs per part
+    vparts = []
+    for pi, ((k0, nk, r0), (vw, vs, vitem, vport, npv)) in enumerate(zip(parts, VW)):
+        vt = vc[:, k0 : k0 + nk].transpose(0, 2, 1)  # (hkv, 64, nk)
+        vq, sv = CT.quant_rows(vt)
+        vqp = np.zeros((hkv, D, npv), np.int16)
+        vqp[:, :, :nk] = vq
+        vblob = np.zeros((4, hkv, vitem // 2), np.uint16)
+        for j in range(hkv):
+            vblob[:, j] = CT.pack_w(vqp[j]).reshape(4, -1)
+        expect(len(parts) + 1 + pi, f"VW{pi}", vw, vblob)
+        expect(len(parts) + 1 + pi, f"VWs{pi}.f32", vs, sv.astype(np.float32))
+        vparts.append((vqp, sv))
+    # Q.K^T
+    xq = qq.reshape(hkv, NQ, D).astype(np.int64)
+    sx = sq.reshape(hkv, NQ)
+    scores = np.stack([CT.gemm_out(xq[j] @ kq[j].astype(np.int64).T, sk[j], sx[j]) for j in range(hkv)])
+    expect(i_qk, "scores.f32", S, scores)
+    # SOFTMAX: the softmax unit's golden executor on the expected scores
+    mem = img.array()
+    o = S - img.base
+    mem[o : o + scores.nbytes] = np.frombuffer(scores.astype(np.float32).tobytes(), np.uint8)
+    smx_emu.run_cmd(cmds[i_smx], mem, img.base)
+    pbytes = mem[Pm - img.base : Pm - img.base + 2 * hkv * NQ * mk].copy()
+    spbytes = mem[sP - img.base : sP - img.base + 4 * hkv * NQ].copy()
+    (out / "smx_P.bin").write_bytes(pbytes.tobytes())
+    (out / "smx_sP.bin").write_bytes(spbytes.tobytes())
+    script.append(f"load {i_smx} {Pm:x} smx_P.bin")
+    script.append(f"load {i_smx} {sP:x} smx_sP.bin")
+    P = pbytes.view(np.int16).reshape(hkv, NQ, mk).astype(np.int64)
+    sp = spbytes.view(np.float32).reshape(hkv, NQ)
+    # P.V (suffix part: F_ACC)
+    y = None
+    for pi, ((k0, nk, r0), (vqp, sv)) in enumerate(zip(parts, vparts)):
+        npv = vqp.shape[2]
+        yp = np.stack(
+            [
+                CT.gemm_out(
+                    P[j][:, r0 : r0 + npv] @ vqp[j].astype(np.int64).T,
+                    sv[j],
+                    sp[j],
+                    addend=None if y is None else y[j],
+                )
+                for j in range(hkv)
+            ]
+        )
+        y = yp
+    Oexp = (
+        y.reshape(hkv, G, tqp, D).transpose(2, 0, 1, 3).reshape(tqp, H * D)
+    )  # row i, column (G j + g) 64 + c
+    expect(i_pv, "O.f32", O, Oexp)
+    xo, so = CT.quant_rows(Oexp[:tq])
+    sop = np.ones(CT.pad4(tq), np.float32)
+    sop[:tq] = so
+    expect(i_pv + 1, "Xo", Xo, xo)
+    expect(i_pv + 1, "sXo.f32", sXo, sop)
+    # ---------------- the two emulations agree bit for bit
+    t_o = trec["out"].numpy()  # (H, tq, D)
+    same = dict(
+        scores=bool(
+            np.array_equal(trec["scores"].numpy().view(np.uint32), scores.astype(np.float32).view(np.uint32))
+        ),
+        P=bool(np.array_equal(trec["pq"].numpy().astype(np.int64), P))
+        and bool(np.array_equal(trec["sp"].numpy()[..., 0].view(np.uint32), sp.view(np.uint32))),
+        O=bool(
+            np.array_equal(
+                t_o.transpose(1, 0, 2).reshape(tq, H * D).view(np.uint32),
+                Oexp[:tq].astype(np.float32).view(np.uint32),
+            )
+        ),
+    )
+    full = t_out[0].numpy() if mask is None else t_out[0][:, mask[0].bool().any(1)].numpy()
+    same["policy_output"] = bool(np.array_equal(full.view(np.uint32), t_o.view(np.uint32)))
+    print(f"{site}: contract.py chain == attn_int16.attention_contract (policy check) bit for bit: {same}")
+    assert all(same.values()), same
+    (out / "mem.bin").write_bytes(img.array().tobytes())
+    (out / "meta.txt").write_text(f"{img.base:x} {lst:x} {img.top - img.base} {len(cmds)}\n")
     (out / "script.txt").write_text("\n".join(script) + "\n")
-    info.update(words=mem.top, checks=sum(1 for s in script if s.startswith("check")))
-    print(f"  {out}: {json.dumps(info)}")
+    info = dict(
+        site=site,
+        H=H,
+        Hkv=hkv,
+        G=G,
+        Tq=tq,
+        TqP=tqp,
+        keys=[p[1] for p in parts],
+        Mk=mk,
+        base=hex(img.base),
+        bytes=img.top - img.base,
+        records=len(cmds),
+        checks=sum(s.startswith("check") for s in script),
+        ops=[C.opnames[c.op] + (f"/{c.note}" if c.note else "") for c in cmds],
+    )
+    print(f"  {out}: {json.dumps({k: v for k, v in info.items() if k != 'ops'})}")
     return info
 
 
 def main():
     src = Path(sys.argv[1]) if len(sys.argv) > 1 else HERE / "vectors" / "calls.pt"
     calls = torch.load(src, weights_only=False)
-    infos = [build(site, calls[site], HERE / "vectors" / site) for site in ("vision", "prefix", "expert_self",
-                                                                            "expert_cross")]
+    infos = [
+        build(site, calls[site], HERE / "vectors" / site)
+        for site in ("vision", "prefix", "expert_self", "expert_cross")
+    ]
     (HERE / "vectors" / "cases.json").write_text(json.dumps(infos, indent=1))
 
 

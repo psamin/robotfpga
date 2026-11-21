@@ -1,21 +1,26 @@
-"""Full-policy effect of the FPGA softmax kernel on SmolVLA -12392 (3 replay frames), plus the softmax inventory.
+"""Full-policy effect of the SOFTMAX unit (integration contract 1.0) on SmolVLA -12392 (3 replay frames), plus
+the softmax inventory and the unit's time model.
 
-Every attention softmax of the policy (SigLIP vision tower, VLM prefix, action expert self- and cross-attention)
-is replaced by the kernel's bit-exact torch emulation (smx_emu.py); everything else stays FP32 as loaded. Modes:
-  orig          the policy as loaded (sdpa vision attention, LeRobot eager attention)          control
-  explicit      explicit Q K^T, torch.softmax, P V in FP32 (the code path of the kernel modes)  control
-  smx_u16       kernel, int16 output: P = q * scale (q in [0, 32767], scale = RN(1 / sum q)), P V in FP32;
-                fully masked rows zero (the default, the sequencer contract)
-  smx_u16_unif  the same with F_EMPTY_UNIFORM (fully masked rows uniform, as torch)
-  smx_f32       kernel, FP32 output (SMX_FP32_OUT=1 build), fully masked rows zero
-Each attention's raw scores Q K^T (FP32) go into the kernel with p0 = 1/sqrt(64) (c = fl32(p0 * log2 e)), masks as
-the kernel's rank vectors (E per key, D per row; every mask is checked to be rank-representable). Errors:
-max |chunk - ref_chunk_raw| (normalized action units, gate 0.05) per frame, and max |chunk - chunk_explicit|
-(the kernel's own effect).
+Every attention softmax of the policy (SigLIP vision tower, VLM prefix, action expert self- and
+cross-attention)
+is replaced by the unit's bit-exact torch emulation (smx_emu.py); everything else stays FP32 as loaded. Modes:
+  orig      the policy as loaded (sdpa vision attention, LeRobot eager attention)                 control
+  explicit  explicit Q K^T, torch.softmax, P V in FP32 (the code path of the unit modes)          control
+  smx       the contract's arithmetic: the scores enter already x 1/8 (the 1/8 rides in Q's stored scale,
+            p4 = -3, CONTRACT.md 2.4), p0 = 1.0 so c = fl32(log2 e); masks as int32 rank vectors
+            (0 <= E[k] <= D[n]); P = q * scale with q in [0, 32767], scale = RN(1 / sum q), fully masked rows
+            q = 0 with scale 1.0; P V in FP32
+  smx_p0    the same unit on the raw scores with p0 = 1/8 (the pre-contract way): must give the same chunk
+  bit for
+            bit (1/8 is exact, and fix() only moves the exponent); checked, not assumed
+Errors: max |chunk - ref_chunk_raw| (normalized action units, gate 0.05) per frame, and max |chunk -
+chunk_explicit|
+(the unit's own effect).
 
     set HF_HUB_OFFLINE=1
-    C:\\kp\\lerobot-venv\\Scripts\\python.exe fpga\\kernels\\softmax\\policy_check.py [--frames 0,1,2] [--modes ...]
-    ... --dump-scores     also writes fpga/kernels/softmax/build/real_scores.pt (real score rows for make_vectors.py)
+    C:\kp\lerobot-venv\Scripts\python.exe fpga\kernels\softmax\policy_check.py [--frames 0,1,2] [--modes ...]
+    ... --dump-scores     also writes fpga/kernels/softmax/build/real_scores.pt (real score rows for
+    make_vectors.py)
 """
 
 from __future__ import annotations
@@ -23,7 +28,6 @@ from __future__ import annotations
 import argparse
 import copy
 import json
-import math
 import os
 import sys
 import time
@@ -32,7 +36,6 @@ from collections import defaultdict
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
@@ -40,14 +43,14 @@ sys.path.insert(0, str(HERE))
 import smx_emu as E  # noqa: E402
 
 SRC_CKPT = ROOT / "build/ckpt/smolvla-12392/smolvla-so101_medicine_bottle_pickplace-12392-native"
-NOVLM_CKPT = ROOT / "build/brief/int16_12392/ckpt_novlm"  # same files, load_vlm_weights=false (deploy_smolvla.py)
+NOVLM_CKPT = (
+    ROOT / "build/brief/int16_12392/ckpt_novlm"
+)  # same files, load_vlm_weights=false (deploy_smolvla.py)
 BATCHES = ROOT / "build/ckpt/smolvla-12392/batches-12392"
 OUT = HERE / "build"
 BIG_NEG = torch.finfo(torch.float32).min
 
 STATE = dict(mode="orig", phase="vision", log=None, dump=None)
-CLK = 250e6
-BR = 256
 
 
 def smx_softmax(scores: torch.Tensor, temp: float, mask, where: str) -> torch.Tensor:
@@ -55,38 +58,50 @@ def smx_softmax(scores: torch.Tensor, temp: float, mask, where: str) -> torch.Te
     B, H, Tq, Tk = scores.shape
     log = STATE["log"]
     if log is not None:
-        log.append(dict(site=where, phase=STATE["phase"], B=B, H=H, Hkv=STATE.get("hkv", H), Tq=Tq, Tk=Tk,
-                        masked=mask is not None))
+        log.append(
+            dict(
+                site=where,
+                phase=STATE["phase"],
+                B=B,
+                H=H,
+                Hkv=STATE.get("hkv", H),
+                Tq=Tq,
+                Tk=Tk,
+                masked=mask is not None,
+            )
+        )
     valid = None if mask is None else mask.expand(B, H, Tq, Tk)
     dump = STATE["dump"]
     if dump is not None and where not in dump:
-        n = min(H, 2) * Tq
-        dump[where] = dict(scores=scores[0, :2].reshape(-1, Tk).clone(), rph=Tq, c=temp * E.LOG2E,
-                           valid=None if valid is None else valid[0, :2].reshape(-1, Tk).clone())
+        dump[where] = dict(
+            scores=scores[0, :2].reshape(-1, Tk).clone(),
+            rph=Tq,
+            c=temp * E.LOG2E,
+            valid=None if valid is None else valid[0, :2].reshape(-1, Tk).clone(),
+        )
     mode = STATE["mode"]
     if mode == "explicit":
         s = scores * temp
         if mask is not None:
             s = torch.where(mask, s, BIG_NEG)
         return torch.softmax(s, dim=-1)
-    c = E.c_from_mult(temp)
-    x = scores.reshape(-1, Tk)
+    if mode == "smx":  # contract: x = scores * 1/8 exactly in FP32 (Q's stored scale), p0 = 1
+        x, p0 = (scores * torch.tensor(temp, dtype=torch.float32)).reshape(-1, Tk), 1.0
+    elif mode == "smx_p0":
+        x, p0 = scores.reshape(-1, Tk), temp
+    else:
+        raise ValueError(mode)
+    c = E.c_from_mult(p0)
     v = None
-    if mask is not None:  # the kernel sees rank vectors: E per key, D per row (one pair per batch item)
+    if mask is not None:  # the unit sees int32 rank vectors: E per key, D per row (one pair per batch item)
         m = mask.expand(B, 1, Tq, Tk)[:, 0]
         r = E.ranks_from_mask(m)
         assert r is not None, f"{where}: mask not rank-representable"
         v = E.rank_valid(r[0], r[1])  # (B, Tq, Tk), == m
+        assert torch.equal(v, m.bool()), where
         STATE["ranked"] = STATE.get("ranked", 0) + 1
         v = v[:, None].expand(B, H, Tq, Tk).reshape(-1, Tk)
-    if mode == "smx_u16":
-        p = E.softmax_u16(x, c, v, empty="zero")
-    elif mode == "smx_u16_unif":
-        p = E.softmax_u16(x, c, v, empty="uniform")
-    elif mode == "smx_f32":
-        p = E.softmax_f32(x, c, v, empty="zero")
-    else:
-        raise ValueError(mode)
+    p = E.softmax_u16(x, c, v)
     return p.reshape(B, H, Tq, Tk)
 
 
@@ -95,7 +110,9 @@ def make_vision_forward(orig):
         if STATE["mode"] == "orig":
             if STATE["log"] is not None:
                 B, T, _ = hidden_states.shape
-                STATE["log"].append(dict(site="vision", phase="vision", B=B, H=self.num_heads, Tq=T, Tk=T, masked=False))
+                STATE["log"].append(
+                    dict(site="vision", phase="vision", B=B, H=self.num_heads, Tq=T, Tk=T, masked=False)
+                )
             return orig(hidden_states, attention_mask, **kwargs)
         assert attention_mask is None, "SmolVLA runs SigLIP without a patch mask"
         input_shape = hidden_states.shape[:-1]
@@ -111,25 +128,47 @@ def make_vision_forward(orig):
 
 
 def make_lm_attention(orig):
-    def eager_attention_forward(self, attention_mask, batch_size, head_dim, query_states, key_states, value_states):
+    def eager_attention_forward(
+        self, attention_mask, batch_size, head_dim, query_states, key_states, value_states
+    ):
         if STATE["mode"] == "orig":
             if STATE["log"] is not None:
-                STATE["log"].append(dict(site=lm_site(query_states, key_states), phase=STATE["phase"], B=batch_size,
-                                         H=self.num_attention_heads, Hkv=self.num_key_value_heads,
-                                         Tq=query_states.shape[1],
-                                         Tk=key_states.shape[1], masked=True))
+                STATE["log"].append(
+                    dict(
+                        site=lm_site(query_states, key_states),
+                        phase=STATE["phase"],
+                        B=batch_size,
+                        H=self.num_attention_heads,
+                        Hkv=self.num_key_value_heads,
+                        Tq=query_states.shape[1],
+                        Tk=key_states.shape[1],
+                        masked=True,
+                    )
+                )
             return orig(attention_mask, batch_size, head_dim, query_states, key_states, value_states)
         H, Hkv = self.num_attention_heads, self.num_key_value_heads
         STATE["hkv"] = Hkv
         g = H // Hkv
         Tk = key_states.shape[1]
-        k = key_states[:, :, :, None, :].expand(batch_size, Tk, Hkv, g, head_dim).reshape(batch_size, Tk, H, head_dim)
-        v = value_states[:, :, :, None, :].expand(batch_size, Tk, Hkv, g, head_dim).reshape(batch_size, Tk, H, head_dim)
+        k = (
+            key_states[:, :, :, None, :]
+            .expand(batch_size, Tk, Hkv, g, head_dim)
+            .reshape(batch_size, Tk, H, head_dim)
+        )
+        v = (
+            value_states[:, :, :, None, :]
+            .expand(batch_size, Tk, Hkv, g, head_dim)
+            .reshape(batch_size, Tk, H, head_dim)
+        )
         q = query_states.to(torch.float32).transpose(1, 2)
         k = k.to(torch.float32).transpose(1, 2)
         v = v.transpose(1, 2)
-        p = smx_softmax(q @ k.transpose(-1, -2), head_dim**-0.5, attention_mask[:, None, :, :],
-                        lm_site(query_states, key_states))
+        p = smx_softmax(
+            q @ k.transpose(-1, -2),
+            head_dim**-0.5,
+            attention_mask[:, None, :, :],
+            lm_site(query_states, key_states),
+        )
         out = torch.matmul(p.to(v.dtype), v)
         return out.permute(0, 2, 1, 3).reshape(batch_size, -1, H * head_dim)
 
@@ -155,7 +194,6 @@ def install(policy):
     vwe = policy.model.vlm_with_expert
     vwe.eager_attention_forward = types.MethodType(make_lm_attention(vwe.eager_attention_forward), vwe)
     # phase tracking: vision tower, prefix prefill, denoising steps
-    model = policy.model
     orig_embed_image = vwe.embed_image
 
     def embed_image(*a, **k):
@@ -193,54 +231,30 @@ def run(policy, frame, mode):
 
 
 def inventory(log):
-    """Rows / elements per site and the kernel's cycle estimates, both layouts (README.md "Time"):
-    rows   one call per attention invocation: B = H items of Tq rows (vision: one item of H * Tq rows, as the
-           sequencer batches it), a_pitch = ceil(Tk / 4) words; both passes stream one word per cycle in parallel,
-           pass 2 one row behind pass 1; rows shorter than 13 words are paced by the divider.
-    engine items = KV heads, N = (H / Hkv) * Tq stacked rows, Np = pad32(N), Mk = pad32(Tk): G = Mk / 32 groups,
-           Np * Mk / 4 words per item; pass 2 starts when pass 1 reaches the item's last group, so the call takes
-           (items + (G - 1) / G) item times.
-    Both: ~150 cycles per item (loop restart + DDR latency) and ~300 per call."""
-    sites = defaultdict(lambda: dict(calls=0, rows=0, elems=0, words_in=0, cyc_rows=0, cyc_engine=0,
-                                     words_engine=0, shapes=set()))
+    """Softmax calls, rows and elements per site of the LeRobot forward (uncompacted: the prefix is 81 tokens
+    here,
+    45 in the contract's list). The unit's time is smx_time.py's, on the contract list itself."""
+    sites = defaultdict(lambda: dict(calls=0, rows=0, elems=0, shapes=set()))
     for e in log:
         s = sites[e["site"]]
         H, Hkv, Tq, Tk = e["H"], e.get("Hkv", e["H"]), e["Tq"], e["Tk"]
         rows = e["B"] * H * Tq
-        L4 = (Tk + 3) // 4
         s["calls"] += 1
         s["rows"] += rows
         s["elems"] += rows * Tk
-        s["words_in"] += rows * L4
-        items = e["B"] * (1 if e["site"] == "vision" else H)
-        s["cyc_rows"] += rows * max(L4, 13) + L4 + items * 150 + 300
-        Np, G = -(-(H // Hkv) * Tq // 32) * 32, -(-Tk // 32)
-        iw = Np * G * 8
-        nit = e["B"] * Hkv
-        s["words_engine"] += nit * iw
-        s["cyc_engine"] += int((nit + (G - 1) / G) * iw) + nit * 150 + 300
         s["shapes"].add((e["B"], H, Hkv, Tq, Tk))
-    keys = ("calls", "rows", "elems", "words_in", "words_engine", "cyc_rows", "cyc_engine")
-    tot = {k: 0 for k in keys}
-    out = {}
-    for k, s in sites.items():
-        out[k] = {kk: s[kk] for kk in keys}
-        out[k]["ms_rows"] = round(s["cyc_rows"] / CLK * 1e3, 3)
-        out[k]["ms_engine"] = round(s["cyc_engine"] / CLK * 1e3, 3)
-        out[k]["shapes(B,H,Hkv,Tq,Tk)"] = sorted(s["shapes"])
-        for t in keys:
-            tot[t] += s[t]
-    tot["ms_rows"] = round(tot["cyc_rows"] / CLK * 1e3, 3)
-    tot["ms_engine"] = round(tot["cyc_engine"] / CLK * 1e3, 3)
-    tot["ms_ideal_stream_rows"] = round(tot["words_in"] / CLK * 1e3, 3)
-    out["total"] = tot
+    out = {
+        k: dict(calls=v["calls"], rows=v["rows"], elems=v["elems"], shapes=sorted(v["shapes"]))
+        for k, v in sites.items()
+    }
+    out["total"] = {k: sum(v[k] for v in sites.values()) for k in ("calls", "rows", "elems")}
     return out
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--frames", default="0,1,2")
-    ap.add_argument("--modes", default="orig,explicit,smx_u16,smx_u16_unif,smx_f32")
+    ap.add_argument("--modes", default="orig,explicit,smx,smx_p0")
     ap.add_argument("--threads", type=int, default=0)
     ap.add_argument("--dump-scores", action="store_true")
     ap.add_argument("--out", default=str(OUT / "policy_check.json"))
@@ -253,8 +267,11 @@ def main():
     ckpt = NOVLM_CKPT if NOVLM_CKPT.exists() else SRC_CKPT
     t0 = time.perf_counter()
     policy = SmolVLAPolicy.from_pretrained(str(ckpt)).to("cpu").eval().float()
-    print(f"loaded {ckpt} in {time.perf_counter() - t0:.1f} s; {install(policy)} vision attention modules patched",
-          flush=True)
+    print(
+        f"loaded {ckpt} in {time.perf_counter() - t0:.1f} s;"
+        f" {install(policy)} vision attention modules patched",
+        flush=True,
+    )
     files = sorted(BATCHES.glob("frame_*.pt"))
     frames = [torch.load(files[int(i)], weights_only=False) for i in a.frames.split(",")]
     modes = a.modes.split(",")
@@ -280,10 +297,17 @@ def main():
                 r["max_abs_vs_explicit"] = float((ch - chunks["explicit"]).abs().max())
             if "orig" in chunks and m != "orig":
                 r["max_abs_vs_orig"] = float((ch - chunks["orig"]).abs().max())
+            if m == "smx_p0" and "smx" in chunks:
+                r["bit_equal_to_smx"] = bool(torch.equal(ch, chunks["smx"]))
             res["modes"].setdefault(m, {})[int(fr["frame"])] = r
-            print(f"frame {int(fr['frame']):5d} {m:9s}: max|chunk-ref| {r['max_abs_err']:.3e} mean {r['mean_abs_err']:.3e}"
-                  + (f"  vs explicit {r['max_abs_vs_explicit']:.3e}" if "max_abs_vs_explicit" in r else "")
-                  + f"  ({dt:.1f} s)", flush=True)
+            print(
+                f"frame {int(fr['frame']):5d} {m:9s}: max|chunk-ref| {r['max_abs_err']:.3e}"
+                + f" mean {r['mean_abs_err']:.3e}"
+                + (f"  vs explicit {r['max_abs_vs_explicit']:.3e}" if "max_abs_vs_explicit" in r else "")
+                + (f"  bit-equal to smx: {r['bit_equal_to_smx']}" if "bit_equal_to_smx" in r else "")
+                + f"  ({dt:.1f} s)",
+                flush=True,
+            )
             Path(a.out).write_text(json.dumps(res, indent=1, default=list), encoding="utf-8")
     inv = res.get("inventory")
     if inv:

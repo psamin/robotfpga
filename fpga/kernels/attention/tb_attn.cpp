@@ -1,158 +1,612 @@
-// Host testbench of the attention data path: attn_pack.h (the HLS core, compiled with g++) + the int16 engine
-// (attn_engine_model.h, and with -DATTN_REAL_ENGINE also the engine's own C++ core fpga/hls/int16_linear.h) on DDR
-// images that make_vectors.py writes from real SmolVLA -12392 attention calls. Every operand (int16 Q / K / V^T /
-// o_proj input with their scales, in the engine's xmem / port layouts) and every engine output (scores, attention
-// output) is compared bit for bit with the torch emulation (attn_int16.py).
+// Host testbench of the attention path under the float_top integration contract (fpga/kernels/CONTRACT.md 5).
 //
-//   python fpga/kernels/attention/make_vectors.py
+//   tb_attn --unit                  QUANT_W / QUANT_WT (attn_kv.h, the HLS mode code) on adversarial commands against
+//                                   an independent reference written from the contract formulas (ref_quant_kv below):
+//                                   the whole memory image is compared, so a write outside the declared extents fails
+//   tb_attn <case dir>...           a contract command list from make_vectors.py (real -12392 attention calls):
+//                                   every record is decoded, validated (validate and validate_hw) and dispatched:
+//                                     QUANT_W, QUANT_WT  attn::quant_kv (the HLS code)
+//                                     GEMM               contract model (C slot rows, items, row groups, bias / D /
+//                                                        F_ACC; ctr::ref::gemm_out), or with -DATTN_REAL_ENGINE the
+//                                                        engine's own fstream16::linear_int16_core per item (the blob
+//                                                        is read as is; X / Y converted from / to the contract rows)
+//                                     QUANT_X            row-unit model (ctr::ref::quant_row per (row, segment))
+//                                     SOFTMAX            the softmax kernel's bits (smx_emu.py), loaded by the script
+//                                   and every intermediate is compared bit for bit with make_vectors.py's expectation
+//   -DATTN_THREADS                  the DATAFLOW processes run as threads on FIFOs bounded at the pragma depths
+//                                   (deadlock model, CONTRACT.md 7); a pass that does not finish is reported
+//
 //   export PATH=/c/Xilinx/Vitis_HLS/2022.2/tps/win64/msys64/mingw64/bin:/c/Xilinx/Vitis_HLS/2022.2/tps/win64/msys64/usr/bin:/c/Windows/System32:/c/Windows
-//   g++ -O2 -std=c++14 -ffp-contract=off -I/c/Xilinx/Vitis_HLS/2022.2/include [-DATTN_REAL_ENGINE] -o tb_attn.exe tb_attn.cpp
-//   ./tb_attn.exe vectors/vision vectors/prefix vectors/expert_self vectors/expert_cross
-//
-// script.txt, one command per line, run in order:
-//   pack <desc_off> <n_desc>                    attn_pack(mem, mem, desc_off, n_desc)
-//   engine M K Nreg w0 w1 w2 w3 xmem ymem       one head-batched engine call (Nreg = n | (H - 1) << 16)
-//   check <name> <off> <n_words> <file> <f32>   compare mem[off .. off + n) with file (f32 = 1: also max |diff|)
+//   g++ -O2 -std=c++14 -ffp-contract=off -I/c/Xilinx/Vitis_HLS/2022.2/include -o tb_attn.exe tb_attn.cpp
+//   ./tb_attn.exe --unit vectors/vision vectors/prefix vectors/expert_self vectors/expert_cross
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <map>
+#include <random>
 #include <sstream>
 #include <string>
 #include <vector>
 
-#include "attn_engine_model.h"
-#include "attn_pack.h"
+#ifdef ATTN_THREADS
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <mutex>
+#include <thread>
+template <class T>
+class BStream {  // a bounded blocking FIFO with the hls::stream calls attn_kv.h uses
+ public:
+  void set_depth(size_t d) { depth_ = d; }
+  void write(const T& v) {
+    std::unique_lock<std::mutex> l(m_);
+    cv_.wait(l, [&] { return q_.size() < depth_; });
+    q_.push_back(v);
+    cv_.notify_all();
+  }
+  T read() {
+    std::unique_lock<std::mutex> l(m_);
+    cv_.wait(l, [&] { return !q_.empty(); });
+    T v = q_.front();
+    q_.pop_front();
+    cv_.notify_all();
+    return v;
+  }
+  bool read_nb(T& v) {
+    std::unique_lock<std::mutex> l(m_);
+    if (q_.empty()) return false;
+    v = q_.front();
+    q_.pop_front();
+    cv_.notify_all();
+    return true;
+  }
+
+ private:
+  std::deque<T> q_;
+  size_t depth_ = 2;
+  std::mutex m_;
+  std::condition_variable cv_;
+};
+static std::atomic<int> g_deadlocks(0);
+static void run4(std::function<void()> a, std::function<void()> b, std::function<void()> c, std::function<void()> d) {
+  std::atomic<int> done(0);
+  std::thread t[4] = {std::thread([&] { a(); done++; }), std::thread([&] { b(); done++; }),
+                      std::thread([&] { c(); done++; }), std::thread([&] { d(); done++; })};
+  const auto t0 = std::chrono::steady_clock::now();
+  while (done < 4) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(20)) {
+      printf("DEADLOCK: a DATAFLOW pass did not finish in 20 s (bounded FIFOs at the pragma depths)\n");
+      fflush(stdout);
+      g_deadlocks++;
+      std::_Exit(3);
+    }
+  }
+  for (auto& x : t) x.join();
+}
+#define ATTN_STREAM BStream
+#define ATTN_DEPTH(s, d) s.set_depth(d)
+#define ATTN_DATAFLOW_THREADS(a, b, c, d) run4([&] { a; }, [&] { b; }, [&] { c; }, [&] { d; })
+#endif
+
+#include "attn_kv.h"
 #ifdef ATTN_REAL_ENGINE
 #include "../../hls/int16_linear.h"
 #endif
 
-using attnpack::Word;
+using attn::Word;
+using ctr::Cmd;
+using ctr::Slot;
 
-static std::vector<uint32_t> load_u32(const std::string& path) {
+// ---------------------------------------------------------------- DDR model: [base, base + bytes) as 128-bit words
+struct Mem {
+  static constexpr size_t GUARD = 1 << 16;  // words (1 MB) of canary below and above the image, compared too
+  uint64_t base = 0;
+  std::vector<Word> w;                   // [guard][image][guard]
+  std::vector<uint8_t>* touched = nullptr;  // if set: every word a set_* writes
+  void init(uint64_t b, size_t bytes, uint32_t fill) {
+    base = b;
+    w.assign((bytes + 15) / 16 + 2 * GUARD, Word(0));
+    for (auto& x : w)
+      for (int j = 0; j < 4; j++) x.range(32 * j + 31, 32 * j) = fill;
+  }
+  size_t idx(uint64_t a) const {
+    if (a < base || a - base >= 16 * (uint64_t)(w.size() - 2 * GUARD)) {
+      fprintf(stderr, "address 0x%llx outside the image [0x%llx, +0x%llx)\n", (unsigned long long)a,
+              (unsigned long long)base, (unsigned long long)(16 * (w.size() - 2 * GUARD)));
+      exit(4);
+    }
+    return GUARD + (size_t)((a - base) >> 4);
+  }
+  uint32_t u32(uint64_t a) const { return (uint32_t)w[idx(a)].range(32 * ((a >> 2) & 3) + 31, 32 * ((a >> 2) & 3)); }
+  void mark(uint64_t a) {
+    if (touched) (*touched)[idx(a)] = 1;
+  }
+  void set_u32(uint64_t a, uint32_t v) { mark(a); w[idx(a)].range(32 * ((a >> 2) & 3) + 31, 32 * ((a >> 2) & 3)) = v; }
+  uint16_t u16(uint64_t a) const { return (uint16_t)w[idx(a)].range(16 * ((a >> 1) & 7) + 15, 16 * ((a >> 1) & 7)); }
+  void set_u16(uint64_t a, uint16_t v) { mark(a); w[idx(a)].range(16 * ((a >> 1) & 7) + 15, 16 * ((a >> 1) & 7)) = v; }
+  float f32(uint64_t a) const { return ctr::u2f(u32(a)); }
+  void set_f32(uint64_t a, float f) { set_u32(a, ctr::f2u(f)); }
+  // the io pointers of the mode functions: register value 0, so word index = byte address >> 4
+  Word* ptr() { return w.data() + GUARD - (base >> 4); }
+};
+
+// ---------------------------------------------------------------- reference QUANT_W / QUANT_WT (contract text)
+static void ref_quant_kv(const Cmd& c, Mem& m) {
+  const Slot &A = c.s[ctr::SLOT_A], &C = c.s[ctr::SLOT_C], &F = c.s[ctr::SLOT_F];
+  const uint32_t W = c.p[ctr::P_SEG] ? ctr::SEG_HEAD : c.K, nseg = c.K / W;
+  const uint32_t NP = c.p[ctr::P_NP] ? c.p[ctr::P_NP] : c.N;
+  const uint64_t segc = c.p[ctr::P_SEGC], segf = c.p[ctr::P_SEGF];
+  const int shift = (int32_t)c.p[ctr::P_SHIFT];
+  std::vector<float> x;
+  std::vector<int16_t> q;
+  for (uint64_t b = 0; b < c.B; b++)
+    for (uint64_t j = 0; j < nseg; j++) {
+      if (c.op == ctr::OP_QUANT_W) {  // KW: one scale per (key, segment)
+        x.resize(W);
+        q.resize(W);
+        for (uint64_t n = 0; n < NP; n++) {
+          for (uint64_t d = 0; d < W; d++) x[d] = n < c.N ? m.f32(ctr::row_addr(A, b, n) + 4 * (j * W + d)) : 0.0f;
+          const float s = ctr::ref::quant_row(x.data(), W, q.data(), shift);
+          for (uint64_t d = 0; d < W; d++) {
+            const uint64_t wa = C.addr + b * C.stride + j * segc + ((n % 32) / 8) * C.pitch + ((n / 32) * W + d) * 16;
+            m.set_u16(wa + 2 * (n % 8), (uint16_t)q[d]);
+          }
+          m.set_f32(F.addr + b * F.stride + j * segf + 4 * n, s);
+        }
+      } else {  // VW: one scale per channel over the item's N keys; keys [N, NP) zero
+        x.resize(c.N);
+        q.resize(c.N);
+        for (uint64_t ch = 0; ch < W; ch++) {
+          for (uint64_t n = 0; n < c.N; n++) x[n] = m.f32(ctr::row_addr(A, b, n) + 4 * (j * W + ch));
+          const float s = ctr::ref::quant_row(x.data(), c.N, q.data(), shift);
+          for (uint64_t n = 0; n < NP; n++) {
+            const uint64_t wa = C.addr + b * C.stride + j * segc + ((ch % 32) / 8) * C.pitch + ((ch / 32) * NP + n) * 16;
+            m.set_u16(wa + 2 * (ch % 8), n < c.N ? (uint16_t)q[n] : (uint16_t)0);
+          }
+          m.set_f32(F.addr + b * F.stride + j * segf + 4 * ch, s);
+        }
+      }
+    }
+}
+
+// ---------------------------------------------------------------- row-unit QUANT_X model (F_QOUT int16 rows)
+static void model_quant_x(const Cmd& c, Mem& m) {
+  const Slot &A = c.s[ctr::SLOT_A], &C = c.s[ctr::SLOT_C], &F = c.s[ctr::SLOT_F];
+  const uint32_t W = c.p[ctr::P_SEG] ? ctr::SEG_HEAD : c.K, nseg = c.K / W;
+  const uint32_t NP = c.p[ctr::P_NP] ? c.p[ctr::P_NP] : c.N;
+  const uint64_t segc = nseg > 1 ? c.p[ctr::P_SEGC] : 0, segf = nseg > 1 ? c.p[ctr::P_SEGF] : 0;
+  std::vector<float> x(W);
+  std::vector<int16_t> q(W);
+  for (uint64_t b = 0; b < c.B; b++)
+    for (uint64_t j = 0; j < nseg; j++) {
+      for (uint64_t n = 0; n < ctr::pad4(NP); n++) {
+        float s = 1.0f;  // pad lanes of the scale vector: 1.0
+        if (n < NP) {
+          for (uint64_t d = 0; d < W; d++) x[d] = n < c.N ? m.f32(ctr::row_addr(A, b, n) + 4 * (j * W + d)) : 0.0f;
+          s = ctr::ref::quant_row(x.data(), W, q.data(), (int32_t)c.p[ctr::P_SHIFT]);
+          for (uint64_t d = 0; d < W; d++)
+            m.set_u16(C.addr + b * C.stride + j * segc + n * C.pitch + 2 * d, (uint16_t)q[d]);
+        }
+        m.set_f32(F.addr + b * F.stride + j * segf + 4 * n, s);
+      }
+    }
+}
+
+// ---------------------------------------------------------------- GEMM (CONTRACT.md 2.3, 3.3)
+static void gemm_epilogue_write(const Cmd& c, Mem& m, uint64_t b, uint64_t n, uint64_t mm, float y) {
+  const Slot& Y = c.s[ctr::SLOT_C];
+  const uint64_t R = c.p[ctr::P_SEGC], P1 = c.p[ctr::P_SEGF];
+  const uint64_t ya = ctr::row_addr2(Y, b, n, R, P1) + 4 * mm;
+  float add = 0.0f;
+  bool has = false;
+  if (c.flags & ctr::F_ADD_D) {
+    add = m.f32(ctr::row_addr(c.s[ctr::SLOT_D], b, n) + 4 * mm);
+    has = true;
+  }
+  if (c.flags & ctr::F_ACC) {
+    add = m.f32(ya);
+    has = true;
+  }
+  if (c.flags & ctr::F_BIAS) y = ctr::ref::fadd_hw(y, m.f32(c.s[ctr::SLOT_G].addr + b * c.s[ctr::SLOT_G].stride + 4 * mm));
+  if (has) y = ctr::ref::fadd_hw(y, add);
+  m.set_f32(ya, y);
+}
+
+#ifndef ATTN_REAL_ENGINE
+static void gemm(const Cmd& c, Mem& m) {
+  const Slot &X = c.s[ctr::SLOT_A], &Wt = c.s[ctr::SLOT_B], &E = c.s[ctr::SLOT_E], &Fs = c.s[ctr::SLOT_F];
+  std::vector<int16_t> xr(c.K), wr((size_t)c.M * c.K);
+  for (uint64_t b = 0; b < c.B; b++) {
+    for (uint64_t mm = 0; mm < c.M; mm++)
+      for (uint64_t k = 0; k < c.K; k++)
+        wr[mm * c.K + k] = (int16_t)m.u16(ctr::w_word_addr(Wt, b, mm, k, c.K) + 2 * ctr::w_lane(mm));
+    for (uint64_t n = 0; n < c.N; n++) {
+      for (uint64_t k = 0; k < c.K; k++) xr[k] = (int16_t)m.u16(ctr::row_addr(X, b, n) + 2 * k);
+      const float st = m.f32(Fs.addr + b * Fs.stride + 4 * n);
+      for (uint64_t mm = 0; mm < c.M; mm++) {
+        int64_t acc = 0;
+        for (uint64_t k = 0; k < c.K; k++) acc += (int32_t)xr[k] * (int32_t)wr[mm * c.K + k];
+        const float y = ctr::ref::gemm_out(acc, m.f32(E.addr + b * E.stride + 4 * mm), st, nullptr, nullptr);
+        gemm_epilogue_write(c, m, b, n, mm, y);
+      }
+    }
+  }
+}
+static const char* gemm_name = "contract model";
+#else
+// The engine's own core per item, on its per-call layout: xmem = [s_row M][s_tok Np][X: Np/32][K][32 tokens],
+// port p = [M/32][K] words read from the contract blob as is, Y[M/32][Np][32] back to the contract rows.
+static void gemm(const Cmd& c, Mem& m) {
+  using fstream::IoWord;
+  using fstream::WPort;
+  const Slot &X = c.s[ctr::SLOT_A], &Wt = c.s[ctr::SLOT_B], &E = c.s[ctr::SLOT_E], &Fs = c.s[ctr::SLOT_F];
+  const uint32_t M = c.M, K = c.K, N = c.N, np = ctr::pad32(N), ws = M / 32 * K;
+  for (uint64_t b = 0; b < c.B; b++) {
+    // the host build's WPort / IoWord are plain 16-byte structs with the HLS word's lane layout
+    std::vector<WPort> w[4];
+    for (int p = 0; p < 4; p++) {
+      w[p].resize(ws);
+      for (uint32_t i = 0; i < ws; i++)
+        for (int l = 0; l < 8; l++) w[p][i].v[l] = m.u16(Wt.addr + b * Wt.stride + p * Wt.pitch + 16 * i + 2 * l);
+    }
+    const size_t nx = M / 4 + np / 4 + (size_t)np * K / 8, xo = M / 4 + np / 4;
+    std::vector<uint32_t> xu(4 * nx, 0u);
+    for (uint32_t mm = 0; mm < M; mm++) xu[mm] = m.u32(E.addr + b * E.stride + 4 * mm);
+    for (uint32_t n = 0; n < np; n++) xu[M + n] = n < N ? m.u32(Fs.addr + b * Fs.stride + 4 * n) : ctr::ONE_BITS;
+    std::vector<uint16_t> xh(8 * (nx - xo), 0);
+    for (uint32_t n = 0; n < N; n++)
+      for (uint32_t k = 0; k < K; k++) {
+        const uint32_t blk = n / 32, a = n % 32;
+        xh[(((size_t)blk * K + k) * 4 + a / 8) * 8 + a % 8] = m.u16(ctr::row_addr(X, b, n) + 2 * k);
+      }
+    std::vector<IoWord> xm(nx), ym((size_t)M * np / 4);
+    memcpy(xm.data(), xu.data(), 16 * xo);
+    memcpy(xm.data() + xo, xh.data(), 16 * (nx - xo));
+    const int st = fstream16::linear_int16_core(w[0].data(), w[1].data(), w[2].data(), w[3].data(), xm.data(),
+                                                ym.data(), (int)M, (int)K, (int)N, (int)(M / 4), (int)((M + np) / 4));
+    if (st) {
+      printf("  engine core returned %d\n", st);
+      exit(5);
+    }
+    for (uint32_t n = 0; n < N; n++)
+      for (uint32_t mm = 0; mm < M; mm++) {
+        const size_t e = ((size_t)(mm / 32) * np + n) * 32 + mm % 32;
+        gemm_epilogue_write(c, m, b, n, mm, ym[e / 4].v[e % 4]);
+      }
+  }
+}
+static const char* gemm_name = "int16_linear.h core";
+#endif
+
+// ---------------------------------------------------------------- unit tests of the mode
+static float edge_value(std::mt19937& g, int pattern, uint32_t i) {
+  std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+  switch (pattern) {
+    case 0: return u(g) * 3.0f;
+    case 1: return 0.0f;
+    case 2: return (i % 2) ? -0.0f : 0.0f;
+    case 3: return ctr::u2f((g() & 0x807FFFFFu) | 0u);                  // denormals (and +-0)
+    case 4: return u(g) * 1e-32f;                                       // below the 1e-30 floor
+    case 5: return u(g) * 3.0e38f;                                      // near FLT_MAX
+    case 6: return (float)((int)(g() % 64) - 32) + 0.5f;                // ties at s = 1 / 1024-ish rows
+    case 7: return i == 3 ? 1000.0f : u(g) * 1e-3f;                     // one outlier
+    case 8: return 1.0f;                                                // all equal
+    default: return ldexpf(u(g), (int)(g() % 200) - 100);               // wide exponents
+  }
+}
+
+struct UCase {
+  const char* name;
+  uint32_t op, K, N, NP, seg, B;
+  int shift;
+  uint32_t apad, cpad, sgap;  // extra bytes: A pitch, C pitch (port pitch), segment gaps
+  uint64_t base;
+};
+
+static int run_unit_case(const UCase& u, uint32_t seed) {
+  std::mt19937 g(seed);
+  const bool vw = u.op == ctr::OP_QUANT_WT;
+  const uint32_t W = u.seg ? 64 : u.K, nseg = u.K / W, NP = u.NP ? u.NP : u.N;
+  // layout: A rows, C blob (4 port arrays per segment, segments segc apart, items stride apart), F scales
+  const uint64_t apitch = 4ull * u.K + u.apad;
+  const uint64_t port = vw ? (uint64_t)(W / 32) * NP * 16 : (uint64_t)(NP / 32) * W * 16;
+  const uint64_t cpitch = port + u.cpad;
+  const uint64_t segc = nseg > 1 ? 4 * cpitch + u.sgap : 0;
+  const uint64_t blob = nseg > 1 ? nseg * segc : 4 * cpitch;
+  const uint64_t nsc = vw ? W : NP;
+  const uint64_t segf = nseg > 1 ? 4 * ctr::pad4((uint32_t)nsc) + u.sgap : 0;
+  const uint64_t sv = nseg > 1 ? nseg * segf : 4 * ctr::pad4((uint32_t)nsc);
+  const uint64_t a0 = u.base + 256, c0 = (a0 + (uint64_t)u.B * u.N * apitch + 4096) / 4096 * 4096;
+  const uint64_t f0 = c0 + (uint64_t)u.B * blob + 256 + 16;
+  const uint64_t end = f0 + (uint64_t)u.B * sv + 256;
+  Cmd c;
+  memset(&c, 0, sizeof c);
+  c.op = u.op;
+  c.K = u.K;
+  c.N = u.N;
+  c.B = u.B;
+  c.s[ctr::SLOT_A] = {a0, (uint32_t)apitch, (uint32_t)(u.N * apitch)};
+  c.s[ctr::SLOT_C] = {c0, (uint32_t)cpitch, (uint32_t)blob};
+  c.s[ctr::SLOT_F] = {f0, 0, (uint32_t)sv};
+  c.p[ctr::P_SEG] = u.seg;
+  c.p[ctr::P_SEGC] = (uint32_t)segc;
+  c.p[ctr::P_SEGF] = (uint32_t)segf;
+  c.p[ctr::P_SHIFT] = (uint32_t)u.shift;
+  c.p[ctr::P_NP] = u.NP;
+  // through the record format: what the sequencer hands the mode
+  uint32_t f[ctr::REC_FIELDS];
+  ctr::encode(c, f);
+  Cmd d;
+  if (ctr::decode(f, d) != ctr::ST_END) {
+    printf("  %-28s decode failed\n", u.name);
+    return 1;
+  }
+  const uint32_t v = ctr::validate(d), vh = ctr::validate_hw(d);
+  if (v || vh) {
+    printf("  %-28s validate %u validate_hw %u (test bug)\n", u.name, v, vh);
+    return 1;
+  }
+  Mem m1, m2;
+  m1.init(u.base, end - u.base, 0xA5A5A5A5u);  // canary everywhere
+  // inputs: per row a pattern (the edge cases mix inside one command)
+  for (uint64_t b = 0; b < u.B; b++)
+    for (uint64_t n = 0; n < u.N; n++) {
+      const int pat = (int)((n * 7 + b * 3 + seed) % 10);
+      for (uint64_t k = 0; k < u.K; k++) m1.set_f32(ctr::row_addr(d.s[ctr::SLOT_A], b, n) + 4 * k, edge_value(g, pat, (uint32_t)k));
+    }
+  if (vw) {  // VW: also columns with their own patterns (a channel of zeros, of denormals, of 1e-32 ...)
+    for (uint64_t b = 0; b < u.B; b++)
+      for (uint64_t k = 0; k < u.K; k += 13) {
+        const int pat = (int)((k / 13 + seed) % 10);
+        for (uint64_t n = 0; n < u.N; n++) m1.set_f32(ctr::row_addr(d.s[ctr::SLOT_A], b, n) + 4 * k, edge_value(g, pat, (uint32_t)n));
+      }
+  }
+  m2 = m1;
+  const auto t0 = std::chrono::steady_clock::now();
+  const uint32_t r = attn::quant_kv(d, m1.ptr(), m1.ptr());
+  const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  ref_quant_kv(d, m2);
+  size_t bad = 0, first = 0;
+  for (size_t i = 0; i < m1.w.size(); i++)
+    if (m1.w[i] != m2.w[i]) {
+      if (!bad) first = i;
+      bad++;
+    }
+  const bool outside = bad && (first < Mem::GUARD || first >= m1.w.size() - Mem::GUARD);
+  printf("  %-28s %s K %5u N %5u NP %5u W %4u B %u shift %+d base 0x%010llx: %s (%zu words differ%s) %.0f ms\n",
+         u.name, vw ? "QUANT_WT" : "QUANT_W ", u.K, u.N, NP, W, u.B, u.shift, (unsigned long long)u.base,
+         bad || r ? "FAIL" : "bit-exact", bad, bad ? "" : ", none outside the extents", ms);
+  if (bad)
+    printf("    first difference at 0x%llx%s\n", (unsigned long long)(m1.base + 16 * first - 16 * Mem::GUARD),
+           outside ? " (in a guard zone: a write past the declared extents)" : "");
+  return (bad || r) ? 1 : 0;
+}
+
+// Non-finite inputs (CONTRACT.md 4.1, review defect 21 / 27): q is undefined, but the mode must finish and must not
+// write outside the declared extents. The reference marks every word it writes; the mode may change no other word.
+static int nonfinite_case(uint32_t op) {
+  const bool vw = op == ctr::OP_QUANT_WT;
+  const uint32_t K = 320, N = 45, NP = 64, W = 64, nseg = K / W;
+  const uint64_t base = 0x800000000ull, apitch = 4 * K, a0 = base + 256, c0 = base + 0x10000;
+  const uint64_t port = vw ? (W / 32) * NP * 16 : (NP / 32) * W * 16, segc = 4 * port;
+  const uint64_t f0 = c0 + nseg * segc + 4096, segf = 4 * (vw ? W : NP);
+  Cmd c;
+  memset(&c, 0, sizeof c);
+  c.op = op;
+  c.K = K;
+  c.N = N;
+  c.B = 1;
+  c.s[ctr::SLOT_A] = {a0, (uint32_t)apitch, 0};
+  c.s[ctr::SLOT_C] = {c0, (uint32_t)port, 0};
+  c.s[ctr::SLOT_F] = {f0, 0, 0};
+  c.p[ctr::P_SEG] = 64;
+  c.p[ctr::P_SEGC] = (uint32_t)segc;
+  c.p[ctr::P_SEGF] = (uint32_t)segf;
+  c.p[ctr::P_NP] = NP;
+  if (ctr::validate(c)) {
+    printf("  nonfinite: validate %u (test bug)\n", ctr::validate(c));
+    return 1;
+  }
+  Mem m1, m2;
+  m1.init(base, f0 + nseg * segf + 4096 - base, 0x5A5A5A5Au);
+  std::mt19937 g(77);
+  const float inf = ctr::u2f(0x7F800000u), nan = ctr::u2f(0x7FC00001u);
+  for (uint64_t n = 0; n < N; n++)
+    for (uint64_t k = 0; k < K; k++) {
+      float v = edge_value(g, 0, (uint32_t)k);
+      if (n % 7 == 1 && k % 64 == 5) v = inf;
+      if (n % 7 == 3 && k % 64 == 9) v = -inf;
+      if (n % 11 == 4 && k % 64 == 33) v = nan;
+      if (k == 70) v = n % 2 ? nan : inf;  // a whole column (VW channel 6 of head 1)
+      m1.set_f32(a0 + n * apitch + 4 * k, v);
+    }
+  m2 = m1;
+  const Mem init = m1;
+  std::vector<uint8_t> t(m2.w.size(), 0);
+  m2.touched = &t;
+  attn::quant_kv(c, m1.ptr(), m1.ptr());
+  ref_quant_kv(c, m2);
+  size_t outside = 0, changed = 0;
+  for (size_t i = 0; i < m1.w.size(); i++)
+    if (m1.w[i] != init.w[i]) {
+      changed++;
+      if (!t[i]) outside++;
+    }
+  printf("  %-28s %s: finished, %zu words written, %zu outside the declared extents: %s\n", "non-finite rows / columns",
+         vw ? "QUANT_WT" : "QUANT_W ", changed, outside, outside ? "FAIL" : "ok");
+  return outside ? 1 : 0;
+}
+
+static int unit_tests() {
+  const uint64_t HI = 0xFF00000000ull, LO = 0x40000000ull, MID = 0x800000000ull;
+  const UCase cs[] = {
+      // QUANT_W (KW)
+      {"kw lm (5 heads, 45 keys)", ctr::OP_QUANT_W, 320, 45, 64, 64, 1, 0, 0, 0, 0, MID},
+      {"kw vision (12 heads)", ctr::OP_QUANT_W, 768, 512, 512, 64, 1, 0, 0, 0, 0, HI},
+      {"kw items 3, pitch gaps", ctr::OP_QUANT_W, 320, 50, 64, 64, 3, 0, 48, 32, 16, LO},
+      {"kw shift -8", ctr::OP_QUANT_W, 128, 33, 64, 64, 2, -8, 16, 0, 0, MID},
+      {"kw shift +8", ctr::OP_QUANT_W, 64, 1, 32, 64, 1, 8, 0, 0, 0, MID},
+      {"kw shift -3 (as Q)", ctr::OP_QUANT_W, 192, 31, 32, 64, 1, -3, 0, 16, 0, HI},
+      {"kw W=K=8 (p1 0)", ctr::OP_QUANT_W, 8, 5, 32, 0, 2, 0, 0, 0, 0, LO},
+      {"kw W=K=200 (p1 0)", ctr::OP_QUANT_W, 200, 70, 96, 0, 1, 1, 32, 0, 0, MID},
+      {"kw W=K=1000 (long rows)", ctr::OP_QUANT_W, 1000, 20, 32, 0, 2, -1, 0, 16, 0, MID},
+      {"kw 300 keys, 17 heads", ctr::OP_QUANT_W, 1088, 300, 320, 64, 1, 0, 0, 0, 32, HI},
+      // QUANT_WT (VW)
+      {"vw lm (5 heads, 45 keys)", ctr::OP_QUANT_WT, 320, 45, 64, 64, 1, 0, 0, 0, 0, MID},
+      {"vw vision (2 items)", ctr::OP_QUANT_WT, 768, 256, 256, 64, 2, 0, 0, 0, 0, HI},
+      {"vw suffix NP 56", ctr::OP_QUANT_WT, 320, 50, 56, 64, 1, 0, 16, 48, 16, LO},
+      {"vw 1 key", ctr::OP_QUANT_WT, 64, 1, 8, 64, 3, 2, 0, 0, 0, MID},
+      {"vw shift -8, 3 heads", ctr::OP_QUANT_WT, 192, 77, 80, 64, 1, -8, 0, 0, 0, MID},
+      {"vw W=K=96 (p1 0)", ctr::OP_QUANT_WT, 96, 40, 40, 0, 2, 0, 16, 0, 0, LO},
+      {"vw W=K=320 (p1 0)", ctr::OP_QUANT_WT, 320, 45, 64, 0, 1, 0, 0, 0, 0, HI},
+      {"vw W=K=32 (p1 0)", ctr::OP_QUANT_WT, 32, 9, 16, 0, 1, -2, 0, 0, 0, MID},
+  };
+  int fails = 0;
+  printf("== unit: QUANT_W / QUANT_WT (attn_kv.h) vs the contract reference, whole image compared\n");
+  uint32_t seed = 1;
+  for (const auto& u : cs) fails += run_unit_case(u, seed++);
+  fails += nonfinite_case(ctr::OP_QUANT_W);
+  fails += nonfinite_case(ctr::OP_QUANT_WT);
+  printf("  %d cases, %d failures\n", (int)(sizeof cs / sizeof cs[0]) + 2, fails);
+  return fails;
+}
+
+// ---------------------------------------------------------------- contract list cases (make_vectors.py)
+static std::vector<uint8_t> load_bytes(const std::string& path) {
   std::ifstream f(path, std::ios::binary | std::ios::ate);
   if (!f) {
     fprintf(stderr, "cannot open %s\n", path.c_str());
     exit(2);
   }
   const size_t n = (size_t)f.tellg();
-  std::vector<uint32_t> v(n / 4);
+  std::vector<uint8_t> v(n);
   f.seekg(0);
-  f.read(reinterpret_cast<char*>(v.data()), (std::streamsize)(v.size() * 4));
+  f.read(reinterpret_cast<char*>(v.data()), (std::streamsize)n);
   return v;
 }
-
-static void to_words(const std::vector<uint32_t>& m, std::vector<Word>& w) {
-  w.resize(m.size() / 4);
-  for (size_t i = 0; i < w.size(); i++)
-    for (int j = 0; j < 4; j++) w[i].range(32 * j + 31, 32 * j) = m[4 * i + j];
+static void put_bytes(Mem& m, uint64_t a, const std::vector<uint8_t>& v) {
+  for (size_t i = 0; i < v.size(); i += 2) m.set_u16(a + i, (uint16_t)(v[i] | (v[i + 1] << 8)));
 }
-static void from_words(const std::vector<Word>& w, std::vector<uint32_t>& m) {
-  for (size_t i = 0; i < w.size(); i++)
-    for (int j = 0; j < 4; j++) m[4 * i + j] = (uint32_t)w[i].range(32 * j + 31, 32 * j);
-}
-
-#ifdef ATTN_REAL_ENGINE
-// the engine's own core, once per head (what float_top's head loop would do), on copies of the operands
-static int real_engine(std::vector<uint32_t>& mem, const attneng::Call& c) {
-  using fstream::IoWord;
-  using fstream::WPort;
-  const uint32_t n = attneng::n_of(c.Nreg), H = attneng::h_of(c.Nreg), np = attneng::np_of(n);
-  const uint32_t WS = attneng::ws_of(c), XS = attneng::xs_of(c), YS = attneng::ys_of(c);
-  for (uint32_t h = 0; h < H; h++) {
-    std::vector<WPort> w[4];
-    for (int p = 0; p < 4; p++) {
-      w[p].resize(WS);
-      memcpy(w[p].data(), &mem[4 * ((size_t)c.w[p] + (size_t)h * WS)], (size_t)WS * 16);
-    }
-    std::vector<IoWord> x(XS), y(YS);
-    memcpy(x.data(), &mem[4 * ((size_t)c.x + (size_t)h * XS)], (size_t)XS * 16);
-    const int st = fstream16::linear_int16_core(w[0].data(), w[1].data(), w[2].data(), w[3].data(), x.data(), y.data(),
-                                                (int)c.M, (int)c.K, (int)n, (int)(c.M / 4), (int)((c.M + np) / 4));
-    if (st) return st;
-    memcpy(&mem[4 * ((size_t)c.y + (size_t)h * YS)], y.data(), (size_t)YS * 16);
-  }
-  return 0;
-}
-#endif
 
 static int run_case(const std::string& dir) {
-  std::vector<uint32_t> mem = load_u32(dir + "/mem.bin");
+  // meta.txt: base, image bytes, list address, records; script.txt: load / check lines
+  std::ifstream mf(dir + "/meta.txt");
+  unsigned long long base, list;
+  size_t bytes, nrec;
+  mf >> std::hex >> base >> list >> std::dec >> bytes >> nrec;
+  const std::vector<uint8_t> img = load_bytes(dir + "/mem.bin");
+  Mem m;
+  m.init(base, bytes, 0);
+  put_bytes(m, base, img);
+  struct Line {
+    std::string kind, name, file;
+    uint64_t addr, n;
+  };
+  std::multimap<size_t, Line> loads, checks;
   std::ifstream sc(dir + "/script.txt");
   std::string line;
-  int fails = 0, checks = 0;
-  printf("== %s (%zu words of DDR image)\n", dir.c_str(), mem.size() / 4);
   while (std::getline(sc, line)) {
     std::istringstream is(line);
-    std::string cmd;
-    is >> cmd;
-    if (cmd == "pack") {
-      uint32_t off, n;
-      is >> off >> n;
-      std::vector<Word> w;
-      to_words(mem, w);
-      const auto t0 = std::chrono::steady_clock::now();
-      const int st = attnpack::attn_pack(w.data(), w.data(), off, n);
-      const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-      from_words(w, mem);
-      printf("  pack desc %u x %u: status %d (%.1f ms host)\n", off, n, st, ms);
-      if (st) fails++;
-    } else if (cmd == "engine") {
-      attneng::Call c;
-      is >> c.M >> c.K >> c.Nreg >> c.w[0] >> c.w[1] >> c.w[2] >> c.w[3] >> c.x >> c.y;
-#ifdef ATTN_REAL_ENGINE
-      const int st = real_engine(mem, c);
-      const char* who = "int16_linear.h core";
-#else
-      const int st = attneng::engine_call(mem, c);
-      const char* who = "C model";
-#endif
-      printf("  engine (%s) M %u K %u N %u H %u: status %d\n", who, c.M, c.K, attneng::n_of(c.Nreg),
-             attneng::h_of(c.Nreg), st);
-      if (st) fails++;
-    } else if (cmd == "check") {
-      std::string name, file;
-      uint32_t off, n;
-      int f32;
-      is >> name >> off >> n >> file >> f32;
-      const std::vector<uint32_t> ref = load_u32(dir + "/" + file);
-      checks++;
-      if (ref.size() != 4 * (size_t)n) {
-        printf("  check %s: expected %u words, file has %zu\n", name.c_str(), n, ref.size() / 4);
-        fails++;
-        continue;
-      }
-      size_t bad = 0;
-      double maxd = 0.0, maxr = 0.0;
-      for (size_t i = 0; i < 4 * (size_t)n; i++) {
-        const uint32_t a = mem[4 * (size_t)off + i];
-        if (a != ref[i]) bad++;
-        if (f32) {
-          maxd = std::fmax(maxd, std::fabs((double)attneng::u2f(a) - (double)attneng::u2f(ref[i])));
-          maxr = std::fmax(maxr, std::fabs((double)attneng::u2f(ref[i])));
-        }
-      }
-      if (bad) fails++;
-      if (f32)
-        printf("  check %-6s %7u words: %s (%zu values differ, max |diff| %.3g of max |ref| %.3g)\n", name.c_str(), n,
-               bad ? "FAIL" : "bit-exact", bad, maxd, maxr);
-      else
-        printf("  check %-6s %7u words: %s (%zu values differ)\n", name.c_str(), n, bad ? "FAIL" : "bit-exact", bad);
+    Line L;
+    size_t at;
+    is >> L.kind >> at;
+    if (L.kind == "load") {
+      is >> std::hex >> L.addr >> std::dec >> L.file;
+      loads.insert({at, L});
+    } else if (L.kind == "check") {
+      is >> L.name >> std::hex >> L.addr >> std::dec >> L.n >> L.file;
+      checks.insert({at, L});
     }
   }
-  printf("  %d checks, %d failures\n", checks, fails);
+  printf("== %s (image 0x%llx + %zu bytes, %zu records at 0x%llx; GEMM: %s)\n", dir.c_str(), base, bytes, nrec, list,
+         gemm_name);
+  int fails = 0, nchecks = 0;
+  for (size_t i = 0; i < nrec; i++) {
+    uint32_t f[ctr::REC_FIELDS];
+    for (uint32_t j = 0; j < ctr::REC_FIELDS; j++) f[j] = m.u32(list + 256 * i + 4 * j);
+    Cmd c;
+    const uint32_t st = ctr::decode(f, c);
+    if (st != ctr::ST_END) {
+      printf("  record %zu: decode status 0x%x\n", i, st);
+      return fails + 1;
+    }
+    const uint32_t v = ctr::validate(c), vh = ctr::validate_hw(c);
+    if (v || vh) {
+      printf("  record %zu (op 0x%02x): validate %u validate_hw %u\n", i, c.op, v, vh);
+      return fails + 1;
+    }
+    const char* what = "";
+    const auto t0 = std::chrono::steady_clock::now();
+    auto lr = loads.equal_range(i);
+    if (lr.first != lr.second) {
+      for (auto it = lr.first; it != lr.second; ++it) put_bytes(m, it->second.addr, load_bytes(dir + "/" + it->second.file));
+      what = c.op == ctr::OP_SOFTMAX ? "SOFTMAX (smx_emu bits loaded)" : "loaded";
+    } else if (c.op == ctr::OP_END) {
+      what = "END";
+    } else if (c.op == ctr::OP_QUANT_W || c.op == ctr::OP_QUANT_WT) {
+      const uint32_t r = attn::quant_kv(c, m.ptr(), m.ptr());
+      what = c.op == ctr::OP_QUANT_W ? "QUANT_W  (attn_kv.h)" : "QUANT_WT (attn_kv.h)";
+      if (r) fails++;
+    } else if (c.op == ctr::OP_GEMM) {
+      gemm(c, m);
+      what = "GEMM";
+    } else if (c.op == ctr::OP_QUANT_X) {
+      model_quant_x(c, m);
+      what = "QUANT_X  (row-unit model)";
+    } else {
+      printf("  record %zu: op 0x%02x has no implementation here\n", i, c.op);
+      return fails + 1;
+    }
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    printf("  [%2zu] %-30s M %4u K %4u N %4u B %2u %6.1f ms\n", i, what, c.M, c.K, c.N, c.B, ms);
+    auto cr = checks.equal_range(i);
+    for (auto it = cr.first; it != cr.second; ++it) {
+      const Line& L = it->second;
+      const std::vector<uint8_t> ref = load_bytes(dir + "/" + L.file);
+      nchecks++;
+      size_t bad = 0;
+      double maxd = 0.0;
+      for (size_t k = 0; k + 1 < ref.size(); k += 2) {
+        const uint16_t a = m.u16(L.addr + k), e = (uint16_t)(ref[k] | (ref[k + 1] << 8));
+        if (a != e) bad++;
+      }
+      if (ref.size() != L.n) bad++;
+      if (bad && L.name.find("f32") != std::string::npos) {
+        for (size_t k = 0; k + 3 < ref.size(); k += 4) {
+          uint32_t e;
+          memcpy(&e, &ref[k], 4);
+          maxd = std::fmax(maxd, std::fabs((double)m.f32(L.addr + k) - (double)ctr::u2f(e)));
+        }
+      }
+      printf("       check %-16s %8zu bytes: %s", L.name.c_str(), ref.size(), bad ? "FAIL" : "bit-exact");
+      if (bad) printf(" (%zu 16-bit halves differ, max |diff| %.3g)", bad, maxd);
+      printf("\n");
+      if (bad) fails++;
+    }
+    if (c.op == ctr::OP_END) break;
+  }
+  printf("  %d checks, %d failures\n", nchecks, fails);
   return fails;
 }
 
 int main(int argc, char** argv) {
+  setvbuf(stdout, nullptr, _IONBF, 0);
   if (argc < 2) {
-    fprintf(stderr, "usage: tb_attn <case dir>...\n");
+    fprintf(stderr, "usage: tb_attn [--unit] [<case dir>...]\n");
     return 2;
   }
   int fails = 0;
-  for (int i = 1; i < argc; i++) fails += run_case(argv[i]);
+  for (int i = 1; i < argc; i++) {
+    if (!strcmp(argv[i], "--unit"))
+      fails += unit_tests();
+    else
+      fails += run_case(argv[i]);
+  }
   printf(fails ? "FAILED (%d)\n" : "ALL PASS\n", fails);
   return fails ? 1 : 0;
 }

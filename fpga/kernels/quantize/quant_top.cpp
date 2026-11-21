@@ -1,46 +1,32 @@
-// Standalone Vitis HLS top of the int16 per-token quantizer (quant_mode.h), the future QUANT_X mode
-// of float_top: same bundle names and widths as float_top (hp0 / hp1 read, io write, s_axi_control).
+// Standalone Vitis HLS top of the row unit's QUANT_X / QUANT_W / QUANT_WT / COPY modes (quant_mode.h), for
+// csynth only: it fetches one 256-byte contract record over io (as the sequencer does), decodes it with
+// ctr::decode and calls qz::row_mode, so the csynth report shows row_mode as its own instance, exactly the
+// function the sequencer's dispatch switch calls. validate_hw is the sequencer's (not instantiated here: the
+// host tb runs every case through ctr::validate first).
 //
-// Registers (all word = 16-byte units; hp0 and hp1 must be given the same base address):
-//   B, N, K                      items, rows per item, values per row
-//   in_off, in_pitch, in_bstride     input FP32 rows, relative to hp0 / hp1
-//   out_off, out_pitch, out_bstride  int16 rows, relative to io
-//   scl_off, scl_bstride             FP32 scale vectors, relative to io
-// Returns 0, or 1 (nothing read or written) when the command breaks quant_cmd_ok's constraints.
+// Bundles as float_top's io: xmem (read) and ymem (write) on m_axi "io", 128-bit, bursts <= 256, 64-bit
+// addresses; s_axi_control. Difference to float_top.cpp: latency = 64 on io (no port change; float_top must
+// add it, else the scheduler assumes 0 and every pipelined read / write unit waits for its own DDR round trip).
 #include "quant_mode.h"
 
-int quant_top(const qz::word_t* hp0, const qz::word_t* hp1, qz::word_t* io, unsigned B, unsigned N, unsigned K,
-              unsigned in_off, unsigned in_pitch, unsigned in_bstride, unsigned out_off, unsigned out_pitch,
-              unsigned out_bstride, unsigned scl_off, unsigned scl_bstride) {
-#pragma HLS INTERFACE mode = m_axi port = hp0 offset = slave bundle = hp0 max_read_burst_length = 256 num_read_outstanding = 16 depth = 1048576
-#pragma HLS INTERFACE mode = m_axi port = hp1 offset = slave bundle = hp1 max_read_burst_length = 256 num_read_outstanding = 16 depth = 1048576
-#pragma HLS INTERFACE mode = m_axi port = io offset = slave bundle = io max_write_burst_length = 256 depth = 1048576
-#pragma HLS INTERFACE mode = s_axilite port = B
-#pragma HLS INTERFACE mode = s_axilite port = N
-#pragma HLS INTERFACE mode = s_axilite port = K
-#pragma HLS INTERFACE mode = s_axilite port = in_off
-#pragma HLS INTERFACE mode = s_axilite port = in_pitch
-#pragma HLS INTERFACE mode = s_axilite port = in_bstride
-#pragma HLS INTERFACE mode = s_axilite port = out_off
-#pragma HLS INTERFACE mode = s_axilite port = out_pitch
-#pragma HLS INTERFACE mode = s_axilite port = out_bstride
-#pragma HLS INTERFACE mode = s_axilite port = scl_off
-#pragma HLS INTERFACE mode = s_axilite port = scl_bstride
+uint32_t quant_top(const qz::word_t* xmem, qz::word_t* ymem, unsigned long long rec) {
+#pragma HLS INTERFACE mode = m_axi port = xmem offset = slave bundle = io max_read_burst_length = 256 num_read_outstanding = 16 latency = 64 depth = 1048576
+#pragma HLS INTERFACE mode = m_axi port = ymem offset = slave bundle = io max_write_burst_length = 256 num_write_outstanding = 16 latency = 64 depth = 1048576
+#pragma HLS INTERFACE mode = s_axilite port = rec
 #pragma HLS INTERFACE mode = s_axilite port = return
-  if (B == 0 || B > 65535 || N == 0 || N > 0xFFFFFF || K > qz::K_MAX) return 1;
-  qz::QCmd c;
-  c.B = B;
-  c.N = N;
-  c.K = K;
-  c.in = in_off;
-  c.in_pitch = in_pitch;
-  c.in_bstride = in_bstride;
-  c.out = out_off;
-  c.out_pitch = out_pitch;
-  c.out_bstride = out_bstride;
-  c.scl = scl_off;
-  c.scl_bstride = scl_bstride;
-  if (!qz::quant_cmd_ok(c)) return 1;
-  qz::quant_rows(hp0, hp1, io, c);
-  return 0;
+  uint32_t f[ctr::REC_FIELDS];
+#pragma HLS ARRAY_PARTITION variable = f complete
+fetch:
+  for (unsigned w = 0; w < ctr::REC_WORDS; w++) {
+#pragma HLS PIPELINE II = 1
+    const qz::word_t v = xmem[(rec >> 4) + w];
+    for (int j = 0; j < 4; j++) {
+#pragma HLS UNROLL
+      f[4 * w + j] = (uint32_t)v.range(32 * j + 31, 32 * j);
+    }
+  }
+  ctr::Cmd c;
+  const uint32_t st = ctr::decode(f, c);
+  if (st != ctr::ST_END) return 0x100 | st;
+  return qz::row_mode(c, xmem, ymem);
 }

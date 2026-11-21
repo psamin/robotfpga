@@ -1,9 +1,12 @@
 #!/bin/sh
-# Host build + run of the softmax testbench with the Vitis MinGW g++ (Git's mingw64 must not be on PATH).
+# Host build + run of the SOFTMAX unit testbench with the Vitis MinGW g++ (Git's mingw64 must not be on PATH).
 #   sh fpga/kernels/softmax/build.sh            # vectors (python) + compile + run every case
 #   SMX_NO_VECTORS=1 sh .../build.sh            # reuse the existing cases
-# Three builds: FP32 output + engine layout (every case), the default (no FP32 output; FP32 cases must be refused
-# with status 1 and leave memory untouched), and rows-only (SMX_ENGINE=0, the rows_ cases).
+# Two builds of the same HLS source (softmax_top.cpp + softmax_core.h):
+#   tb_softmax.exe        DATAFLOW processes one after the other on unbounded FIFOs (the HLS csim semantics)
+#   tb_softmax_dfsim.exe  the processes as threads on FIFOs bounded at the pragma depths (deadlock model)
+# plus the prologue's integer c = fl32(p0 * log2 e) against the host FPU (--cparams) and the divider on every
+# possible row sum against the host's 1.0f / S (--divider).
 set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PY="${PY:-/c/kp/lerobot-venv/Scripts/python.exe}"
@@ -13,12 +16,15 @@ if [ -z "$SMX_NO_VECTORS" ]; then
   rm -rf "$B/cases"
   (cd "$HERE" && "$PY" gen_tables.py && "$PY" make_vectors.py --out "$B/cases")
 fi
+# g++ needs a writable temp directory (TMP/TEMP may point at C:\WINDOWS under a stripped environment)
+mkdir -p "$B/tmp"
+export TMP="$B/tmp" TEMP="$B/tmp" TMPDIR="$B/tmp"
 export PATH="/c/Xilinx/Vitis_HLS/2022.2/tps/win64/msys64/mingw64/bin:/c/Xilinx/Vitis_HLS/2022.2/tps/win64/msys64/usr/bin:/c/Windows/System32:/c/Windows"
 INC=/c/Xilinx/Vitis_HLS/2022.2/include
-CXX="g++ -std=c++14 -O2 -Wall -Wno-unknown-pragmas -Wno-unused-label -Wno-unused-function -D__USE_MINGW_ANSI_STDIO=1 -I$INC"
-$CXX -DSMX_FP32_OUT=1 -DSMX_ENGINE=1 -o "$B/tb_softmax_fp1.exe" "$HERE/tb_softmax.cpp"
-$CXX -DSMX_FP32_OUT=0 -DSMX_ENGINE=1 -o "$B/tb_softmax_fp0.exe" "$HERE/tb_softmax.cpp"
-$CXX -DSMX_FP32_OUT=0 -DSMX_ENGINE=0 -o "$B/tb_softmax_rows.exe" "$HERE/tb_softmax.cpp"
-"$B/tb_softmax_fp1.exe" "$B"/cases/*
-"$B/tb_softmax_fp0.exe" "$B"/cases/*
-"$B/tb_softmax_rows.exe" "$B"/cases/rows_*
+CXX="g++ -std=c++14 -O2 -Wall -Wno-unknown-pragmas -Wno-unused-label -Wno-unused-function -Wno-sign-compare -Wno-comment -ffp-contract=off -D__USE_MINGW_ANSI_STDIO=1 -static"
+$CXX -I"$INC" -o "$B/tb_softmax.exe" "$HERE/tb_softmax.cpp"
+$CXX -DSMX_DFSIM -I"$HERE/tb_dfsim" -I"$INC" -o "$B/tb_softmax_dfsim.exe" "$HERE/tb_softmax.cpp" -pthread
+"$B/tb_softmax.exe" --cparams
+"$B/tb_softmax.exe" --divider
+"$B/tb_softmax.exe" "$B"/cases/*
+"$B/tb_softmax_dfsim.exe" "$B"/cases/*
