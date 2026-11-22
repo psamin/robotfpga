@@ -1,0 +1,10 @@
+--- a/fpga/kernels/sequencer/seq_core.h
++++ b/fpga/kernels/sequencer/seq_core.h
+@@ -126,6 +126,7 @@
+ static inline uint32_t unit_of(uint32_t op) {
+ #pragma HLS INLINE
+   if (op == ctr::OP_GEMM) return U_GEMM;
++  if (op == ctr::OP_QK_SOFTMAX) return U_GEMM;  // phase B: the GEMM unit runs Q.K^T + softmax
+   if (op == ctr::OP_SOFTMAX) return U_SMX;
+   if (op == ctr::OP_QUANT_X || op == ctr::OP_QUANT_W || op == ctr::OP_QUANT_WT || op == ctr::OP_NORM ||
+       op == ctr::OP_GELU || op == ctr::OP_SILU_MUL || op == ctr::OP_ROPE || op == ctr::OP_COPY)

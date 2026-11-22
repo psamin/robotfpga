@@ -1,0 +1,14 @@
+--- a/fpga/kernels/sequencer/build_smolvla.py
++++ b/fpga/kernels/sequencer/build_smolvla.py
+@@ -339,9 +339,9 @@
+             self.mem.write(e.addr, tab.tobytes())
+         # rank vectors (CONTRACT.md 5): query row t = g TqP + i; pad -1
+         for c, (ph, _name, i, _) in zip(self.cmds, self.roles, strict=True):
+-            if c.op != C.OP_SOFTMAX or not c.flags & C.F_MASK:
++            if c.op not in (C.OP_SOFTMAX, getattr(C, "OP_QK_SOFTMAX", -1)) or not c.flags & C.F_MASK:
+                 continue
+-            nq, L = c.N, c.K
++            nq, L = c.N, (c.K if c.op == C.OP_SOFTMAX else c.M)
+             tq = nq // 3
+             ii = torch.arange(nq) % tq
+             kk = torch.arange(L)

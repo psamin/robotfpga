@@ -1,0 +1,728 @@
+
+
+================================================================
+== Synthesis Summary Report of 'amx_top'
+================================================================
++ General Information: 
+    * Date:           Sat Nov 21 20:24:14 2026
+    * Version:        2022.2 (Build 3670227 on Oct 13 2022)
+    * Project:        amx_fused_p467
+    * Solution:       sol1 (Vivado IP Flow Target)
+    * Product family: zynquplus
+    * Target device:  xck26-sfvc784-2LV-c
+    
+
++ Performance & Resource Estimates: 
+    
+    PS: '+' for module; 'o' for loop; '*' for dataflow
+    +-----------------------------------------------+--------+--------+-----------+-----------+----------+---------+--------+----------+--------+---------+-------------+-------------+-----+
+    |                    Modules                    |  Issue |        |  Latency  |  Latency  | Iteration|         |  Trip  |          |        |         |             |             |     |
+    |                    & Loops                    |  Type  |  Slack |  (cycles) |    (ns)   |  Latency | Interval|  Count | Pipelined|  BRAM  |   DSP   |      FF     |     LUT     | URAM|
+    +-----------------------------------------------+--------+--------+-----------+-----------+----------+---------+--------+----------+--------+---------+-------------+-------------+-----+
+    |+ amx_top                                      |  Timing|  -25.30|          -|          -|         -|        -|       -|        no|  4 (1%)|  14 (1%)|  27630 (11%)|  43309 (36%)|    -|
+    | + amx_top_Pipeline_fetch                      |       -|    0.00|         19|     88.730|         -|       19|       -|        no|       -|        -|   2254 (~0%)|     73 (~0%)|    -|
+    |  o fetch                                      |       -|    3.41|         17|     79.390|         2|        1|      16|       yes|       -|        -|            -|            -|    -|
+    | + amx_top_Pipeline_VITIS_LOOP_252_1           |       -|    2.01|         10|     46.700|         -|       10|       -|        no|       -|        -|      6 (~0%)|    220 (~0%)|    -|
+    |  o VITIS_LOOP_252_1                           |       -|    3.41|          8|     37.360|         1|        1|       8|       yes|       -|        -|            -|            -|    -|
+    | + amx_top_Pipeline_VITIS_LOOP_257_2           |       -|    1.98|         18|     84.060|         -|       18|       -|        no|       -|        -|      7 (~0%)|    114 (~0%)|    -|
+    |  o VITIS_LOOP_257_2                           |       -|    3.41|         16|     74.720|         1|        1|      16|       yes|       -|        -|            -|            -|    -|
+    | o items                                       |       -|    3.41|          -|          -|         -|        -|       -|        no|       -|        -|            -|            -|    -|
+    |  + region_ap_uint_128_s*                      |  Timing|  -25.30|          -|          -|         -|        -|       -|  dataflow|  4 (1%)|  14 (1%)|   21420 (9%)|  35118 (29%)|    -|
+    |   + load_io_ap_uint_128_s                     |  Timing|  -25.30|          -|          -|         -|        -|       -|        no|  4 (1%)|  8 (~0%)|   16406 (7%)|  28752 (24%)|    -|
+    |    o tiles_io                                 |       -|    3.41|          -|          -|         -|        -|       -|        no|       -|        -|            -|            -|    -|
+    |     + load_io_ap_uint_128_Pipeline_xq_am      |       -|    0.00|       1034|  4.829e+03|         -|     1034|       -|        no|       -|        -|   2060 (~0%)|   1084 (~0%)|    -|
+    |      o xq_am                                  |       -|    3.41|       1032|  4.819e+03|        10|        1|    1024|       yes|       -|        -|            -|            -|    -|
+    |     + load_io_ap_uint_128_Pipeline_xq_sc      |       -|    0.11|         81|    378.270|         -|       81|       -|        no|       -|        -|    2954 (1%)|    4853 (4%)|    -|
+    |      o xq_sc                                  |       -|    3.41|         79|    368.930|        17|        1|      64|       yes|       -|        -|            -|            -|    -|
+    |     + load_io_ap_uint_128_Pipeline_stok_t     |       -|    0.00|         26|    121.420|         -|       26|       -|        no|       -|        -|   1563 (~0%)|    426 (~0%)|    -|
+    |      o stok_t                                 |       -|    3.41|         24|    112.080|        10|        1|      16|       yes|       -|        -|            -|            -|    -|
+    |     + load_io_ap_uint_128_Pipeline_load_srow  |       -|    0.00|          -|          -|         -|        -|       -|        no|       -|        -|     35 (~0%)|    120 (~0%)|    -|
+    |      o load_srow                              |       -|    3.41|          -|          -|         2|        1|       -|       yes|       -|        -|            -|            -|    -|
+    |     + load_io_ap_uint_128_Pipeline_load_bias  |       -|    0.00|          -|          -|         -|        -|       -|        no|       -|        -|     35 (~0%)|    120 (~0%)|    -|
+    |      o load_bias                              |       -|    3.41|          -|          -|         2|        1|       -|       yes|       -|        -|            -|            -|    -|
+    |     o groups_io                               |       -|    3.41|  117578240|  3.375e+09|    459290|        -|     256|        no|       -|        -|            -|            -|    -|
+    |      + load_io_ap_uint_128_Pipeline_load_dr   |       -|    0.00|        521|  2.433e+03|         -|      521|       -|        no|       -|        -|    701 (~0%)|    1334 (1%)|    -|
+    |       o load_dr                               |       -|    3.41|        519|  2.424e+03|        16|        8|      64|       yes|       -|        -|            -|            -|    -|
+    |      + load_io_ap_uint_128_Pipeline_load_xs   |       -|    0.00|       8220|  3.839e+04|         -|     8220|       -|        no|       -|        -|    920 (~0%)|    1426 (1%)|    -|
+    |       o load_xs                               |       -|    3.41|       8201|  3.830e+04|        18|        8|    1024|       yes|       -|        -|            -|            -|    -|
+    |      + load_io_ap_uint_128_Pipeline_xq_x      |  Timing|  -25.30|     458762|  1.317e+07|         -|   458762|       -|        no|       -|        -|    2383 (1%)|  15360 (13%)|    -|
+    |       o xq_x                                  |      II|    3.41|     458754|  1.317e+07|         9|        7|   65536|       yes|       -|        -|            -|            -|    -|
+    |   + store_ap_uint_128_s                       |  Timing|   -0.42|          -|          -|         -|        -|       -|        no|       -|  6 (~0%)|    5012 (2%)|    6332 (5%)|    -|
+    |    o tiles_st                                 |       -|    3.41|          -|          -|    131127|        -|       -|        no|       -|        -|            -|            -|    -|
+    |     + store_ap_uint_128_Pipeline_store_y      |  Timing|   -0.42|     131083|  6.122e+05|         -|   131083|       -|        no|       -|        -|    2607 (1%)|    4895 (4%)|    -|
+    |      o store_y                                |       -|    3.41|     131080|  6.121e+05|         9|        1|  131072|       yes|       -|        -|            -|            -|    -|
+    +-----------------------------------------------+--------+--------+-----------+-----------+----------+---------+--------+----------+--------+---------+-------------+-------------+-----+
+
+
+================================================================
+== HW Interfaces
+================================================================
+* M_AXI
++-----------+------------+---------------+---------+--------+----------+-----------+--------------+--------------+-------------+-------------+
+| Interface | Data Width | Address Width | Latency | Offset | Register | Max Widen | Max Read     | Max Write    | Num Read    | Num Write   |
+|           | (SW->HW)   |               |         |        |          | Bitwidth  | Burst Length | Burst Length | Outstanding | Outstanding |
++-----------+------------+---------------+---------+--------+----------+-----------+--------------+--------------+-------------+-------------+
+| m_axi_io  | 128 -> 128 | 64            | 0       | slave  | 0        | 0         | 256          | 256          | 16          | 16          |
++-----------+------------+---------------+---------+--------+----------+-----------+--------------+--------------+-------------+-------------+
+
+* S_AXILITE Interfaces
++---------------+------------+---------------+--------+----------+
+| Interface     | Data Width | Address Width | Offset | Register |
++---------------+------------+---------------+--------+----------+
+| s_axi_control | 32         | 6             | 24     | 0        |
++---------------+------------+---------------+--------+----------+
+
+* S_AXILITE Registers
++---------------+-----------+--------+-------+--------+----------------------------------+----------------------------------------------------------------------+
+| Interface     | Register  | Offset | Width | Access | Description                      | Bit Fields                                                           |
++---------------+-----------+--------+-------+--------+----------------------------------+----------------------------------------------------------------------+
+| s_axi_control | CTRL      | 0x00   | 32    | RW     | Control signals                  | 0=AP_START 1=AP_DONE 2=AP_IDLE 3=AP_READY 7=AUTO_RESTART 9=INTERRUPT |
+| s_axi_control | GIER      | 0x04   | 32    | RW     | Global Interrupt Enable Register | 0=Enable                                                             |
+| s_axi_control | IP_IER    | 0x08   | 32    | RW     | IP Interrupt Enable Register     | 0=CHAN0_INT_EN 1=CHAN1_INT_EN                                        |
+| s_axi_control | IP_ISR    | 0x0c   | 32    | RW     | IP Interrupt Status Register     | 0=CHAN0_INT_ST 1=CHAN1_INT_ST                                        |
+| s_axi_control | ap_return | 0x10   | 32    | R      | Data signal of ap_return         |                                                                      |
+| s_axi_control | xmem_1    | 0x18   | 32    | W      | Data signal of xmem              |                                                                      |
+| s_axi_control | xmem_2    | 0x1c   | 32    | W      | Data signal of xmem              |                                                                      |
+| s_axi_control | ymem_1    | 0x24   | 32    | W      | Data signal of ymem              |                                                                      |
+| s_axi_control | ymem_2    | 0x28   | 32    | W      | Data signal of ymem              |                                                                      |
+| s_axi_control | rec       | 0x30   | 32    | W      | Data signal of rec               |                                                                      |
++---------------+-----------+--------+-------+--------+----------------------------------+----------------------------------------------------------------------+
+
+* AXIS
++-----------+---------------+-------+--------+--------+
+| Interface | Register Mode | TDATA | TREADY | TVALID |
++-----------+---------------+-------+--------+--------+
+| bias_s    | both          | 128   | 1      | 1      |
+| ds        | both          | 128   | 1      | 1      |
+| srow_s    | both          | 128   | 1      | 1      |
+| stok_s    | both          | 128   | 1      | 1      |
+| xr        | both          | 128   | 1      | 1      |
+| ys        | both          | 128   | 1      | 1      |
++-----------+---------------+-------+--------+--------+
+
+* TOP LEVEL CONTROL
++-----------+------------+-----------+
+| Interface | Type       | Ports     |
++-----------+------------+-----------+
+| ap_clk    | clock      | ap_clk    |
+| ap_rst_n  | reset      | ap_rst_n  |
+| interrupt | interrupt  | interrupt |
+| ap_ctrl   | ap_ctrl_hs |           |
++-----------+------------+-----------+
+
+
+================================================================
+== SW I/O Information
+================================================================
+* Top Function Arguments
++----------+-----------+--------------------------+
+| Argument | Direction | Datatype                 |
++----------+-----------+--------------------------+
+| xmem     | inout     | ap_uint<128> const *     |
+| ymem     | inout     | ap_uint<128>*            |
+| rec      | in        | unsigned int             |
+| xr       | out       | stream<ap_uint<128>, 0>& |
+| stok_s   | out       | stream<ap_uint<128>, 0>& |
+| srow_s   | out       | stream<ap_uint<128>, 0>& |
+| bias_s   | out       | stream<ap_uint<128>, 0>& |
+| ds       | out       | stream<ap_uint<128>, 0>& |
+| ys       | in        | stream<ap_uint<128>, 0>& |
+| return   | out       | int                      |
++----------+-----------+--------------------------+
+
+* SW-to-HW Mapping
++----------+---------------+-----------+----------+-------------------------------------+
+| Argument | HW Interface  | HW Type   | HW Usage | HW Info                             |
++----------+---------------+-----------+----------+-------------------------------------+
+| xmem     | m_axi_io      | interface |          |                                     |
+| xmem     | s_axi_control | register  | offset   | name=xmem_1 offset=0x18 range=32    |
+| xmem     | s_axi_control | register  | offset   | name=xmem_2 offset=0x1c range=32    |
+| ymem     | m_axi_io      | interface |          |                                     |
+| ymem     | s_axi_control | register  | offset   | name=ymem_1 offset=0x24 range=32    |
+| ymem     | s_axi_control | register  | offset   | name=ymem_2 offset=0x28 range=32    |
+| rec      | s_axi_control | register  |          | name=rec offset=0x30 range=32       |
+| xr       | xr            | interface |          |                                     |
+| stok_s   | stok_s        | interface |          |                                     |
+| srow_s   | srow_s        | interface |          |                                     |
+| bias_s   | bias_s        | interface |          |                                     |
+| ds       | ds            | interface |          |                                     |
+| ys       | ys            | interface |          |                                     |
+| return   | s_axi_control | register  |          | name=ap_return offset=0x10 range=32 |
++----------+---------------+-----------+----------+-------------------------------------+
+
+
+================================================================
+== M_AXI Burst Information
+================================================================
+ Note: All burst requests might be further partitioned into multiple requests during RTL generation based on max_read_burst_length or max_write_burst_length settings.
+
+* Inferred Burst Summary
++--------------+-----------+-----------+----------+-------+-------------------------------------------------------------------------------------------+
+| HW Interface | Loop      | Direction | Length   | Width | Location                                                                                  |
++--------------+-----------+-----------+----------+-------+-------------------------------------------------------------------------------------------+
+| m_axi_io     |           | read      | 6        | 128   | C:/Users/athit/robotfpga/fpga/kernels/phaseB/emit_amax/patched/hls\gemm_contract.h:94:9   |
+| m_axi_io     |           | read      | 8        | 128   | C:/Users/athit/robotfpga/fpga/kernels/phaseB/emit_amax/patched/hls\gemm_contract.h:249:21 |
+| m_axi_io     | load_srow | read      | variable | 128   | C:/Users/athit/robotfpga/fpga/kernels/phaseB/emit_amax/patched/hls\gemm_contract.h:423:7  |
+| m_axi_io     | load_bias | read      | variable | 128   | C:/Users/athit/robotfpga/fpga/kernels/phaseB/emit_amax/patched/hls\gemm_contract.h:429:9  |
+| m_axi_io     | fetch     | read      | 16       | 128   | C:/Users/athit/robotfpga/fpga/kernels/phaseB/emit_amax/hls/amx_top.cpp:40:3               |
++--------------+-----------+-----------+----------+-------+-------------------------------------------------------------------------------------------+
+
+* Inferred Bursts and Widening Missed
++--------------+----------+-----------+--------------------------------------------------------------------------------------------------------+------------+-------------------------------------------------------------------------------------------+
+| HW Interface | Variable | Loop      | Problem                                                                                                | Resolution | Location                                                                                  |
++--------------+----------+-----------+--------------------------------------------------------------------------------------------------------+------------+-------------------------------------------------------------------------------------------+
+| m_axi_io     | io       | xq_am     | Access v.V is in the conditional branch                                                                | 214-232    | C:/Users/athit/robotfpga/fpga/kernels/phaseB/emit_amax/patched/hls\gemm_contract.h:272:3  |
+| m_axi_io     | io       | stok_t    | Access load is in the conditional branch                                                               | 214-232    | C:/Users/athit/robotfpga/fpga/kernels/phaseB/emit_amax/patched/hls\gemm_contract.h:378:7  |
+| m_axi_io     | io       | load_dr   | Could not analyze pattern                                                                              | 214-229    | C:/Users/athit/robotfpga/fpga/kernels/phaseB/emit_amax/patched/hls\gemm_contract.h:397:9  |
+| m_axi_io     | io       | load_dr   | Could not analyze pattern                                                                              | 214-229    | C:/Users/athit/robotfpga/fpga/kernels/phaseB/emit_amax/patched/hls\gemm_contract.h:397:9  |
+| m_axi_io     | io       | load_dr   | Could not analyze pattern                                                                              | 214-229    | C:/Users/athit/robotfpga/fpga/kernels/phaseB/emit_amax/patched/hls\gemm_contract.h:397:9  |
+| m_axi_io     | io       | tiles_io  | Could not analyze pattern                                                                              | 214-229    | C:/Users/athit/robotfpga/fpga/kernels/phaseB/emit_amax/patched/hls\gemm_contract.h:372:3  |
+| m_axi_io     | io       | tiles_io  | Access call is in the conditional branch                                                               | 214-232    | C:/Users/athit/robotfpga/fpga/kernels/phaseB/emit_amax/patched/hls\gemm_contract.h:372:3  |
+| m_axi_io     | xmem     | fetch     | Could not widen since type i128 size is greater than or equal to the max_widen_bitwidth threshold of 0 | 214-353    | C:/Users/athit/robotfpga/fpga/kernels/phaseB/emit_amax/hls/amx_top.cpp:40:3               |
+| m_axi_io     | io       |           | Could not widen since type i128 size is greater than or equal to the max_widen_bitwidth threshold of 0 | 214-353    | C:/Users/athit/robotfpga/fpga/kernels/phaseB/emit_amax/patched/hls\gemm_contract.h:249:21 |
+| m_axi_io     | io       |           | Could not widen since type i128 size is greater than or equal to the max_widen_bitwidth threshold of 0 | 214-353    | C:/Users/athit/robotfpga/fpga/kernels/phaseB/emit_amax/patched/hls\gemm_contract.h:94:9   |
+| m_axi_io     | io       | load_bias | Could not widen since type i128 size is greater than or equal to the max_widen_bitwidth threshold of 0 | 214-353    | C:/Users/athit/robotfpga/fpga/kernels/phaseB/emit_amax/patched/hls\gemm_contract.h:429:9  |
+| m_axi_io     | io       | load_srow | Could not widen since type i128 size is greater than or equal to the max_widen_bitwidth threshold of 0 | 214-353    | C:/Users/athit/robotfpga/fpga/kernels/phaseB/emit_amax/patched/hls\gemm_contract.h:423:7  |
++--------------+----------+-----------+--------------------------------------------------------------------------------------------------------+------------+-------------------------------------------------------------------------------------------+
+
+    * Resolution URL: www.xilinx.com/cgi-bin/docs/rdoc?v=2022.2;t=hls+guidance;d=XXX-YYY.html (replace XXX-YYY with column value)
+
+================================================================
+== Bind Op Report
+================================================================
++---------------------------------------------+-----+--------+--------------+-----+--------+---------+
+| Name                                        | DSP | Pragma | Variable     | Op  | Impl   | Latency |
++---------------------------------------------+-----+--------+--------------+-----+--------+---------+
+| + amx_top                                   | 14  |        |              |     |        |         |
+|   add_ln40_fu_1014_p2                       | -   |        | add_ln40     | add | fabric | 0       |
+|   sub_i_fu_1815_p2                          | -   |        | sub_i        | add | fabric | 0       |
+|   sub90_i_fu_1834_p2                        | -   |        | sub90_i      | add | fabric | 0       |
+|   sub94_i_fu_1866_p2                        | -   |        | sub94_i      | add | fabric | 0       |
+|   add_ln55_fu_1894_p2                       | -   |        | add_ln55     | add | fabric | 0       |
+|   add_ln790_fu_1921_p2                      | -   |        | add_ln790    | add | fabric | 0       |
+|   it_xa_fu_1926_p2                          | -   |        | it_xa        | add | fabric | 0       |
+|   add_ln792_fu_1931_p2                      | -   |        | add_ln792    | add | fabric | 0       |
+|   it_ya_fu_1936_p2                          | -   |        | it_ya        | add | fabric | 0       |
+|   add_ln798_1_fu_1941_p2                    | -   |        | add_ln798_1  | add | fabric | 0       |
+|   add_ln798_fu_1946_p2                      | -   |        | add_ln798    | add | fabric | 0       |
+|   add_ln802_fu_1958_p2                      | -   |        | add_ln802    | add | fabric | 0       |
+|   it_ea_fu_1963_p2                          | -   |        | it_ea        | add | fabric | 0       |
+|   add_ln803_fu_1968_p2                      | -   |        | add_ln803    | add | fabric | 0       |
+|   it_fa_fu_1973_p2                          | -   |        | it_fa        | add | fabric | 0       |
+|   add_ln804_fu_1978_p2                      | -   |        | add_ln804    | add | fabric | 0       |
+|   it_ga_fu_1983_p2                          | -   |        | it_ga        | add | fabric | 0       |
+|   it_ha_fu_1988_p2                          | -   |        | it_ha        | add | fabric | 0       |
+|   hoff_fu_1993_p2                           | -   |        | hoff         | add | fabric | 0       |
+|  + amx_top_Pipeline_fetch                   | 0   |        |              |     |        |         |
+|    add_ln40_fu_1039_p2                      | -   |        | add_ln40     | add | fabric | 0       |
+|  + amx_top_Pipeline_VITIS_LOOP_252_1        | 0   |        |              |     |        |         |
+|    add_ln252_fu_351_p2                      | -   |        | add_ln252    | add | fabric | 0       |
+|  + amx_top_Pipeline_VITIS_LOOP_257_2        | 0   |        |              |     |        |         |
+|    add_ln257_fu_191_p2                      | -   |        | add_ln257    | add | fabric | 0       |
+|  + region_ap_uint_128_s                     | 14  |        |              |     |        |         |
+|   + load_io_ap_uint_128_s                   | 8   |        |              |     |        |         |
+|     add_ln295_fu_934_p2                     | -   |        | add_ln295    | add | fabric | 0       |
+|     mul_2ns_26ns_27_1_1_U261                | -   |        | mul_ln370    | mul | auto   | 0       |
+|     sub_i_fu_836_p2                         | -   |        | sub_i        | add | fabric | 0       |
+|     klast_fu_854_p2                         | -   |        | klast        | sub | fabric | 0       |
+|     add_ln372_fu_1072_p2                    | -   |        | add_ln372    | add | fabric | 0       |
+|     add_ln372_1_fu_1078_p2                  | -   |        | add_ln372_1  | add | fabric | 0       |
+|     sub_ln321_fu_868_p2                     | -   |        | sub_ln321    | sub | fabric | 0       |
+|     sub_ln321_1_fu_1087_p2                  | -   |        | sub_ln321_1  | sub | fabric | 0       |
+|     add_ln298_fu_1147_p2                    | -   |        | add_ln298    | add | fabric | 0       |
+|     grp_fu_794_p2                           | -   |        | add_ln374    | add | fabric | 0       |
+|     rest_1_fu_1312_p2                       | -   |        | rest_1       | sub | fabric | 0       |
+|     grp_fu_794_p2                           | -   |        | add_ln386    | add | fabric | 0       |
+|     rest_fu_1257_p2                         | -   |        | rest         | sub | fabric | 0       |
+|     mul_27s_26ns_27_1_1_U262                | 2   |        | mul_ln386    | mul | auto   | 0       |
+|     mul_34s_32ns_64_2_1_U265                | 3   |        | rw0_grp      | mul | auto   | 1       |
+|     mul_34s_32ns_64_2_1_U266                | 3   |        | rw_row       | mul | auto   | 1       |
+|     add_ln392_fu_1451_p2                    | -   |        | add_ln392    | add | fabric | 0       |
+|     thr_1_fu_1473_p2                        | -   |        | thr_1        | add | fabric | 0       |
+|    + load_io_ap_uint_128_Pipeline_xq_am     | 0   |        |              |     |        |         |
+|      add_ln272_fu_331_p2                    | -   |        | add_ln272    | add | fabric | 0       |
+|      wi_fu_341_p2                           | -   |        | wi           | add | fabric | 0       |
+|      add_ln277_fu_362_p2                    | -   |        | add_ln277    | add | fabric | 0       |
+|      add_ln277_1_fu_376_p2                  | -   |        | add_ln277_1  | add | fabric | 0       |
+|      j_4_fu_406_p2                          | -   |        | j_4          | add | fabric | 0       |
+|      pw_1_fu_412_p2                         | -   |        | pw_1         | add | fabric | 0       |
+|      w_5_fu_417_p2                          | -   |        | w_5          | add | fabric | 0       |
+|    + load_io_ap_uint_128_Pipeline_xq_sc     | 0   |        |              |     |        |         |
+|      add_ln293_fu_391_p2                    | -   |        | add_ln293    | add | fabric | 0       |
+|      add_ln296_fu_631_p2                    | -   |        | add_ln296    | add | fabric | 0       |
+|      sum_V_fu_529_p2                        | -   |        | sum_V        | add | fabric | 0       |
+|      q_V_12_fu_583_p2                       | -   |        | q_V_12       | add | fabric | 0       |
+|      rem_V_1_fu_589_p2                      | -   |        | rem_V_1      | add | fabric | 0       |
+|      Es_V_fu_716_p2                         | -   |        | Es_V         | add | fabric | 0       |
+|      M_V_fu_774_p2                          | -   |        | M_V          | add | fabric | 0       |
+|      Es_V_1_fu_796_p2                       | -   |        | Es_V_1       | add | fabric | 0       |
+|      rsb_T_V_d1                             | -   |        | rs_T_V       | sub | fabric | 0       |
+|      rsb_B_V_d1                             | -   |        | rs_B_V       | add | fabric | 0       |
+|      sub_ln1669_fu_866_p2                   | -   |        | sub_ln1669   | sub | fabric | 0       |
+|      sub_ln186_fu_927_p2                    | -   |        | sub_ln186    | sub | fabric | 0       |
+|      sub_ln186_1_fu_966_p2                  | -   |        | sub_ln186_1  | sub | fabric | 0       |
+|      sub_ln186_2_fu_1078_p2                 | -   |        | sub_ln186_2  | sub | fabric | 0       |
+|      sub_ln186_3_fu_1116_p2                 | -   |        | sub_ln186_3  | sub | fabric | 0       |
+|      sub_ln186_4_fu_1152_p2                 | -   |        | sub_ln186_4  | sub | fabric | 0       |
+|      sub_ln186_5_fu_1190_p2                 | -   |        | sub_ln186_5  | sub | fabric | 0       |
+|      sub_ln186_6_fu_1226_p2                 | -   |        | sub_ln186_6  | sub | fabric | 0       |
+|      sub_ln186_7_fu_1264_p2                 | -   |        | sub_ln186_7  | sub | fabric | 0       |
+|      sub_ln186_8_fu_1300_p2                 | -   |        | sub_ln186_8  | sub | fabric | 0       |
+|      sub_ln186_9_fu_1338_p2                 | -   |        | sub_ln186_9  | sub | fabric | 0       |
+|      sub_ln186_10_fu_1374_p2                | -   |        | sub_ln186_10 | sub | fabric | 0       |
+|      sub_ln186_11_fu_1412_p2                | -   |        | sub_ln186_11 | sub | fabric | 0       |
+|      sub_ln186_12_fu_1448_p2                | -   |        | sub_ln186_12 | sub | fabric | 0       |
+|      sub_ln186_13_fu_1486_p2                | -   |        | sub_ln186_13 | sub | fabric | 0       |
+|      sub_ln186_14_fu_1522_p2                | -   |        | sub_ln186_14 | sub | fabric | 0       |
+|      sub_ln186_15_fu_1560_p2                | -   |        | sub_ln186_15 | sub | fabric | 0       |
+|      sub_ln186_16_fu_1596_p2                | -   |        | sub_ln186_16 | sub | fabric | 0       |
+|      sub_ln186_17_fu_1634_p2                | -   |        | sub_ln186_17 | sub | fabric | 0       |
+|      sub_ln186_18_fu_1670_p2                | -   |        | sub_ln186_18 | sub | fabric | 0       |
+|      sub_ln186_19_fu_1708_p2                | -   |        | sub_ln186_19 | sub | fabric | 0       |
+|      sub_ln186_20_fu_1744_p2                | -   |        | sub_ln186_20 | sub | fabric | 0       |
+|      sub_ln186_21_fu_1782_p2                | -   |        | sub_ln186_21 | sub | fabric | 0       |
+|      sub_ln186_22_fu_1823_p2                | -   |        | sub_ln186_22 | sub | fabric | 0       |
+|      sub_ln186_23_fu_1855_p2                | -   |        | sub_ln186_23 | sub | fabric | 0       |
+|      add_ln186_fu_872_p2                    | -   |        | add_ln186    | add | fabric | 0       |
+|    + load_io_ap_uint_128_Pipeline_stok_t    | 0   |        |              |     |        |         |
+|      add_ln378_fu_231_p2                    | -   |        | add_ln378    | add | fabric | 0       |
+|      wi_fu_245_p2                           | -   |        | wi           | add | fabric | 0       |
+|      add_ln381_fu_269_p2                    | -   |        | add_ln381    | add | fabric | 0       |
+|      add_ln381_1_fu_283_p2                  | -   |        | add_ln381_1  | add | fabric | 0       |
+|    + load_io_ap_uint_128_Pipeline_load_dr   | 0   |        |              |     |        |         |
+|      add_ln397_fu_298_p2                    | -   |        | add_ln397    | add | fabric | 0       |
+|      add_ln400_fu_313_p2                    | -   |        | add_ln400    | add | fabric | 0       |
+|      add_ln403_fu_347_p2                    | -   |        | add_ln403    | add | fabric | 0       |
+|      add_ln94_2_fu_486_p2                   | -   |        | add_ln94_2   | add | fabric | 0       |
+|      add_ln403_1_fu_383_p2                  | -   |        | add_ln403_1  | add | fabric | 0       |
+|      add_ln403_2_fu_508_p2                  | -   |        | add_ln403_2  | add | fabric | 0       |
+|      rw_r_4_fu_399_p2                       | -   |        | rw_r_4       | add | fabric | 0       |
+|      rw_grp_4_fu_415_p2                     | -   |        | rw_grp_4     | add | fabric | 0       |
+|      rw_row_4_fu_420_p2                     | -   |        | rw_row_4     | add | fabric | 0       |
+|    + load_io_ap_uint_128_Pipeline_load_xs   | 0   |        |              |     |        |         |
+|      add_ln244_fu_421_p2                    | -   |        | add_ln244    | add | fabric | 0       |
+|      add_ln249_fu_451_p2                    | -   |        | add_ln249    | add | fabric | 0       |
+|      add_ln249_1_fu_633_p2                  | -   |        | add_ln249_1  | add | fabric | 0       |
+|      x_a_fu_478_p2                          | -   |        | x_a          | add | fabric | 0       |
+|      x_row_fu_484_p2                        | -   |        | x_row        | add | fabric | 0       |
+|      x_blk_row0_fu_489_p2                   | -   |        | x_blk_row0   | add | fabric | 0       |
+|      x_n0_fu_494_p2                         | -   |        | x_n0         | add | fabric | 0       |
+|      x_c_fu_510_p2                          | -   |        | x_c          | add | fabric | 0       |
+|      xg_5_fu_586_p2                         | -   |        | xg_5         | add | fabric | 0       |
+|    + load_io_ap_uint_128_Pipeline_xq_x      | 0   |        |              |     |        |         |
+|      add_ln319_fu_911_p2                    | -   |        | add_ln319    | add | fabric | 0       |
+|      add_ln320_fu_934_p2                    | -   |        | add_ln320    | add | fabric | 0       |
+|      add_ln326_fu_1000_p2                   | -   |        | add_ln326    | add | fabric | 0       |
+|      add_ln326_1_fu_1014_p2                 | -   |        | add_ln326_1  | add | fabric | 0       |
+|      mul_26ns_24ns_50_1_1_U209              | -   | yes    | ret_V        | mul | fabric | 0       |
+|      mul_25ns_17ns_42_1_1_U210              | -   | yes    | ret_V_1      | mul | fabric | 0       |
+|      mul_8ns_7ns_15_1_1_U211                | -   | yes    | mul_ln1494   | mul | fabric | 0       |
+|      lo_V_fu_1395_p2                        | -   |        | lo_V         | add | fabric | 0       |
+|      Q_V_fu_1453_p2                         | -   |        | Q_V          | add | fabric | 0       |
+|      M_V_fu_1533_p2                         | -   |        | M_V          | add | fabric | 0       |
+|      sub_ln127_fu_1554_p2                   | -   |        | sub_ln127    | sub | fabric | 0       |
+|      sh_V_fu_1578_p2                        | -   |        | sh_V         | add | fabric | 0       |
+|      add_ln244_fu_1624_p2                   | -   |        | add_ln244    | add | fabric | 0       |
+|      add_ln244_1_fu_1646_p2                 | -   |        | add_ln244_1  | add | fabric | 0       |
+|      v_V_fu_1984_p2                         | -   |        | v_V          | add | fabric | 0       |
+|      add_ln186_3_fu_2006_p2                 | -   |        | add_ln186_3  | add | fabric | 0       |
+|      q_V_fu_2054_p2                         | -   |        | q_V          | sub | fabric | 0       |
+|      mul_26ns_24ns_50_1_1_U212              | -   | yes    | ret_V_2      | mul | fabric | 0       |
+|      mul_25ns_17ns_42_1_1_U213              | -   | yes    | ret_V_3      | mul | fabric | 0       |
+|      mul_8ns_7ns_15_1_1_U214                | -   | yes    | mul_ln1494_3 | mul | fabric | 0       |
+|      lo_V_1_fu_2230_p2                      | -   |        | lo_V_1       | add | fabric | 0       |
+|      Q_V_1_fu_2288_p2                       | -   |        | Q_V_1        | add | fabric | 0       |
+|      M_V_2_fu_2368_p2                       | -   |        | M_V_2        | add | fabric | 0       |
+|      sub_ln127_1_fu_2386_p2                 | -   |        | sub_ln127_1  | sub | fabric | 0       |
+|      sh_V_1_fu_2410_p2                      | -   |        | sh_V_1       | add | fabric | 0       |
+|      add_ln244_4_fu_2456_p2                 | -   |        | add_ln244_4  | add | fabric | 0       |
+|      add_ln244_5_fu_2478_p2                 | -   |        | add_ln244_5  | add | fabric | 0       |
+|      v_V_1_fu_2816_p2                       | -   |        | v_V_1        | add | fabric | 0       |
+|      add_ln186_9_fu_2838_p2                 | -   |        | add_ln186_9  | add | fabric | 0       |
+|      q_V_3_fu_2886_p2                       | -   |        | q_V_3        | sub | fabric | 0       |
+|      mul_26ns_24ns_50_1_1_U215              | -   | yes    | ret_V_4      | mul | fabric | 0       |
+|      mul_25ns_17ns_42_1_1_U216              | -   | yes    | ret_V_5      | mul | fabric | 0       |
+|      mul_8ns_7ns_15_1_1_U217                | -   | yes    | mul_ln1494_6 | mul | fabric | 0       |
+|      lo_V_2_fu_3063_p2                      | -   |        | lo_V_2       | add | fabric | 0       |
+|      Q_V_2_fu_3121_p2                       | -   |        | Q_V_2        | add | fabric | 0       |
+|      M_V_4_fu_3201_p2                       | -   |        | M_V_4        | add | fabric | 0       |
+|      sub_ln127_2_fu_3219_p2                 | -   |        | sub_ln127_2  | sub | fabric | 0       |
+|      sh_V_2_fu_3243_p2                      | -   |        | sh_V_2       | add | fabric | 0       |
+|      add_ln244_8_fu_3289_p2                 | -   |        | add_ln244_8  | add | fabric | 0       |
+|      add_ln244_9_fu_3311_p2                 | -   |        | add_ln244_9  | add | fabric | 0       |
+|      v_V_2_fu_3649_p2                       | -   |        | v_V_2        | add | fabric | 0       |
+|      add_ln186_15_fu_3671_p2                | -   |        | add_ln186_15 | add | fabric | 0       |
+|      q_V_6_fu_3719_p2                       | -   |        | q_V_6        | sub | fabric | 0       |
+|      add_ln344_fu_1274_p2                   | -   |        | add_ln344    | add | fabric | 0       |
+|      mul_26ns_24ns_50_1_1_U218              | -   | yes    | ret_V_6      | mul | fabric | 0       |
+|      mul_25ns_17ns_42_1_1_U219              | -   | yes    | ret_V_7      | mul | fabric | 0       |
+|      mul_8ns_7ns_15_1_1_U220                | -   | yes    | mul_ln1494_9 | mul | fabric | 0       |
+|      lo_V_3_fu_3896_p2                      | -   |        | lo_V_3       | add | fabric | 0       |
+|      Q_V_3_fu_3954_p2                       | -   |        | Q_V_3        | add | fabric | 0       |
+|      M_V_6_fu_4034_p2                       | -   |        | M_V_6        | add | fabric | 0       |
+|      sub_ln127_3_fu_4052_p2                 | -   |        | sub_ln127_3  | sub | fabric | 0       |
+|      sh_V_3_fu_4076_p2                      | -   |        | sh_V_3       | add | fabric | 0       |
+|      add_ln244_12_fu_4122_p2                | -   |        | add_ln244_12 | add | fabric | 0       |
+|      add_ln244_13_fu_4144_p2                | -   |        | add_ln244_13 | add | fabric | 0       |
+|      v_V_3_fu_4482_p2                       | -   |        | v_V_3        | add | fabric | 0       |
+|      add_ln186_21_fu_4504_p2                | -   |        | add_ln186_21 | add | fabric | 0       |
+|      q_V_9_fu_4552_p2                       | -   |        | q_V_9        | sub | fabric | 0       |
+|      w_fu_1079_p2                           | -   |        | w            | add | fabric | 0       |
+|      x_a_3_fu_1097_p2                       | -   |        | x_a_3        | add | fabric | 0       |
+|      x_row_2_fu_1102_p2                     | -   |        | x_row_2      | add | fabric | 0       |
+|      x_blk_row0_2_fu_1107_p2                | -   |        | x_blk_row0_2 | add | fabric | 0       |
+|      x_n0_3_fu_1112_p2                      | -   |        | x_n0_3       | add | fabric | 0       |
+|      x_c_3_fu_1127_p2                       | -   |        | x_c_3        | add | fabric | 0       |
+|      xg_3_fu_1200_p2                        | -   |        | xg_3         | add | fabric | 0       |
+|    + load_io_ap_uint_128_Pipeline_load_srow | 0   |        |              |     |        |         |
+|      add_ln423_fu_99_p2                     | -   |        | add_ln423    | add | fabric | 0       |
+|    + load_io_ap_uint_128_Pipeline_load_bias | 0   |        |              |     |        |         |
+|      add_ln429_fu_99_p2                     | -   |        | add_ln429    | add | fabric | 0       |
+|   + store_ap_uint_128_s                     | 6   |        |              |     |        |         |
+|     sub_fu_324_p2                           | -   |        | sub          | add | fabric | 0       |
+|     add_ln661_fu_368_p2                     | -   |        | add_ln661    | add | fabric | 0       |
+|     sub_ln155_fu_386_p2                     | -   |        | sub_ln155    | sub | fabric | 0       |
+|     mul_33ns_32ns_64_2_1_U336               | 3   |        | rw0_grp      | mul | auto   | 1       |
+|     mul_33ns_32ns_64_2_1_U337               | 3   |        | rw0_row      | mul | auto   | 1       |
+|     p_op_fu_432_p2                          | -   |        | p_op         | add | fabric | 0       |
+|    + store_ap_uint_128_Pipeline_store_y     | 0   |        |              |     |        |         |
+|      add_ln698_2_fu_704_p2                  | -   |        | add_ln698_2  | add | fabric | 0       |
+|      add_ln732_2_fu_1159_p2                 | -   |        | add_ln732_2  | add | fabric | 0       |
+|      add_ln732_1_fu_1173_p2                 | -   |        | add_ln732_1  | add | fabric | 0       |
+|      w_3_fu_808_p2                          | -   |        | w_3          | add | fabric | 0       |
+|      g_1_fu_887_p2                          | -   |        | g_1          | add | fabric | 0       |
+|      add_ln722_fu_898_p2                    | -   |        | add_ln722    | add | fabric | 0       |
+|      i_4_fu_912_p2                          | -   |        | i_4          | add | fabric | 0       |
+|      rw_r_1_fu_918_p2                       | -   |        | rw_r_1       | add | fabric | 0       |
+|      rw_grp_1_fu_934_p2                     | -   |        | rw_grp_1     | add | fabric | 0       |
+|      rw_row_1_fu_939_p2                     | -   |        | rw_row_1     | add | fabric | 0       |
+|      add_ln683_2_fu_1244_p2                 | -   |        | add_ln683_2  | add | fabric | 0       |
+|      awx_r_1_fu_1062_p2                     | -   |        | awx_r_1      | add | fabric | 0       |
+|      awx_grp_1_fu_1274_p2                   | -   |        | awx_grp_1    | add | fabric | 0       |
+|      awx_row_1_fu_1279_p2                   | -   |        | awx_row_1    | add | fabric | 0       |
+|      add_ln732_fu_1299_p2                   | -   |        | add_ln732    | add | fabric | 0       |
+|      add_ln694_fu_1324_p2                   | -   |        | add_ln694    | add | fabric | 0       |
++---------------------------------------------+-----+--------+--------------+-----+--------+---------+
+
+
+================================================================
+== Bind Storage Report
+================================================================
++---------------------------+------+------+--------+------------+---------+--------+---------+
+| Name                      | BRAM | URAM | Pragma | Variable   | Storage | Impl   | Latency |
++---------------------------+------+------+--------+------------+---------+--------+---------+
+| + amx_top                 | 4    | 0    |        |            |         |        |         |
+|   c_s_addr_U              | -    | -    |        | c_s_addr   | ram_s2p | auto   | 1       |
+|   c_s_pitch_U             | -    | -    |        | c_s_pitch  | ram_s2p | auto   | 1       |
+|   c_s_stride_U            | -    | -    |        | c_s_stride | ram_s2p | auto   | 1       |
+|   c_p_U                   | -    | -    |        | c_p        | ram_s2p | auto   | 1       |
+|  + region_ap_uint_128_s   | 4    | 0    |        |            |         |        |         |
+|   + load_io_ap_uint_128_s | 4    | 0    |        |            |         |        |         |
+|     am_V_U                | -    | -    | yes    | am_V       | ram_2p  | lutram | 1       |
+|     am_V_1_U              | -    | -    | yes    | am_V_1     | ram_2p  | lutram | 1       |
+|     am_V_2_U              | -    | -    | yes    | am_V_2     | ram_2p  | lutram | 1       |
+|     am_V_3_U              | -    | -    | yes    | am_V_3     | ram_2p  | lutram | 1       |
+|     rsb_S_V_U             | 1    | -    | yes    | rsb_S_V    | ram_2p  | bram   | 1       |
+|     rsb_R_V_U             | 1    | -    | yes    | rsb_R_V    | ram_2p  | bram   | 1       |
+|     rsb_T_V_U             | 1    | -    | yes    | rsb_T_V    | ram_2p  | bram   | 1       |
+|     rsb_B_V_U             | 1    | -    | yes    | rsb_B_V    | ram_2p  | bram   | 1       |
+|     stk_V_U               | -    | -    | yes    | stk_V      | ram_2p  | lutram | 1       |
+|     stk_V_1_U             | -    | -    | yes    | stk_V_1    | ram_2p  | lutram | 1       |
+|   + store_ap_uint_128_s   | 0    | 0    |        |            |         |        |         |
+|     amem_V_U              | -    | -    | yes    | amem_V     | ram_2p  | lutram | 1       |
++---------------------------+------+------+--------+------------+---------+--------+---------+
+
+
+================================================================
+== Pragma Report
+================================================================
+* Valid Pragma Syntax
++-----------------+--------------------------------------------------------------------------------------------------+------------------------------------------------------------+
+| Type            | Options                                                                                          | Location                                                   |
++-----------------+--------------------------------------------------------------------------------------------------+------------------------------------------------------------+
+| inline          |                                                                                                  | ../../../../../hls/float_linear.h:79 in w_lane             |
+| inline          |                                                                                                  | ../../../../../hls/float_linear.h:83 in io_lane            |
+| inline          |                                                                                                  | ../../../../../hls/float_linear.h:90 in io_set             |
+| inline          |                                                                                                  | ../../../../../hls/float_linear.h:118 in bf16_to_f32       |
+| inline          |                                                                                                  | ../../../../../hls/float_linear.h:131 in bf16_mul          |
+| bind_op         | variable = prod op = mul impl = dsp                                                              | ../../../../../hls/float_linear.h:141 in bf16_mul          |
+| inline          |                                                                                                  | ../../../../../hls/float_linear.h:180 in mac_mul           |
+| bind_op         | variable = p op = fmul impl = maxdsp                                                             | ../../../../../hls/float_linear.h:185 in mac_mul           |
+| pipeline        | II = 1                                                                                           | ../../../../../hls/float_linear.h:196 in load_all          |
+| array_partition | variable = acc complete dim = 1                                                                  | ../../../../../hls/float_linear.h:212 in compute_all       |
+| array_partition | variable = acc complete dim = 2                                                                  | ../../../../../hls/float_linear.h:213 in compute_all       |
+| bind_storage    | variable = acc type = ram_2p impl = lutram                                                       | ../../../../../hls/float_linear.h:214 in compute_all       |
+| array_partition | variable = word complete                                                                         | ../../../../../hls/float_linear.h:218 in compute_all       |
+| pipeline        | II = 1                                                                                           | ../../../../../hls/float_linear.h:222 in compute_all       |
+| dependence      | variable = acc inter distance = ACC_DIST true                                                    | ../../../../../hls/float_linear.h:223 in compute_all       |
+| unroll          |                                                                                                  | ../../../../../hls/float_linear.h:232 in compute_all       |
+| unroll          |                                                                                                  | ../../../../../hls/float_linear.h:234 in compute_all       |
+| unroll          |                                                                                                  | ../../../../../hls/float_linear.h:241 in compute_all       |
+| unroll          |                                                                                                  | ../../../../../hls/float_linear.h:244 in compute_all       |
+| pipeline        | II = 1                                                                                           | ../../../../../hls/float_linear.h:259 in compute_all       |
+| unroll          |                                                                                                  | ../../../../../hls/float_linear.h:263 in compute_all       |
+| pipeline        | II = 1                                                                                           | ../../../../../hls/float_linear.h:281 in store_all         |
+| dataflow        |                                                                                                  | ../../../../../hls/float_linear.h:290 in run_tile          |
+| stream          | variable = s0 depth = WFIFO                                                                      | ../../../../../hls/float_linear.h:293 in run_tile          |
+| stream          | variable = s1 depth = WFIFO                                                                      | ../../../../../hls/float_linear.h:294 in run_tile          |
+| stream          | variable = s2 depth = WFIFO                                                                      | ../../../../../hls/float_linear.h:295 in run_tile          |
+| stream          | variable = s3 depth = WFIFO                                                                      | ../../../../../hls/float_linear.h:296 in run_tile          |
+| stream          | variable = ys depth = YFIFO                                                                      | ../../../../../hls/float_linear.h:297 in run_tile          |
+| pipeline        | II = 1                                                                                           | ../../../../../hls/float_linear.h:320 in linear_bf16_core  |
+| unroll          |                                                                                                  | ../../../../../hls/float_linear.h:328 in linear_bf16_core  |
+| inline          |                                                                                                  | ../../../../../hls/int16_linear.h:122 in w_lane16          |
+| inline          |                                                                                                  | ../../../../../hls/int16_linear.h:126 in io_half           |
+| inline          |                                                                                                  | ../../../../../hls/int16_linear.h:130 in x_lane            |
+| inline          |                                                                                                  | ../../../../../hls/int16_linear.h:134 in cap_of            |
+| inline          |                                                                                                  | ../../../../../hls/int16_linear.h:138 in ew_get            |
+| inline          |                                                                                                  | ../../../../../hls/int16_linear.h:142 in ew_set            |
+| inline          |                                                                                                  | ../../../../../hls/int16_linear.h:146 in ew_shift4         |
+| inline          |                                                                                                  | ../../../../../hls/int16_linear.h:150 in acc_add           |
+| bind_op         | variable = pr op = mul impl = dsp latency = 2                                                    | ../../../../../hls/int16_linear.h:155 in acc_add           |
+| inline          |                                                                                                  | ../../../../../hls/int16_linear.h:159 in fmul_dq           |
+| inline          |                                                                                                  | ../../../../../hls/int16_linear.h:248 in cap_diff          |
+| inline          |                                                                                                  | ../../../../../hls/int16_linear.h:260 in i43_to_f32        |
+| unroll          |                                                                                                  | ../../../../../hls/int16_linear.h:270 in i43_to_f32        |
+| inline          |                                                                                                  | ../../../../../hls/int16_linear.h:297 in blocks_of_tile    |
+| pipeline        | II = 1                                                                                           | ../../../../../hls/int16_linear.h:309 in load_w16          |
+| pipeline        | II = 1                                                                                           | ../../../../../hls/int16_linear.h:328 in load_io16         |
+| pipeline        | II = 1                                                                                           | ../../../../../hls/int16_linear.h:334 in load_io16         |
+| pipeline        | II = 1                                                                                           | ../../../../../hls/int16_linear.h:340 in load_io16         |
+| bind_storage    | variable = xbuf type = ram_s2p impl = uram                                                       | ../../../../../hls/int16_linear.h:365 in compute16         |
+| array_partition | variable = xbuf complete dim = 1                                                                 | ../../../../../hls/int16_linear.h:366 in compute16         |
+| bind_storage    | variable = wbuf type = ram_s2p impl = uram                                                       | ../../../../../hls/int16_linear.h:369 in compute16         |
+| array_partition | variable = wbuf complete dim = 1                                                                 | ../../../../../hls/int16_linear.h:370 in compute16         |
+| array_partition | variable = acc complete dim = 0                                                                  | ../../../../../hls/int16_linear.h:381 in compute16         |
+| array_partition | variable = shadow complete dim = 0                                                               | ../../../../../hls/int16_linear.h:383 in compute16         |
+| array_partition | variable = wcur complete                                                                         | ../../../../../hls/int16_linear.h:385 in compute16         |
+| unroll          |                                                                                                  | ../../../../../hls/int16_linear.h:388 in compute16         |
+| unroll          |                                                                                                  | ../../../../../hls/int16_linear.h:390 in compute16         |
+| unroll          |                                                                                                  | ../../../../../hls/int16_linear.h:395 in compute16         |
+| pipeline        | II = 1                                                                                           | ../../../../../hls/int16_linear.h:404 in compute16         |
+| array_partition | variable = edl complete                                                                          | ../../../../../hls/int16_linear.h:439 in compute16         |
+| array_partition | variable = fdl complete                                                                          | ../../../../../hls/int16_linear.h:446 in compute16         |
+| array_partition | variable = xd complete                                                                           | ../../../../../hls/int16_linear.h:457 in compute16         |
+| array_partition | variable = wd complete                                                                           | ../../../../../hls/int16_linear.h:458 in compute16         |
+| unroll          |                                                                                                  | ../../../../../hls/int16_linear.h:460 in compute16         |
+| unroll          |                                                                                                  | ../../../../../hls/int16_linear.h:464 in compute16         |
+| unroll          |                                                                                                  | ../../../../../hls/int16_linear.h:469 in compute16         |
+| unroll          |                                                                                                  | ../../../../../hls/int16_linear.h:473 in compute16         |
+| pipeline        | II = 1                                                                                           | ../../../../../hls/int16_linear.h:478 in compute16         |
+| dependence      | variable = xbuf inter false                                                                      | ../../../../../hls/int16_linear.h:479 in compute16         |
+| dependence      | variable = xbuf intra false                                                                      | ../../../../../hls/int16_linear.h:480 in compute16         |
+| dependence      | variable = wbuf inter false                                                                      | ../../../../../hls/int16_linear.h:482 in compute16         |
+| dependence      | variable = wbuf intra false                                                                      | ../../../../../hls/int16_linear.h:483 in compute16         |
+| unroll          |                                                                                                  | ../../../../../hls/int16_linear.h:521 in compute16         |
+| array_partition | variable = wq complete                                                                           | ../../../../../hls/int16_linear.h:526 in compute16         |
+| unroll          |                                                                                                  | ../../../../../hls/int16_linear.h:533 in compute16         |
+| unroll          |                                                                                                  | ../../../../../hls/int16_linear.h:538 in compute16         |
+| unroll          |                                                                                                  | ../../../../../hls/int16_linear.h:564 in compute16         |
+| unroll          |                                                                                                  | ../../../../../hls/int16_linear.h:569 in compute16         |
+| unroll          |                                                                                                  | ../../../../../hls/int16_linear.h:571 in compute16         |
+| unroll          |                                                                                                  | ../../../../../hls/int16_linear.h:578 in compute16         |
+| unroll          |                                                                                                  | ../../../../../hls/int16_linear.h:582 in compute16         |
+| unroll          |                                                                                                  | ../../../../../hls/int16_linear.h:584 in compute16         |
+| unroll          |                                                                                                  | ../../../../../hls/int16_linear.h:589 in compute16         |
+| unroll          |                                                                                                  | ../../../../../hls/int16_linear.h:593 in compute16         |
+| unroll          |                                                                                                  | ../../../../../hls/int16_linear.h:621 in compute16         |
+| unroll          |                                                                                                  | ../../../../../hls/int16_linear.h:724 in compute16         |
+| array_partition | variable = srow cyclic factor = 4                                                                | ../../../../../hls/int16_linear.h:749 in dequant16         |
+| array_partition | variable = prev complete dim = 2                                                                 | ../../../../../hls/int16_linear.h:752 in dequant16         |
+| bind_storage    | variable = prev type = ram_2p impl = lutram                                                      | ../../../../../hls/int16_linear.h:753 in dequant16         |
+| pipeline        | II = 1                                                                                           | ../../../../../hls/int16_linear.h:756 in dequant16         |
+| unroll          |                                                                                                  | ../../../../../hls/int16_linear.h:758 in dequant16         |
+| pipeline        | II = 1                                                                                           | ../../../../../hls/int16_linear.h:764 in dequant16         |
+| unroll          |                                                                                                  | ../../../../../hls/int16_linear.h:767 in dequant16         |
+| pipeline        | II = 1                                                                                           | ../../../../../hls/int16_linear.h:776 in dequant16         |
+| unroll          |                                                                                                  | ../../../../../hls/int16_linear.h:779 in dequant16         |
+| pipeline        | II = 1                                                                                           | ../../../../../hls/int16_linear.h:787 in dequant16         |
+| dependence      | variable = prev inter false                                                                      | ../../../../../hls/int16_linear.h:788 in dequant16         |
+| unroll          |                                                                                                  | ../../../../../hls/int16_linear.h:793 in dequant16         |
+| pipeline        | II = 1                                                                                           | ../../../../../hls/int16_linear.h:832 in store16           |
+| dataflow        |                                                                                                  | ../../../../../hls/int16_linear.h:841 in run_all16         |
+| stream          | variable = s0 depth = WFIFO16                                                                    | ../../../../../hls/int16_linear.h:846 in run_all16         |
+| stream          | variable = s1 depth = WFIFO16                                                                    | ../../../../../hls/int16_linear.h:847 in run_all16         |
+| stream          | variable = s2 depth = WFIFO16                                                                    | ../../../../../hls/int16_linear.h:848 in run_all16         |
+| stream          | variable = s3 depth = WFIFO16                                                                    | ../../../../../hls/int16_linear.h:849 in run_all16         |
+| bind_storage    | variable = s0 type = fifo impl = uram                                                            | ../../../../../hls/int16_linear.h:851 in run_all16         |
+| bind_storage    | variable = s1 type = fifo impl = uram                                                            | ../../../../../hls/int16_linear.h:852 in run_all16         |
+| bind_storage    | variable = s2 type = fifo impl = uram                                                            | ../../../../../hls/int16_linear.h:853 in run_all16         |
+| bind_storage    | variable = s3 type = fifo impl = uram                                                            | ../../../../../hls/int16_linear.h:854 in run_all16         |
+| stream          | variable = xs depth = SFIFO                                                                      | ../../../../../hls/int16_linear.h:856 in run_all16         |
+| stream          | variable = srow_s depth = SFIFO                                                                  | ../../../../../hls/int16_linear.h:857 in run_all16         |
+| stream          | variable = stok_s depth = SFIFO                                                                  | ../../../../../hls/int16_linear.h:858 in run_all16         |
+| stream          | variable = es depth = 4                                                                          | ../../../../../hls/int16_linear.h:859 in run_all16         |
+| stream          | variable = ys depth = 16                                                                         | ../../../../../hls/int16_linear.h:860 in run_all16         |
+| bind_storage    | variable = xs type = fifo impl = lutram                                                          | ../../../../../hls/int16_linear.h:861 in run_all16         |
+| bind_storage    | variable = srow_s type = fifo impl = srl                                                         | ../../../../../hls/int16_linear.h:862 in run_all16         |
+| bind_storage    | variable = stok_s type = fifo impl = srl                                                         | ../../../../../hls/int16_linear.h:863 in run_all16         |
+| bind_storage    | variable = es type = fifo impl = srl                                                             | ../../../../../hls/int16_linear.h:864 in run_all16         |
+| bind_storage    | variable = ys type = fifo impl = srl                                                             | ../../../../../hls/int16_linear.h:865 in run_all16         |
+| inline          |                                                                                                  | ../../../../quantize/quant_int16.h:59 in f2u               |
+| inline          |                                                                                                  | ../../../../quantize/quant_int16.h:65 in u2f               |
+| inline          |                                                                                                  | ../../../../quantize/quant_int16.h:75 in abs_bits          |
+| inline          |                                                                                                  | ../../../../quantize/quant_int16.h:79 in amax2             |
+| inline          |                                                                                                  | ../../../../quantize/quant_int16.h:94 in scale_bits        |
+| inline          |                                                                                                  | ../../../../quantize/quant_int16.h:147 in recip_seed       |
+| inline          |                                                                                                  | ../../../../quantize/quant_int16.h:154 in recip_load       |
+| inline          |                                                                                                  | ../../../../quantize/quant_int16.h:163 in recip_init       |
+| inline          |                                                                                                  | ../../../../quantize/quant_int16.h:167 in recip_step       |
+| unroll          |                                                                                                  | ../../../../quantize/quant_int16.h:169 in recip_step       |
+| inline          |                                                                                                  | ../../../../quantize/quant_int16.h:180 in recip_result     |
+| inline          |                                                                                                  | ../../../../quantize/quant_int16.h:185 in recip_sig        |
+| pipeline        | II = 1                                                                                           | ../../../../quantize/quant_int16.h:189 in recip_sig        |
+| inline          |                                                                                                  | ../../../../quantize/quant_int16.h:200 in recip_unrolled   |
+| unroll          |                                                                                                  | ../../../../quantize/quant_int16.h:203 in recip_unrolled   |
+| inline          |                                                                                                  | ../../../../quantize/quant_int16.h:213 in stored_scale     |
+| inline          |                                                                                                  | ../../../../quantize/quant_int16.h:222 in row_scale_from_s |
+| inline          |                                                                                                  | ../../../../quantize/quant_int16.h:232 in row_scale        |
+| inline          |                                                                                                  | ../../../../quantize/quant_int16.h:242 in rne_sat          |
+| inline          |                                                                                                  | ../../../../quantize/quant_int16.h:289 in quant_elem_recip |
+| bind_op         | variable = p2 op = mul impl = fabric                                                             | ../../../../quantize/quant_int16.h:301 in quant_elem_recip |
+| inline          |                                                                                                  | ../../../../quantize/quant_int16.h:323 in quant_elem_fdiv  |
+| inline          |                                                                                                  | ../../../../quantize/quant_int16.h:333 in quant_elem       |
+| inline          |                                                                                                  | ../../../../quantize/quant_int16.h:344 in dequant          |
+| inline          |                                                                                                  | ../../../../quantize/quant_int16.h:355 in word_f32         |
+| inline          |                                                                                                  | ../../../../quantize/quant_int16.h:359 in word_set_q       |
+| inline          |                                                                                                  | ../../../../quantize/quant_int16.h:363 in word_q           |
+| inline          |                                                                                                  | ../../../../quantize/quant_int16.h:368 in word_amax        |
+| inline          |                                                                                                  | ../../../../quantize/quant_int16.h:374 in quant8           |
+| unroll          |                                                                                                  | ../../../../quantize/quant_int16.h:377 in quant8           |
+| inline          |                                                                                                  | ../../emit_amax.h:47 in lane_bits                          |
+| inline          |                                                                                                  | ../../emit_amax.h:51 in set_lane_bits                      |
+| inline          |                                                                                                  | ../../emit_amax.h:64 in amax2                              |
+| inline          |                                                                                                  | ../../emit_amax.h:69 in word_amax                          |
+| inline          |                                                                                                  | ../../emit_amax.h:86 in xscale                             |
+| inline          |                                                                                                  | ../../emit_amax.h:102 in quant_elem_fab                    |
+| bind_op         | variable = P op = mul impl = fabric                                                              | ../../emit_amax.h:107 in quant_elem_fab                    |
+| bind_op         | variable = p1 op = mul impl = fabric                                                             | ../../emit_amax.h:113 in quant_elem_fab                    |
+| bind_op         | variable = p2 op = mul impl = fabric                                                             | ../../emit_amax.h:116 in quant_elem_fab                    |
+| inline          |                                                                                                  | ../../patched/hls/gemm_contract.h:70 in h16                |
+| inline          |                                                                                                  | ../../patched/hls/gemm_contract.h:74 in set16              |
+| inline          |                                                                                                  | ../../patched/hls/gemm_contract.h:78 in zero_word          |
+| inline          |                                                                                                  | ../../patched/hls/gemm_contract.h:82 in ones_word          |
+| inline          |                                                                                                  | ../../patched/hls/gemm_contract.h:88 in fadd_ep            |
+| inline          |                                                                                                  | ../../patched/hls/gemm_contract.h:93 in to_io              |
+| inline          |                                                                                                  | ../../patched/hls/gemm_contract.h:98 in from_io            |
+| inline          |                                                                                                  | ../../patched/hls/gemm_contract.h:154 in valid_rows        |
+| inline          |                                                                                                  | ../../patched/hls/gemm_contract.h:164 in start             |
+| inline          |                                                                                                  | ../../patched/hls/gemm_contract.h:176 in next              |
+| inline          |                                                                                                  | ../../patched/hls/gemm_contract.h:187 in off               |
+| pipeline        | II = 1                                                                                           | ../../patched/hls/gemm_contract.h:200 in load_w            |
+| loop_tripcount  | min = 256 max = 1048576                                                                          | ../../patched/hls/gemm_contract.h:201 in load_w            |
+| inline          |                                                                                                  | ../../patched/hls/gemm_contract.h:224 in x_next            |
+| inline          |                                                                                                  | ../../patched/hls/gemm_contract.h:243 in x_unit            |
+| unroll          |                                                                                                  | ../../patched/hls/gemm_contract.h:247 in x_unit            |
+| inline          |                                                                                                  | ../../patched/hls/gemm_contract.h:263 in xq_scales         |
+| array_partition | variable = am complete dim = 2                                                                   | ../../patched/hls/gemm_contract.h:266 in xq_scales         |
+| bind_storage    | variable = am type = ram_2p impl = lutram                                                        | ../../patched/hls/gemm_contract.h:267 in xq_scales         |
+| pipeline        | II = 1                                                                                           | ../../patched/hls/gemm_contract.h:273 in xq_scales         |
+| dependence      | variable = am inter false                                                                        | ../../patched/hls/gemm_contract.h:274 in xq_scales         |
+| loop_tripcount  | min = 16 max = 1024                                                                              | ../../patched/hls/gemm_contract.h:275 in xq_scales         |
+| unroll          |                                                                                                  | ../../patched/hls/gemm_contract.h:279 in xq_scales         |
+| pipeline        | II = 1                                                                                           | ../../patched/hls/gemm_contract.h:294 in xq_scales         |
+| inline          |                                                                                                  | ../../patched/hls/gemm_contract.h:307 in xq_run            |
+| pipeline        | II = 1                                                                                           | ../../patched/hls/gemm_contract.h:316 in xq_run            |
+| loop_tripcount  | min = 0 max = 65536                                                                              | ../../patched/hls/gemm_contract.h:317 in xq_run            |
+| unroll          |                                                                                                  | ../../patched/hls/gemm_contract.h:329 in xq_run            |
+| bind_storage    | variable = rsb type = ram_2p impl = bram                                                         | ../../patched/hls/gemm_contract.h:362 in load_io           |
+| array_partition | variable = stk complete dim = 1                                                                  | ../../patched/hls/gemm_contract.h:364 in load_io           |
+| bind_storage    | variable = stk type = ram_2p impl = lutram                                                       | ../../patched/hls/gemm_contract.h:365 in load_io           |
+| loop_tripcount  | min = 2 max = 1025                                                                               | ../../patched/hls/gemm_contract.h:373 in load_io           |
+| pipeline        | II = 1                                                                                           | ../../patched/hls/gemm_contract.h:379 in load_io           |
+| loop_tripcount  | min = 1 max = 256                                                                                | ../../patched/hls/gemm_contract.h:393 in load_io           |
+| pipeline        | II = UW                                                                                          | ../../patched/hls/gemm_contract.h:398 in load_io           |
+| loop_tripcount  | min = 1 max = 64                                                                                 | ../../patched/hls/gemm_contract.h:399 in load_io           |
+| unroll          |                                                                                                  | ../../patched/hls/gemm_contract.h:402 in load_io           |
+| pipeline        | II = UW                                                                                          | ../../patched/hls/gemm_contract.h:414 in load_io           |
+| loop_tripcount  | min = 0 max = 1024                                                                               | ../../patched/hls/gemm_contract.h:415 in load_io           |
+| pipeline        | II = 1                                                                                           | ../../patched/hls/gemm_contract.h:424 in load_io           |
+| pipeline        | II = 1                                                                                           | ../../patched/hls/gemm_contract.h:430 in load_io           |
+| array_partition | variable = stage complete dim = 1                                                                | ../../patched/hls/gemm_contract.h:454 in xpose             |
+| bind_storage    | variable = stage type = ram_s2p impl = lutram                                                    | ../../patched/hls/gemm_contract.h:455 in xpose             |
+| array_partition | variable = wd_dl complete                                                                        | ../../patched/hls/gemm_contract.h:468 in xpose             |
+| array_partition | variable = rd_dl complete                                                                        | ../../patched/hls/gemm_contract.h:469 in xpose             |
+| unroll          |                                                                                                  | ../../patched/hls/gemm_contract.h:471 in xpose             |
+| pipeline        | II = 1                                                                                           | ../../patched/hls/gemm_contract.h:481 in xpose             |
+| dependence      | variable = stage inter false                                                                     | ../../patched/hls/gemm_contract.h:482 in xpose             |
+| dependence      | variable = stage intra false                                                                     | ../../patched/hls/gemm_contract.h:483 in xpose             |
+| loop_tripcount  | min = 256 max = 1048576                                                                          | ../../patched/hls/gemm_contract.h:484 in xpose             |
+| unroll          |                                                                                                  | ../../patched/hls/gemm_contract.h:496 in xpose             |
+| unroll          |                                                                                                  | ../../patched/hls/gemm_contract.h:549 in xpose             |
+| array_partition | variable = srow cyclic factor = 4                                                                | ../../patched/hls/gemm_contract.h:563 in dequant_ep        |
+| array_partition | variable = bsv cyclic factor = 4                                                                 | ../../patched/hls/gemm_contract.h:564 in dequant_ep        |
+| array_partition | variable = prev complete dim = 2                                                                 | ../../patched/hls/gemm_contract.h:567 in dequant_ep        |
+| bind_storage    | variable = prev type = ram_2p impl = lutram                                                      | ../../patched/hls/gemm_contract.h:568 in dequant_ep        |
+| pipeline        | II = 1                                                                                           | ../../patched/hls/gemm_contract.h:571 in dequant_ep        |
+| unroll          |                                                                                                  | ../../patched/hls/gemm_contract.h:573 in dequant_ep        |
+| pipeline        | II = 1                                                                                           | ../../patched/hls/gemm_contract.h:579 in dequant_ep        |
+| unroll          |                                                                                                  | ../../patched/hls/gemm_contract.h:584 in dequant_ep        |
+| pipeline        | II = 1                                                                                           | ../../patched/hls/gemm_contract.h:594 in dequant_ep        |
+| unroll          |                                                                                                  | ../../patched/hls/gemm_contract.h:597 in dequant_ep        |
+| pipeline        | II = 1                                                                                           | ../../patched/hls/gemm_contract.h:605 in dequant_ep        |
+| dependence      | variable = prev inter false                                                                      | ../../patched/hls/gemm_contract.h:606 in dequant_ep        |
+| loop_tripcount  | min = 256 max = 1048576                                                                          | ../../patched/hls/gemm_contract.h:607 in dequant_ep        |
+| unroll          |                                                                                                  | ../../patched/hls/gemm_contract.h:616 in dequant_ep        |
+| bind_storage    | variable = amem type = ram_2p impl = lutram                                                      | ../../patched/hls/gemm_contract.h:655 in store             |
+| pipeline        | II = 1                                                                                           | ../../patched/hls/gemm_contract.h:676 in store             |
+| dependence      | variable = amem inter false                                                                      | ../../patched/hls/gemm_contract.h:677 in store             |
+| loop_tripcount  | min = 8 max = 131072                                                                             | ../../patched/hls/gemm_contract.h:678 in store             |
+| inline          | off                                                                                              | ../../patched/hls/gemm_contract.h:741 in gemm_item         |
+| dataflow        |                                                                                                  | ../../patched/hls/gemm_contract.h:742 in gemm_item         |
+| stream          | variable = s0 depth = fstream16::WFIFO16                                                         | ../../patched/hls/gemm_contract.h:746 in gemm_item         |
+| stream          | variable = s1 depth = fstream16::WFIFO16                                                         | ../../patched/hls/gemm_contract.h:747 in gemm_item         |
+| stream          | variable = s2 depth = fstream16::WFIFO16                                                         | ../../patched/hls/gemm_contract.h:748 in gemm_item         |
+| stream          | variable = s3 depth = fstream16::WFIFO16                                                         | ../../patched/hls/gemm_contract.h:749 in gemm_item         |
+| bind_storage    | variable = s0 type = fifo impl = uram                                                            | ../../patched/hls/gemm_contract.h:751 in gemm_item         |
+| bind_storage    | variable = s1 type = fifo impl = uram                                                            | ../../patched/hls/gemm_contract.h:752 in gemm_item         |
+| bind_storage    | variable = s2 type = fifo impl = uram                                                            | ../../patched/hls/gemm_contract.h:753 in gemm_item         |
+| bind_storage    | variable = s3 type = fifo impl = uram                                                            | ../../patched/hls/gemm_contract.h:754 in gemm_item         |
+| stream          | variable = xr depth = 64                                                                         | ../../patched/hls/gemm_contract.h:756 in gemm_item         |
+| stream          | variable = xs depth = 32                                                                         | ../../patched/hls/gemm_contract.h:757 in gemm_item         |
+| stream          | variable = srow_s depth = 64                                                                     | ../../patched/hls/gemm_contract.h:758 in gemm_item         |
+| stream          | variable = bias_s depth = 64                                                                     | ../../patched/hls/gemm_contract.h:759 in gemm_item         |
+| stream          | variable = stok_s depth = 32                                                                     | ../../patched/hls/gemm_contract.h:760 in gemm_item         |
+| stream          | variable = es depth = 4                                                                          | ../../patched/hls/gemm_contract.h:761 in gemm_item         |
+| stream          | variable = ds depth = 64                                                                         | ../../patched/hls/gemm_contract.h:762 in gemm_item         |
+| stream          | variable = ys depth = 32                                                                         | ../../patched/hls/gemm_contract.h:763 in gemm_item         |
+| bind_storage    | variable = xr type = fifo impl = lutram                                                          | ../../patched/hls/gemm_contract.h:764 in gemm_item         |
+| bind_storage    | variable = xs type = fifo impl = srl                                                             | ../../patched/hls/gemm_contract.h:765 in gemm_item         |
+| bind_storage    | variable = srow_s type = fifo impl = srl                                                         | ../../patched/hls/gemm_contract.h:766 in gemm_item         |
+| bind_storage    | variable = bias_s type = fifo impl = srl                                                         | ../../patched/hls/gemm_contract.h:767 in gemm_item         |
+| bind_storage    | variable = stok_s type = fifo impl = srl                                                         | ../../patched/hls/gemm_contract.h:768 in gemm_item         |
+| bind_storage    | variable = es type = fifo impl = srl                                                             | ../../patched/hls/gemm_contract.h:769 in gemm_item         |
+| bind_storage    | variable = ds type = fifo impl = lutram                                                          | ../../patched/hls/gemm_contract.h:770 in gemm_item         |
+| bind_storage    | variable = ys type = fifo impl = srl                                                             | ../../patched/hls/gemm_contract.h:771 in gemm_item         |
+| inline          |                                                                                                  | ../../patched/hls/gemm_contract.h:782 in plan_item         |
+| unroll          |                                                                                                  | ../../patched/hls/gemm_contract.h:787 in plan_item         |
+| inline          | off                                                                                              | ../../patched/hls/gemm_contract.h:828 in gemm_unit         |
+| loop_tripcount  | min = 1 max = 24                                                                                 | ../../patched/hls/gemm_contract.h:832 in gemm_unit         |
+| inline          |                                                                                                  | ../../patched/kernels/contract.h:192 in f2u                |
+| inline          |                                                                                                  | ../../patched/kernels/contract.h:198 in u2f                |
+| inline          |                                                                                                  | ../../patched/kernels/contract.h:205 in known_op           |
+| unroll          |                                                                                                  | ../../patched/kernels/contract.h:214 in rec_check          |
+| inline          |                                                                                                  | ../../patched/kernels/contract.h:266 in row_addr           |
+| inline          |                                                                                                  | ../../patched/kernels/contract.h:271 in row_addr2          |
+| inline          |                                                                                                  | ../../patched/kernels/contract.h:276 in seg_addr           |
+| inline          |                                                                                                  | ../../patched/kernels/contract.h:280 in scale_addr         |
+| inline          |                                                                                                  | ../../patched/kernels/contract.h:286 in w_word_addr        |
+| inline          |                                                                                                  | ../../patched/kernels/contract.h:290 in w_lane             |
+| inline          | off                                                                                              | ../amx_top.cpp:18 in region                                |
+| dataflow        |                                                                                                  | ../amx_top.cpp:19 in region                                |
+| interface       | mode = m_axi port = xmem offset = slave bundle = io max_read_burst_length = 256 depth = 1048576  | ../amx_top.cpp:27 in amx_top                               |
+| interface       | mode = m_axi port = ymem offset = slave bundle = io max_write_burst_length = 256 depth = 1048576 | ../amx_top.cpp:28 in amx_top                               |
+| interface       | mode = s_axilite port = rec                                                                      | ../amx_top.cpp:29 in amx_top                               |
+| interface       | mode = s_axilite port = return                                                                   | ../amx_top.cpp:30 in amx_top                               |
+| interface       | mode = axis port = xr                                                                            | ../amx_top.cpp:31 in amx_top                               |
+| interface       | mode = axis port = stok_s                                                                        | ../amx_top.cpp:32 in amx_top                               |
+| interface       | mode = axis port = srow_s                                                                        | ../amx_top.cpp:33 in amx_top                               |
+| interface       | mode = axis port = bias_s                                                                        | ../amx_top.cpp:34 in amx_top                               |
+| interface       | mode = axis port = ds                                                                            | ../amx_top.cpp:35 in amx_top                               |
+| interface       | mode = axis port = ys                                                                            | ../amx_top.cpp:36 in amx_top                               |
+| array_partition | variable = f complete                                                                            | ../amx_top.cpp:38 in amx_top                               |
+| pipeline        | II = 1                                                                                           | ../amx_top.cpp:41 in amx_top                               |
+| unroll          |                                                                                                  | ../amx_top.cpp:44 in amx_top                               |
+| loop_tripcount  | min = 1 max = 24                                                                                 | ../amx_top.cpp:56 in amx_top                               |
++-----------------+--------------------------------------------------------------------------------------------------+------------------------------------------------------------+
+
+

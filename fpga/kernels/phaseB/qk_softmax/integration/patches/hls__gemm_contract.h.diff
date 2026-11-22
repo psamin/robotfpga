@@ -1,0 +1,247 @@
+--- a/fpga/hls/gemm_contract.h
++++ b/fpga/hls/gemm_contract.h
+@@ -28,9 +28,20 @@
+ //   store    ys -> io                   row-major Y, one 128-byte burst per (token, group) (E-3)
+ // The dequantizer and the store run 4 FP32 per clock: a block of 1,024 outputs takes 256 clocks, so blocks of
+ // K < 256 are bound by the store (attention Q.K^T, K = 64), as the contract's time model assumes.
++//
++// OP_QK_SOFTMAX (phase B, fpga/kernels/phaseB/qk_softmax): the same region runs Q.K^T and the softmax of an
++// attention item as one command. Slots A, B as the GEMM; G = s_tok, H = s_row (the GEMM's F, E); C, D, E, F as
++// SOFTMAX (P rows, rank_q, rank_k, P scales). The extra processes (qks_tail.h):
++//   load_io     + rs: rank_k (once per item) and rank_q (per tile, beside s_tok(t)), F_MASK only
++//   dequant_ep  writes ss instead of ys (same arithmetic; no bias / D)
++//   sbuf        ss -> score buffer (2 tiles, URAM) + row max + visibility -> sxs / smx, a tile at a time
++//   smx::compute, smx::divider   the SOFTMAX unit's own processes (softmax_core.h, unchanged)
++//   store       eq / rq -> P rows + scale vector (the SOFTMAX writer's pattern) instead of Y
++// A GEMM command runs the tail processes with zero iterations and a QK_SOFTMAX command never touches ys.
+ #pragma once
+ #include "int16_linear.h"
+ #include "../kernels/contract.h"
++#include "qks_tail.h"
+ 
+ namespace fgemm {
+ 
+@@ -133,6 +144,8 @@
+   uint64_t yR, yP1, dR, dP1;  // row groups of Y and of the addend (F_ACC: C's), R = 0: none
+   int N, K, groups, nblk, ntiles, nch;
+   bool bias, addd;
++  bool qks, mask;          // OP_QK_SOFTMAX, F_MASK
++  uint64_t qa, ka;         // rank_q, rank_k byte addresses (F_MASK)
+ };
+ 
+ // rows per tile that hold tokens n < N
+@@ -230,9 +243,21 @@
+     x.row += it.xp;
+   }
+ }
++// OP_QK_SOFTMAX with F_MASK: the ranks for sbuf on rs (one more consumer, the same order rule): rank_k (L / 4
++// words) and rank_q(0) after the bias, rank_q(t) after s_tok(t). rank_q words past pad4(N) are not read (zeros).
++template <class W>
++static inline void rq_tile(const W* io, const Item& it, int t, uint64_t f_words, Fifo16<IoWord>& rs) {
++#pragma HLS INLINE
++rq_t:
++  for (int w = 0; w < NTT / F4; w++) {
++#pragma HLS PIPELINE II = 1
++    const uint64_t wi = (uint64_t)t * (NTT / F4) + w;
++    rs.write(wi < f_words ? to_io(io[(it.qa >> 4) + wi]) : zero_word());
++  }
++}
+ template <class W>
+ static void load_io(const W* io, const Item it, Fifo16<IoWord>& xr, Fifo16<IoWord>& stok_s, Fifo16<IoWord>& srow_s,
+-                    Fifo16<IoWord>& bias_s, Fifo16<IoWord>& ds) {
++                    Fifo16<IoWord>& bias_s, Fifo16<IoWord>& ds, Fifo16<IoWord>& rs) {
+   const uint64_t f_words = (uint64_t)ctr::pad4((uint32_t)it.N) / F4;  // s_tok words the slot holds
+   XGen x;
+   x.a = 0;
+@@ -265,6 +290,14 @@
+       bias_s.write(to_io(io[(it.ga >> 4) + i]));
+     }
+   }
++  if (it.mask) {
++  load_rk:
++    for (int i = 0; i < G * (LANES / F4); i++) {
++#pragma HLS PIPELINE II = 1
++      rs.write(to_io(io[(it.ka >> 4) + i]));
++    }
++    rq_tile(io, it, 0, f_words, rs);
++  }
+ tiles_io:
+   for (int t = 0; t < it.ntiles; t++) {
+     if (t > 0) {
+@@ -274,6 +307,7 @@
+         const uint64_t wi = (uint64_t)t * (NTT / F4) + w;
+         stok_s.write(wi < f_words ? to_io(io[(it.fa >> 4) + wi]) : ones_word());
+       }
++      if (it.mask) rq_tile(io, it, t, f_words, rs);
+     }
+     const int nv = valid_rows(it.N, t);
+     const int unext = t + 1 < it.ntiles ? fstream16::blocks_of_tile(it.nblk, t + 1) * it.nch * TB : 0;
+@@ -417,7 +451,7 @@
+ 
+ // ---------------------------------------------------------------- process 6: block sums -> outputs (4 lanes)
+ static void dequant_ep(Fifo16<IoWord>& srow_s, Fifo16<IoWord>& bias_s, Fifo16<IoWord>& stok_s,
+-                       Fifo16<EWord>& es, Fifo16<IoWord>& ds, Fifo16<IoWord>& ys, const Item it) {
++                       Fifo16<EWord>& es, Fifo16<IoWord>& ds, Fifo16<IoWord>& ys, Fifo16<IoWord>& ss, const Item it) {
+   float srow[M_MAX], bsv[M_MAX];
+ #pragma HLS ARRAY_PARTITION variable = srow cyclic factor = 4
+ #pragma HLS ARRAY_PARTITION variable = bsv cyclic factor = 4
+@@ -482,7 +516,12 @@
+         if (it.addd) y = fadd_ep(y, fstream::io_lane(dv, j));
+         fstream::io_set(o, j, y);
+       }
+-      if (valid) ys.write(o);
++      if (valid) {
++        if (it.qks)
++          ss.write(o);  // the scores stay on chip (sbuf)
++        else
++          ys.write(o);
++      }
+       cw = fstream16::ew_shift4(cw);
+       if (q == DQS - 1) {
+         q = 0;
+@@ -506,7 +545,12 @@
+ 
+ // ---------------------------------------------------------------- process 7: row-major Y
+ template <class W>
+-static void store(Fifo16<IoWord>& ys, W* io, const Item it) {
++static void store(Fifo16<IoWord>& ys, smx::QStream& eq, smx::RStream& rq, W* io, const Item it,
++                  const smx::Params sp) {
++  if (it.qks) {  // P rows + scales (OP_QK_SOFTMAX); the same io write port
++    qks::store_p(eq, rq, io, sp);
++    return;
++  }
+ tiles_st:
+   for (int t = 0; t < it.ntiles; t++) {
+     const int nv = valid_rows(it.N, t);
+@@ -537,12 +581,31 @@
+ 
+ // ---------------------------------------------------------------- one item
+ template <class WP, class W>
+-static void gemm_item(const WP* w0, const WP* w1, const WP* w2, const WP* w3, const W* xmem, W* ymem, const Item it) {
++static void gemm_item(const WP* w0, const WP* w1, const WP* w2, const WP* w3, const W* xmem, W* ymem, const Item it,
++                      const qks::Tail tl, const smx::Params sp) {
+ #pragma HLS INLINE off
+ #pragma HLS DATAFLOW
+   Fifo16<WPort> s0, s1, s2, s3;
+   Fifo16<IoWord> xr, xs, srow_s, stok_s, bias_s, ds, ys;
+   Fifo16<EWord> es;
++  Fifo16<IoWord> ss, rs;  // OP_QK_SOFTMAX: scores dequant -> sbuf, ranks load_io -> sbuf
++  smx::XStream sxs("qks_sxs");
++  smx::MStream smx_s("qks_smx");
++  smx::QStream eq("qks_eq");
++  smx::SStream sq("qks_sq");
++  smx::RStream rq("qks_rq");
++#pragma HLS STREAM variable = ss depth = 32
++#pragma HLS STREAM variable = rs depth = 32
++#pragma HLS BIND_STORAGE variable = ss type = fifo impl = srl
++#pragma HLS BIND_STORAGE variable = rs type = fifo impl = srl
++#pragma HLS STREAM variable = sxs depth = smx::XS_DEPTH
++#pragma HLS BIND_STORAGE variable = sxs type = fifo impl = lutram
++#pragma HLS STREAM variable = smx_s depth = smx::MX_DEPTH
++#pragma HLS STREAM variable = eq depth = smx::EQ_DEPTH
++#pragma HLS BIND_STORAGE variable = eq type = fifo impl = srl
++#pragma HLS STREAM variable = sq depth = smx::SQ_DEPTH
++#pragma HLS STREAM variable = rq depth = smx::RQ_DEPTH
++#pragma HLS BIND_STORAGE variable = rq type = fifo impl = lutram
+ #pragma HLS STREAM variable = s0 depth = fstream16::WFIFO16
+ #pragma HLS STREAM variable = s1 depth = fstream16::WFIFO16
+ #pragma HLS STREAM variable = s2 depth = fstream16::WFIFO16
+@@ -570,11 +633,14 @@
+ #pragma HLS BIND_STORAGE variable = ds type = fifo impl = lutram
+ #pragma HLS BIND_STORAGE variable = ys type = fifo impl = srl
+   load_w(w0, w1, w2, w3, it, s0, s1, s2, s3);
+-  load_io(xmem, it, xr, stok_s, srow_s, bias_s, ds);
++  load_io(xmem, it, xr, stok_s, srow_s, bias_s, ds, rs);
+   xpose(xr, xs, it);
+   fstream16::compute16(s0, s1, s2, s3, xs, es, it.groups, it.K, it.nblk, it.ntiles);
+-  dequant_ep(srow_s, bias_s, stok_s, es, ds, ys, it);
+-  store(ys, ymem, it);
++  dequant_ep(srow_s, bias_s, stok_s, es, ds, ys, ss, it);
++  qks::sbuf(ss, rs, sxs, smx_s, tl);
++  smx::compute(sxs, smx_s, eq, sq, sp);  // sp.B = 0 for a GEMM command: no iteration
++  qks::divider_if(sq, rq, tl);
++  store(ys, eq, rq, ymem, it, sp);
+ }
+ 
+ static inline Item plan_item(const ctr::Cmd& c, uint64_t b) {
+@@ -598,10 +664,16 @@
+   it.dp = acc ? it.yp : (uint64_t)D.pitch;
+   it.dR = acc ? it.yR : 0;
+   it.dP1 = acc ? it.yP1 : 0;
+-  it.ea = E.addr + b * E.stride;
+-  it.fa = F.addr + b * F.stride;
++  it.qks = c.op == ctr::OP_QK_SOFTMAX;
++  const ctr::Slot &Hs = c.s[ctr::SLOT_H];
++  it.ea = it.qks ? Hs.addr + b * Hs.stride : E.addr + b * E.stride;  // s_row: QK_SOFTMAX slot H
++  it.fa = it.qks ? G.addr + b * G.stride : F.addr + b * F.stride;    // s_tok: QK_SOFTMAX slot G
+   it.ga = G.addr + b * G.stride;
+-  it.bias = (c.flags & ctr::F_BIAS) != 0;
++  it.bias = (c.flags & ctr::F_BIAS) != 0;  // F_BIAS (0x20) is not a QK_SOFTMAX flag (validate)
++  it.mask = it.qks && (c.flags & ctr::F_MASK) != 0;
++  it.qa = D.addr + b * D.stride;
++  it.ka = E.addr + b * E.stride;
++  if (it.qks) it.addd = false;  // slot D is rank_q
+   it.N = (int)c.N;
+   it.K = (int)c.K;
+   it.groups = (int)(c.M / LANES);
+@@ -609,6 +681,51 @@
+   it.ntiles = (it.nblk + NBX - 1) / NBX;
+   it.nch = (int)((c.K + CK - 1) / CK);
+   return it;
++}
++
++// OP_QK_SOFTMAX: the softmax side of item b (smx::Params as smx::make_params builds it for one item; B = 0 for a
++// GEMM command, so smx::compute runs no iteration).
++static inline qks::Tail plan_tail(const Item& it, const ctr::Cmd& c) {
++#pragma HLS INLINE
++  qks::Tail tl;
++  tl.on = it.qks;
++  tl.mask = it.mask;
++  tl.N = it.N;
++  tl.G = it.groups;
++  tl.ntiles = it.ntiles;
++  tl.W = (int)(c.M >> 2);
++  return tl;
++}
++static inline smx::Params plan_smx(const ctr::Cmd& c, uint64_t b, bool qks_on) {
++#pragma HLS INLINE
++  smx::Params p;
++  const ctr::Slot &Cs = c.s[ctr::SLOT_C], &F = c.s[ctr::SLOT_F];
++  const uint32_t np = c.p[ctr::P_NP] ? c.p[ctr::P_NP] : c.N;
++  p.B = qks_on ? 1 : 0;
++  p.N = c.N;
++  p.NP = np;
++  p.NP4 = (np + 3) & ~3u;
++  p.W = c.M >> 2;
++  p.W2 = c.M >> 3;
++  p.mask = (c.flags & ctr::F_MASK) != 0;
++  ap_int<10> ec;
++  smx::c_params(c.p[ctr::P_EPS], p.mc, ec);
++  p.kc = (ap_int<11>)153 - (ap_int<11>)ec;
++  p.a = 0;
++  p.d = 0;
++  p.e = 0;
++  p.c = (smx::WAddr)((Cs.addr + b * Cs.stride) >> 4);
++  p.f = (smx::WAddr)((F.addr + b * F.stride) >> 4);
++  p.ap = 0;
++  p.cp = Cs.pitch >> 4;
++  p.as = 0;
++  p.cs = 0;
++  p.ds = 0;
++  p.es = 0;
++  p.fs = 0;
++  p.a_contig = false;
++  p.c_contig = p.cp == p.W2;
++  return p;
+ }
+ 
+ // The unit: one command (validate_hw passed: Mp 32..8192 % 32, K 8..4096 % 8, N, B 1..65535, slots aligned,
+@@ -622,7 +739,7 @@
+   for (uint32_t b = 0; b < c.B; b++) {
+ #pragma HLS LOOP_TRIPCOUNT min = 1 max = 24
+     const Item it = plan_item(c, b);
+-    gemm_item(hp0, hp1, hp2, hp3, io_rd, io_wr, it);
++    gemm_item(hp0, hp1, hp2, hp3, io_rd, io_wr, it, plan_tail(it, c), plan_smx(c, b, it.qks));
+   }
+   return ctr::ME_OK;
+ }

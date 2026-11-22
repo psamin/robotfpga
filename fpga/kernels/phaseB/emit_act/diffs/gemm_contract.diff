@@ -1,0 +1,276 @@
+--- a/fpga/hls/gemm_contract.h	2026-11-21 20:08:59.771473200 -0800
++++ b/fpga/hls/gemm_contract.h	2026-11-21 20:08:59.835486900 -0800
+@@ -25,12 +25,17 @@
+ //                                       at one k), one word in and one word out per clock (E-2)
+ //   compute16                           the MAC array (int16_linear.h), unchanged
+ //   dequant_ep  es + scales + ds -> ys  4 lanes (E-1): i43 -> FP32, * s_row, * s_tok, + bias, + D; rows n < N only
+-//   store    ys -> io                   row-major Y, one 128-byte burst per (token, group) (E-3)
++//                                       p6 = P_ACT (phase B emit_act): then GELU / SILU / SILU_MUL on y, 2 values
++//                                       a clock (fpga/kernels/phaseB/emit_act/emit_act.h)
++//   store    ys -> io                   row-major Y, one 128-byte burst per (token, group) (E-3); EPI_SILU_MUL:
++//                                       64 bytes (16 output columns per group)
+ // The dequantizer and the store run 4 FP32 per clock: a block of 1,024 outputs takes 256 clocks, so blocks of
+-// K < 256 are bound by the store (attention Q.K^T, K = 64), as the contract's time model assumes.
++// K < 256 are bound by the store (attention Q.K^T, K = 64), as the contract's time model assumes. With P_ACT the
++// dequantizer takes 512 clocks per block (every act GEMM of -12392 has K >= 720: hidden behind the MACs).
+ #pragma once
+ #include "int16_linear.h"
+ #include "../kernels/contract.h"
++#include "../kernels/phaseB/emit_act/emit_act.h"
+ 
+ namespace fgemm {
+ 
+@@ -133,6 +138,8 @@
+   uint64_t yR, yP1, dR, dP1;  // row groups of Y and of the addend (F_ACC: C's), R = 0: none
+   int N, K, groups, nblk, ntiles, nch;
+   bool bias, addd;
++  int act;  // p6 = P_ACT: ctr::EPI_* (0 = none)
++  int yu;   // io words of Y per (token, group): YU, or YU / 2 for EPI_SILU_MUL
+ };
+ 
+ // rows per tile that hold tokens n < N
+@@ -416,6 +423,12 @@
+ }
+ 
+ // ---------------------------------------------------------------- process 6: block sums -> outputs (4 lanes)
++// Without P_ACT: one quarter (4 values) of an emit word a clock, lane j the epilogue of value 4q + j.
++// With P_ACT (emit_act.h): two clocks per quarter (h = 0, 1). Lanes 0, 1 run the epilogue of values 4q + 2h and
++// 4q + 2h + 1 (h = 1: their inputs are lanes 2, 3 of the quarter, kept from h = 0 in the stash); lanes 2, 3 lend
++// their second multiplier for the activation: fmul(x, h(x)) (GELU, SILU, SILU_MUL gate half) or fmul(up, gb)
++// (SILU_MUL up half, gb = silu(gate) of the same column, written 8 iterations earlier). One io word of y leaves
++// every second clock (SILU_MUL: of the up half only). Each FP32 operator stays one core per lane (2 fmul, 2 fadd).
+ static void dequant_ep(Fifo16<IoWord>& srow_s, Fifo16<IoWord>& bias_s, Fifo16<IoWord>& stok_s,
+                        Fifo16<EWord>& es, Fifo16<IoWord>& ds, Fifo16<IoWord>& ys, const Item it) {
+   float srow[M_MAX], bsv[M_MAX];
+@@ -425,6 +438,9 @@
+   Cap prev[EROWS * DQS][DQL];  // [row * 4 + quarter][lane]
+ #pragma HLS ARRAY_PARTITION variable = prev complete dim = 2
+ #pragma HLS BIND_STORAGE variable = prev type = ram_2p impl = lutram
++  float gb[2][2 * DQS];  // EPI_SILU_MUL: silu(gate) of the token's 16 gate columns, [act lane][2 q + h]
++#pragma HLS ARRAY_PARTITION variable = gb complete dim = 1
++#pragma HLS BIND_STORAGE variable = gb type = ram_s2p impl = lutram
+ prev_zero:
+   for (int r = 0; r < EROWS * DQS; r++) {
+ #pragma HLS PIPELINE II = 1
+@@ -432,6 +448,10 @@
+ #pragma HLS UNROLL
+       prev[r][j] = 0;
+     }
++    if (r < 2 * DQS) {
++      gb[0][r] = 0.0f;
++      gb[1][r] = 0.0f;
++    }
+   }
+ srow_in:
+   for (int i = 0; i < it.groups * (LANES / F4); i++) {
+@@ -445,6 +465,25 @@
+       bsv[F4 * i + j] = fstream::io_lane(bw, j);
+     }
+   }
++  const bool am = it.act != ea::ACT_NONE;      // an activation follows the epilogue
++  const bool tsilu = it.act != ea::ACT_GELU;   // h = sigmoid (else Phi_tanh)
++  const bool mul = it.act == ea::ACT_SILU_MUL;  // gate | up halves
++  const int sub = am ? 2 : 1;                   // clocks per quarter
++  // the epilogue lanes' inputs for h = 1 (lanes 2, 3 of the quarter, kept from h = 0) and the h = 0 results
++  float sd[2], ssr[2], sbs[2], sdv[2], ylo[2];
++#pragma HLS ARRAY_PARTITION variable = sd complete
++#pragma HLS ARRAY_PARTITION variable = ssr complete
++#pragma HLS ARRAY_PARTITION variable = sbs complete
++#pragma HLS ARRAY_PARTITION variable = sdv complete
++#pragma HLS ARRAY_PARTITION variable = ylo complete
++  for (int j = 0; j < 2; j++) {
++#pragma HLS UNROLL
++    sd[j] = 0.0f;
++    ssr[j] = 0.0f;
++    sbs[j] = 0.0f;
++    sdv[j] = 0.0f;
++    ylo[j] = 0.0f;
++  }
+ tiles_dq:
+   for (int t = 0; t < it.ntiles; t++) {
+     const int nbt = fstream16::blocks_of_tile(it.nblk, t);
+@@ -458,74 +497,147 @@
+       }
+     }
+     int g = 0, b = 0, r = 0, q = 0;
++    bool h1 = false;  // the second clock of a quarter (P_ACT only)
+     EWord cw = EWord();
+   dq:
+-    for (int itr = 0; itr < it.groups * nbt * EROWS * DQS; itr++) {
++    for (int itr = 0; itr < it.groups * nbt * EROWS * DQS * sub; itr++) {
+ #pragma HLS PIPELINE II = 1
+ #pragma HLS DEPENDENCE variable = prev inter false
++#pragma HLS DEPENDENCE variable = gb type = inter direction = RAW distance = 8 dependent = true
+ #pragma HLS LOOP_TRIPCOUNT min = 256 max = 1048576
+-      if (q == 0) cw = es.read();
++      if (q == 0 && !h1) cw = es.read();
+       const int tok = b * TB + (r >> 1);
+       const bool valid = t * NTT + tok < it.N;
+       const float st = stok[tok];
+       IoWord dv = zero_word();
+-      if (it.addd && valid) dv = ds.read();
+-      IoWord o;
++      if (it.addd && valid && !h1) dv = ds.read();
++      // front: the quarter's 4 block sums (prev written once, at h = 0)
++      float dfv[DQL], srv[DQL], bsj[DQL], dvj[DQL];
++#pragma HLS ARRAY_PARTITION variable = dfv complete
++#pragma HLS ARRAY_PARTITION variable = srv complete
++#pragma HLS ARRAY_PARTITION variable = bsj complete
++#pragma HLS ARRAY_PARTITION variable = dvj complete
+       for (int j = 0; j < DQL; j++) {
+ #pragma HLS UNROLL
+-        const Cap c = fstream16::ew_get(cw, j);  // lanes 4q..4q+3: the word shifts down by 4 values per clock
++        const Cap c = fstream16::ew_get(cw, j);  // lanes 4q..4q+3: the word shifts down by 4 values per quarter
+         const U43 d = fstream16::cap_diff(c, prev[r * DQS + q][j]);
+-        prev[r * DQS + q][j] = c;
++        if (!h1) prev[r * DQS + q][j] = c;
+         const int m = g * LANES + (r & 1) * EW + DQL * q + j;
+-        float y = fstream16::fmul_dq(fstream16::fmul_dq(fstream16::i43_to_f32(d), srow[m]), st);
+-        if (it.bias) y = fadd_ep(y, bsv[m]);
+-        if (it.addd) y = fadd_ep(y, fstream::io_lane(dv, j));
+-        fstream::io_set(o, j, y);
+-      }
+-      if (valid) ys.write(o);
+-      cw = fstream16::ew_shift4(cw);
+-      if (q == DQS - 1) {
+-        q = 0;
+-        if (r == EROWS - 1) {
+-          r = 0;
+-          if (b == nbt - 1) {
+-            b = 0;
+-            g++;
++        dfv[j] = fstream16::i43_to_f32(d);
++        srv[j] = srow[m];
++        bsj[j] = bsv[m];
++        dvj[j] = fstream::io_lane(dv, j);
++      }
++      // lanes 0, 1 at h = 1: values 4q + 2, 4q + 3 from the stash
++      float ind[DQL], ins[DQL], inb[DQL], ina[DQL];
++#pragma HLS ARRAY_PARTITION variable = ind complete
++#pragma HLS ARRAY_PARTITION variable = ins complete
++#pragma HLS ARRAY_PARTITION variable = inb complete
++#pragma HLS ARRAY_PARTITION variable = ina complete
++      for (int j = 0; j < DQL; j++) {
++#pragma HLS UNROLL
++        const bool st_in = j < 2 && h1;
++        ind[j] = st_in ? sd[j & 1] : dfv[j];
++        ins[j] = st_in ? ssr[j & 1] : srv[j];
++        inb[j] = st_in ? sbs[j & 1] : bsj[j];
++        ina[j] = st_in ? sdv[j & 1] : dvj[j];
++      }
++      if (!h1) {
++        for (int j = 0; j < 2; j++) {
++#pragma HLS UNROLL
++          sd[j] = dfv[2 + j];
++          ssr[j] = srv[2 + j];
++          sbs[j] = bsj[2 + j];
++          sdv[j] = dvj[2 + j];
++        }
++      }
++      float outv[DQL];
++#pragma HLS ARRAY_PARTITION variable = outv complete
++      float xv[2];
++#pragma HLS ARRAY_PARTITION variable = xv complete
++      for (int j = 0; j < 2; j++) {  // lanes 0, 1: the epilogue
++#pragma HLS UNROLL
++        float y = fstream16::fmul_dq(fstream16::fmul_dq(ind[j], ins[j]), st);
++        if (it.bias) y = fadd_ep(y, inb[j]);
++        if (it.addd) y = fadd_ep(y, ina[j]);
++        xv[j] = y;
++        outv[j] = y;
++      }
++      const bool uph = mul && (r & 1) != 0;  // SILU_MUL: the up half of the token's group
++      const int gi = 2 * q + (h1 ? 1 : 0);
++      for (int j = 2; j < DQL; j++) {  // lanes 2, 3: the epilogue, or the activation of lane j - 2's value
++#pragma HLS UNROLL
++        const int p = j - 2;
++        const float m1 = fstream16::fmul_dq(ind[j], ins[j]);
++        const float hv = ea::hval(xv[p], tsilu);
++        const float gv = gb[p][gi];
++        const float pr = fstream16::fmul_dq(am ? xv[p] : m1, am ? (uph ? gv : hv) : st);
++        if (mul && !uph) gb[p][gi] = pr;
++        float y = pr;
++        if (it.bias) y = fadd_ep(y, inb[j]);
++        if (it.addd) y = fadd_ep(y, ina[j]);
++        outv[j] = am ? pr : y;
++      }
++      IoWord o;
++      fstream::io_set(o, 0, am ? ylo[0] : outv[0]);
++      fstream::io_set(o, 1, am ? ylo[1] : outv[1]);
++      fstream::io_set(o, 2, outv[2]);
++      fstream::io_set(o, 3, outv[3]);
++      if (am && !h1) {
++        ylo[0] = outv[2];
++        ylo[1] = outv[3];
++      }
++      if (valid && (!am || (h1 && (!mul || uph)))) ys.write(o);
++      const bool qend = !am || h1;  // the quarter is done
++      h1 = am && !h1;
++      if (qend) {
++        cw = fstream16::ew_shift4(cw);
++        if (q == DQS - 1) {
++          q = 0;
++          if (r == EROWS - 1) {
++            r = 0;
++            if (b == nbt - 1) {
++              b = 0;
++              g++;
++            } else {
++              b++;
++            }
+           } else {
+-            b++;
++            r++;
+           }
+         } else {
+-          r++;
++          q++;
+         }
+-      } else {
+-        q++;
+       }
+     }
+   }
+ }
+ 
+ // ---------------------------------------------------------------- process 7: row-major Y
++// it.yu io words per (token, group): 8 (32 FP32 columns), or 4 for EPI_SILU_MUL (the group's 16 output columns).
+ template <class W>
+ static void store(Fifo16<IoWord>& ys, W* io, const Item it) {
++  const uint64_t gstep = (uint64_t)it.yu * 16;  // bytes per group in a Y row: 128 or 64
+ tiles_st:
+   for (int t = 0; t < it.ntiles; t++) {
+     const int nv = valid_rows(it.N, t);
+     RowWalk rw0;
+     rw0.start((uint64_t)t * NTT, it.yR, it.yP1, it.yp);
+     RowWalk rw = rw0;
+-    int g = 0, i = 0;
++    int i = 0;
++    uint64_t gofs = 0;  // g * gstep
+   store_y:
+     for (int u = 0; u < it.groups * nv; u++) {
+ #pragma HLS PIPELINE II = YU
+ #pragma HLS LOOP_TRIPCOUNT min = 1 max = 16384
+-      const uint64_t base = (it.ya + rw.off() + (uint64_t)g * (LANES * 4)) >> 4;
++      const uint64_t base = (it.ya + rw.off() + gofs) >> 4;
+       for (int w = 0; w < YU; w++) {
+ #pragma HLS UNROLL
+-        io[base + w] = from_io<W>(ys.read());
++        if (w < it.yu) io[base + w] = from_io<W>(ys.read());
+       }
+       if (i == nv - 1) {
+         i = 0;
+-        g++;
++        gofs += gstep;
+         rw = rw0;
+       } else {
+         i++;
+@@ -602,6 +714,8 @@
+   it.fa = F.addr + b * F.stride;
+   it.ga = G.addr + b * G.stride;
+   it.bias = (c.flags & ctr::F_BIAS) != 0;
++  it.act = (int)c.p[ctr::P_ACT];
++  it.yu = it.act == ea::ACT_SILU_MUL ? YU / 2 : YU;
+   it.N = (int)c.N;
+   it.K = (int)c.K;
+   it.groups = (int)(c.M / LANES);

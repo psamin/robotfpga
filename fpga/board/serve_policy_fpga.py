@@ -22,6 +22,17 @@ Listens on 127.0.0.1 only: LeRobot's gRPC transport uses pickle, so reach it thr
     python fpga/board/serve_policy_fpga.py --selftest <checkpoint dir> --batches <dir of frame_*.pt>
     # the same without a board (host C core; --mock ip runs the board's buffer/register code path too)
     python fpga/board/serve_policy_fpga.py --mock layout [--arith int16] --selftest <ckpt dir> --batches <dir>
+
+--path list: the whole chunk as one command list (fpga/board/cmdlist.py, fpga/kernels/CONTRACT.md): every
+weight packed at load (the 21 FP32-stored layers on the engine too; --arm-fp32 puts them back on the ARM),
+one IP start per chunk, the language trim (12 real tokens) and LM layer 15's skip built into the list.
+predict_action_chunk becomes re-entrant (each call its own tensors and arena, not the policy's shared
+_queues); --inflight 2 lets LeRobot's server hold two observations and run two GetActions at once (two
+arenas). Needs the list-mode float_top loaded (load_overlay.py). --selftest with --mock emu runs the same list
+on the laptop with the kernels' bit-exact emulators and checks two-in-flight chunks against one-at-a-time
+chunks bit for bit:
+    python fpga/board/serve_policy_fpga.py --path list --mock emu --selftest <ckpt dir> --batches <dir>
+--lang-trim / --skip-dead-layer: the same two exact levers for the per-call path (off by default).
 """
 
 import argparse
@@ -38,6 +49,8 @@ from fpga.board.runtime import (  # noqa: E402
     fast_tanh_gelu,
     fpga_linears,
     overlap_image_embedding,
+    skip_dead_lm_layer,
+    trim_language,
 )
 
 FAST_GELU = True
@@ -45,6 +58,10 @@ OVERLAP = True
 FUSE = True  # q/k/v and gate/up of one input: one engine call (runtime.fusion_groups)
 MEMO = True  # expert cross-attention k/v of the prefix cache: computed once per chunk (runtime.memo_modules)
 KEEP_FP32 = True  # the checkpoint's FP32 layers stay FP32 on the ARM (runtime.fp32_stored_linears)
+LANG_TRIM = False  # per-call path: real language tokens only (runtime.trim_language; exact)
+SKIP_DEAD = False  # per-call path: LM layer 15's unread work skipped (runtime.skip_dead_lm_layer; bit-exact)
+LIST = None  # --path list: the cmdlist.ListRuntime keyword arguments
+_RT = None  # the current ListRuntime (one per loaded policy)
 
 
 def checkpoint_file(name_or_path: str):
@@ -62,7 +79,12 @@ def checkpoint_file(name_or_path: str):
 
 def to_fpga(policy, eng, checkpoint):
     """Swap the linears (packing from the stored BF16, then freeing them), then FP32 for the rest."""
+    if LIST is not None:
+        return to_list(policy)
     t0 = time.perf_counter()
+    skipped = skip_dead_lm_layer(policy) if SKIP_DEAD else []
+    if LANG_TRIM:
+        trim_language(policy)
     info = {}
     n = fpga_linears(policy, eng, fuse=FUSE, memo=MEMO, keep_fp32=KEEP_FP32, checkpoint=checkpoint, info=info)
     policy.float()
@@ -75,10 +97,52 @@ def to_fpga(policy, eng, checkpoint):
         f" {time.perf_counter() - t0:.1f} s; {len(info['kept_fp32'])} FP32 layers on the ARM; {left:,} params"
         f" left on the ARM; {g} tanh-GELU modules on the sigmoid form; images"
         f" {'overlapped' if OVERLAP else 'sequential'}; fused calls {'on' if FUSE else 'off'}, k/v memo"
-        f" {'on' if MEMO else 'off'}",
+        f" {'on' if MEMO else 'off'}; language trim {'on' if LANG_TRIM else 'off'}; layer-15 dead work"
+        f" {'skipped' if skipped else 'kept'}",
         flush=True,
     )
     return policy
+
+
+def to_list(policy):
+    """--path list: pack, place and validate the chunk's command list; predict_action_chunk runs it."""
+    from fpga.board.cmdlist import ListRuntime, install
+
+    global _RT
+    if _RT is not None:  # a client reconnected: LeRobot loaded the policy again; free the old buffers first
+        _RT.close()
+        _RT = None
+    t0 = time.perf_counter()
+    rt = _RT = ListRuntime(policy, **LIST)
+    install(policy, rt)
+    print(f"command list ready in {time.perf_counter() - t0:.1f} s", flush=True)
+    return policy
+
+
+def selftest_list(args):
+    import torch
+    from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+
+    from fpga.board.cmdlist import check_inflight, replay
+
+    torch.set_num_threads(args.threads)
+    policy = to_fpga(SmolVLAPolicy.from_pretrained(args.selftest).to("cpu").eval(), None, None)
+    files = sorted(Path(args.batches).glob("frame_*.pt"))
+    if not files:
+        sys.exit(f"no frame_*.pt in {args.batches}")
+    frames = [torch.load(f, weights_only=False) for f in files]
+    rows = replay(policy, frames)
+    worst = max(r["max_abs_diff_normalized"] for r in rows)
+    k = max(2, args.inflight)
+    inf = check_inflight(policy, frames, [r["_chunk"] for r in rows], k)
+    print(json.dumps({"inflight_check": inf}), flush=True)
+    ok = worst < 0.05 and inf["ok"]
+    print(
+        f"{'PASS' if ok else 'FAIL'}: max |chunk - PyTorch FP32 reference| = {worst:.4g} (normalized units);"
+        f" {k} in flight bit-equal to one at a time: {inf['ok']}"
+    )
+    policy._fpga_list_runtime.close()
+    sys.exit(0 if ok else 1)
 
 
 def selftest(args, eng):
@@ -141,8 +205,17 @@ def serve(args, eng):
         return out
 
     ps.PolicyServer.SendPolicyInstructions = instructions_on_fpga
+    if args.inflight > 1:
+        if LIST is None:
+            sys.exit("--inflight > 1 needs --path list (the per-call path shares the policy's queues)")
+        from fpga.board.cmdlist import patch_policy_server
+
+        patch_policy_server(ps, args.inflight)
     sys.argv = [sys.argv[0], f"--host={args.host}", f"--port={args.port}", f"--fps={args.fps}"]
-    print(f"SERVING with FPGA linears ({eng.arith}) on {args.host}:{args.port} (localhost only)", flush=True)
+    what = (
+        f"the command list ({args.inflight} in flight)" if LIST is not None else f"FPGA linears ({eng.arith})"
+    )
+    print(f"SERVING with {what} on {args.host}:{args.port} (localhost only)", flush=True)
     ps.serve()
 
 
@@ -172,8 +245,23 @@ def main():
     )
     ap.add_argument(
         "--mock",
-        choices=["layout", "ip"],
-        help="selftest on the host C core instead of the board (no root)",
+        choices=["layout", "ip", "emu"],
+        help="selftest without the board: per-call host C core (layout, ip) or the list's emulators (emu)",
+    )
+    ap.add_argument(
+        "--path", choices=["call", "list"], default="call", help="per-call engine or command list"
+    )
+    ap.add_argument("--inflight", type=int, default=1, help="list path: inferences in flight (server queue)")
+    ap.add_argument("--arenas", type=int, default=2, help="list path: arenas (>= --inflight)")
+    ap.add_argument("--arm-fp32", action="store_true", help="list path: the 21 FP32-stored layers on the ARM")
+    ap.add_argument("--list-fe", choices=["kernels", "torch"], default="kernels", help="list mock front ends")
+    ap.add_argument("--low-ddr", action="store_true", help="list path: refuse buffers above 0x8000_0000")
+    ap.add_argument("--clock-mhz", type=float, default=None, help="list path: PL clock to set (board)")
+    ap.add_argument(
+        "--lang-trim", action="store_true", help="per-call path: real language tokens only (exact)"
+    )
+    ap.add_argument(
+        "--skip-dead-layer", action="store_true", help="per-call path: skip LM layer 15's unread work (exact)"
     )
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8080)
@@ -186,10 +274,33 @@ def main():
         sys.exit(
             "refusing to listen beyond localhost: the gRPC transport unpickles requests; use an SSH tunnel"
         )
-    global FAST_GELU, OVERLAP, FUSE, MEMO, KEEP_FP32
+    global FAST_GELU, OVERLAP, FUSE, MEMO, KEEP_FP32, LANG_TRIM, SKIP_DEAD, LIST
     FAST_GELU = not args.no_fast_gelu
     OVERLAP = not args.no_overlap
     FUSE, MEMO, KEEP_FP32 = not args.no_fuse, not args.no_memo, not args.no_keep_fp32
+    LANG_TRIM, SKIP_DEAD = args.lang_trim, args.skip_dead_layer
+    if args.path == "list":
+        if args.mock not in (None, "emu") or args.engine != "xrt" or args.arith != "fp32":
+            sys.exit("--path list: --mock emu or the board (--engine xrt); its arithmetic is int16 by build")
+        if args.lang_trim or args.skip_dead_layer:
+            sys.exit("--path list: the language trim and the layer-15 skip are built into the list")
+        if args.arenas < args.inflight:
+            sys.exit("--arenas must be >= --inflight")
+        if args.mock and not args.selftest:
+            sys.exit("--mock is for --selftest")
+        LIST = dict(
+            backend="mock" if args.mock else "xrt",
+            arenas=args.arenas,
+            fe=args.list_fe,
+            arm_fp32=args.arm_fp32,
+            low_ddr=args.low_ddr,
+            clock_mhz=args.clock_mhz,
+        )
+        return selftest_list(args) if args.selftest else serve(args, None)
+    if args.mock == "emu":
+        sys.exit("--mock emu is the list path's mock (--path list)")
+    if args.inflight > 1:
+        sys.exit("--inflight > 1 needs --path list (the per-call path shares the policy's queues)")
     if args.mock:
         if not args.selftest:
             sys.exit("--mock is for --selftest")

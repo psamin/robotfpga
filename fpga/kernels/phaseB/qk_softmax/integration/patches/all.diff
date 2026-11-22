@@ -1,0 +1,1063 @@
+--- a/fpga/hls/gemm_contract.h
++++ b/fpga/hls/gemm_contract.h
+@@ -28,9 +28,20 @@
+ //   store    ys -> io                   row-major Y, one 128-byte burst per (token, group) (E-3)
+ // The dequantizer and the store run 4 FP32 per clock: a block of 1,024 outputs takes 256 clocks, so blocks of
+ // K < 256 are bound by the store (attention Q.K^T, K = 64), as the contract's time model assumes.
++//
++// OP_QK_SOFTMAX (phase B, fpga/kernels/phaseB/qk_softmax): the same region runs Q.K^T and the softmax of an
++// attention item as one command. Slots A, B as the GEMM; G = s_tok, H = s_row (the GEMM's F, E); C, D, E, F as
++// SOFTMAX (P rows, rank_q, rank_k, P scales). The extra processes (qks_tail.h):
++//   load_io     + rs: rank_k (once per item) and rank_q (per tile, beside s_tok(t)), F_MASK only
++//   dequant_ep  writes ss instead of ys (same arithmetic; no bias / D)
++//   sbuf        ss -> score buffer (2 tiles, URAM) + row max + visibility -> sxs / smx, a tile at a time
++//   smx::compute, smx::divider   the SOFTMAX unit's own processes (softmax_core.h, unchanged)
++//   store       eq / rq -> P rows + scale vector (the SOFTMAX writer's pattern) instead of Y
++// A GEMM command runs the tail processes with zero iterations and a QK_SOFTMAX command never touches ys.
+ #pragma once
+ #include "int16_linear.h"
+ #include "../kernels/contract.h"
++#include "qks_tail.h"
+ 
+ namespace fgemm {
+ 
+@@ -133,6 +144,8 @@
+   uint64_t yR, yP1, dR, dP1;  // row groups of Y and of the addend (F_ACC: C's), R = 0: none
+   int N, K, groups, nblk, ntiles, nch;
+   bool bias, addd;
++  bool qks, mask;          // OP_QK_SOFTMAX, F_MASK
++  uint64_t qa, ka;         // rank_q, rank_k byte addresses (F_MASK)
+ };
+ 
+ // rows per tile that hold tokens n < N
+@@ -230,9 +243,21 @@
+     x.row += it.xp;
+   }
+ }
++// OP_QK_SOFTMAX with F_MASK: the ranks for sbuf on rs (one more consumer, the same order rule): rank_k (L / 4
++// words) and rank_q(0) after the bias, rank_q(t) after s_tok(t). rank_q words past pad4(N) are not read (zeros).
++template <class W>
++static inline void rq_tile(const W* io, const Item& it, int t, uint64_t f_words, Fifo16<IoWord>& rs) {
++#pragma HLS INLINE
++rq_t:
++  for (int w = 0; w < NTT / F4; w++) {
++#pragma HLS PIPELINE II = 1
++    const uint64_t wi = (uint64_t)t * (NTT / F4) + w;
++    rs.write(wi < f_words ? to_io(io[(it.qa >> 4) + wi]) : zero_word());
++  }
++}
+ template <class W>
+ static void load_io(const W* io, const Item it, Fifo16<IoWord>& xr, Fifo16<IoWord>& stok_s, Fifo16<IoWord>& srow_s,
+-                    Fifo16<IoWord>& bias_s, Fifo16<IoWord>& ds) {
++                    Fifo16<IoWord>& bias_s, Fifo16<IoWord>& ds, Fifo16<IoWord>& rs) {
+   const uint64_t f_words = (uint64_t)ctr::pad4((uint32_t)it.N) / F4;  // s_tok words the slot holds
+   XGen x;
+   x.a = 0;
+@@ -265,6 +290,14 @@
+       bias_s.write(to_io(io[(it.ga >> 4) + i]));
+     }
+   }
++  if (it.mask) {
++  load_rk:
++    for (int i = 0; i < G * (LANES / F4); i++) {
++#pragma HLS PIPELINE II = 1
++      rs.write(to_io(io[(it.ka >> 4) + i]));
++    }
++    rq_tile(io, it, 0, f_words, rs);
++  }
+ tiles_io:
+   for (int t = 0; t < it.ntiles; t++) {
+     if (t > 0) {
+@@ -274,6 +307,7 @@
+         const uint64_t wi = (uint64_t)t * (NTT / F4) + w;
+         stok_s.write(wi < f_words ? to_io(io[(it.fa >> 4) + wi]) : ones_word());
+       }
++      if (it.mask) rq_tile(io, it, t, f_words, rs);
+     }
+     const int nv = valid_rows(it.N, t);
+     const int unext = t + 1 < it.ntiles ? fstream16::blocks_of_tile(it.nblk, t + 1) * it.nch * TB : 0;
+@@ -417,7 +451,7 @@
+ 
+ // ---------------------------------------------------------------- process 6: block sums -> outputs (4 lanes)
+ static void dequant_ep(Fifo16<IoWord>& srow_s, Fifo16<IoWord>& bias_s, Fifo16<IoWord>& stok_s,
+-                       Fifo16<EWord>& es, Fifo16<IoWord>& ds, Fifo16<IoWord>& ys, const Item it) {
++                       Fifo16<EWord>& es, Fifo16<IoWord>& ds, Fifo16<IoWord>& ys, Fifo16<IoWord>& ss, const Item it) {
+   float srow[M_MAX], bsv[M_MAX];
+ #pragma HLS ARRAY_PARTITION variable = srow cyclic factor = 4
+ #pragma HLS ARRAY_PARTITION variable = bsv cyclic factor = 4
+@@ -482,7 +516,12 @@
+         if (it.addd) y = fadd_ep(y, fstream::io_lane(dv, j));
+         fstream::io_set(o, j, y);
+       }
+-      if (valid) ys.write(o);
++      if (valid) {
++        if (it.qks)
++          ss.write(o);  // the scores stay on chip (sbuf)
++        else
++          ys.write(o);
++      }
+       cw = fstream16::ew_shift4(cw);
+       if (q == DQS - 1) {
+         q = 0;
+@@ -506,7 +545,12 @@
+ 
+ // ---------------------------------------------------------------- process 7: row-major Y
+ template <class W>
+-static void store(Fifo16<IoWord>& ys, W* io, const Item it) {
++static void store(Fifo16<IoWord>& ys, smx::QStream& eq, smx::RStream& rq, W* io, const Item it,
++                  const smx::Params sp) {
++  if (it.qks) {  // P rows + scales (OP_QK_SOFTMAX); the same io write port
++    qks::store_p(eq, rq, io, sp);
++    return;
++  }
+ tiles_st:
+   for (int t = 0; t < it.ntiles; t++) {
+     const int nv = valid_rows(it.N, t);
+@@ -537,12 +581,31 @@
+ 
+ // ---------------------------------------------------------------- one item
+ template <class WP, class W>
+-static void gemm_item(const WP* w0, const WP* w1, const WP* w2, const WP* w3, const W* xmem, W* ymem, const Item it) {
++static void gemm_item(const WP* w0, const WP* w1, const WP* w2, const WP* w3, const W* xmem, W* ymem, const Item it,
++                      const qks::Tail tl, const smx::Params sp) {
+ #pragma HLS INLINE off
+ #pragma HLS DATAFLOW
+   Fifo16<WPort> s0, s1, s2, s3;
+   Fifo16<IoWord> xr, xs, srow_s, stok_s, bias_s, ds, ys;
+   Fifo16<EWord> es;
++  Fifo16<IoWord> ss, rs;  // OP_QK_SOFTMAX: scores dequant -> sbuf, ranks load_io -> sbuf
++  smx::XStream sxs("qks_sxs");
++  smx::MStream smx_s("qks_smx");
++  smx::QStream eq("qks_eq");
++  smx::SStream sq("qks_sq");
++  smx::RStream rq("qks_rq");
++#pragma HLS STREAM variable = ss depth = 32
++#pragma HLS STREAM variable = rs depth = 32
++#pragma HLS BIND_STORAGE variable = ss type = fifo impl = srl
++#pragma HLS BIND_STORAGE variable = rs type = fifo impl = srl
++#pragma HLS STREAM variable = sxs depth = smx::XS_DEPTH
++#pragma HLS BIND_STORAGE variable = sxs type = fifo impl = lutram
++#pragma HLS STREAM variable = smx_s depth = smx::MX_DEPTH
++#pragma HLS STREAM variable = eq depth = smx::EQ_DEPTH
++#pragma HLS BIND_STORAGE variable = eq type = fifo impl = srl
++#pragma HLS STREAM variable = sq depth = smx::SQ_DEPTH
++#pragma HLS STREAM variable = rq depth = smx::RQ_DEPTH
++#pragma HLS BIND_STORAGE variable = rq type = fifo impl = lutram
+ #pragma HLS STREAM variable = s0 depth = fstream16::WFIFO16
+ #pragma HLS STREAM variable = s1 depth = fstream16::WFIFO16
+ #pragma HLS STREAM variable = s2 depth = fstream16::WFIFO16
+@@ -570,11 +633,14 @@
+ #pragma HLS BIND_STORAGE variable = ds type = fifo impl = lutram
+ #pragma HLS BIND_STORAGE variable = ys type = fifo impl = srl
+   load_w(w0, w1, w2, w3, it, s0, s1, s2, s3);
+-  load_io(xmem, it, xr, stok_s, srow_s, bias_s, ds);
++  load_io(xmem, it, xr, stok_s, srow_s, bias_s, ds, rs);
+   xpose(xr, xs, it);
+   fstream16::compute16(s0, s1, s2, s3, xs, es, it.groups, it.K, it.nblk, it.ntiles);
+-  dequant_ep(srow_s, bias_s, stok_s, es, ds, ys, it);
+-  store(ys, ymem, it);
++  dequant_ep(srow_s, bias_s, stok_s, es, ds, ys, ss, it);
++  qks::sbuf(ss, rs, sxs, smx_s, tl);
++  smx::compute(sxs, smx_s, eq, sq, sp);  // sp.B = 0 for a GEMM command: no iteration
++  qks::divider_if(sq, rq, tl);
++  store(ys, eq, rq, ymem, it, sp);
+ }
+ 
+ static inline Item plan_item(const ctr::Cmd& c, uint64_t b) {
+@@ -598,10 +664,16 @@
+   it.dp = acc ? it.yp : (uint64_t)D.pitch;
+   it.dR = acc ? it.yR : 0;
+   it.dP1 = acc ? it.yP1 : 0;
+-  it.ea = E.addr + b * E.stride;
+-  it.fa = F.addr + b * F.stride;
++  it.qks = c.op == ctr::OP_QK_SOFTMAX;
++  const ctr::Slot &Hs = c.s[ctr::SLOT_H];
++  it.ea = it.qks ? Hs.addr + b * Hs.stride : E.addr + b * E.stride;  // s_row: QK_SOFTMAX slot H
++  it.fa = it.qks ? G.addr + b * G.stride : F.addr + b * F.stride;    // s_tok: QK_SOFTMAX slot G
+   it.ga = G.addr + b * G.stride;
+-  it.bias = (c.flags & ctr::F_BIAS) != 0;
++  it.bias = (c.flags & ctr::F_BIAS) != 0;  // F_BIAS (0x20) is not a QK_SOFTMAX flag (validate)
++  it.mask = it.qks && (c.flags & ctr::F_MASK) != 0;
++  it.qa = D.addr + b * D.stride;
++  it.ka = E.addr + b * E.stride;
++  if (it.qks) it.addd = false;  // slot D is rank_q
+   it.N = (int)c.N;
+   it.K = (int)c.K;
+   it.groups = (int)(c.M / LANES);
+@@ -609,6 +681,51 @@
+   it.ntiles = (it.nblk + NBX - 1) / NBX;
+   it.nch = (int)((c.K + CK - 1) / CK);
+   return it;
++}
++
++// OP_QK_SOFTMAX: the softmax side of item b (smx::Params as smx::make_params builds it for one item; B = 0 for a
++// GEMM command, so smx::compute runs no iteration).
++static inline qks::Tail plan_tail(const Item& it, const ctr::Cmd& c) {
++#pragma HLS INLINE
++  qks::Tail tl;
++  tl.on = it.qks;
++  tl.mask = it.mask;
++  tl.N = it.N;
++  tl.G = it.groups;
++  tl.ntiles = it.ntiles;
++  tl.W = (int)(c.M >> 2);
++  return tl;
++}
++static inline smx::Params plan_smx(const ctr::Cmd& c, uint64_t b, bool qks_on) {
++#pragma HLS INLINE
++  smx::Params p;
++  const ctr::Slot &Cs = c.s[ctr::SLOT_C], &F = c.s[ctr::SLOT_F];
++  const uint32_t np = c.p[ctr::P_NP] ? c.p[ctr::P_NP] : c.N;
++  p.B = qks_on ? 1 : 0;
++  p.N = c.N;
++  p.NP = np;
++  p.NP4 = (np + 3) & ~3u;
++  p.W = c.M >> 2;
++  p.W2 = c.M >> 3;
++  p.mask = (c.flags & ctr::F_MASK) != 0;
++  ap_int<10> ec;
++  smx::c_params(c.p[ctr::P_EPS], p.mc, ec);
++  p.kc = (ap_int<11>)153 - (ap_int<11>)ec;
++  p.a = 0;
++  p.d = 0;
++  p.e = 0;
++  p.c = (smx::WAddr)((Cs.addr + b * Cs.stride) >> 4);
++  p.f = (smx::WAddr)((F.addr + b * F.stride) >> 4);
++  p.ap = 0;
++  p.cp = Cs.pitch >> 4;
++  p.as = 0;
++  p.cs = 0;
++  p.ds = 0;
++  p.es = 0;
++  p.fs = 0;
++  p.a_contig = false;
++  p.c_contig = p.cp == p.W2;
++  return p;
+ }
+ 
+ // The unit: one command (validate_hw passed: Mp 32..8192 % 32, K 8..4096 % 8, N, B 1..65535, slots aligned,
+@@ -622,7 +739,7 @@
+   for (uint32_t b = 0; b < c.B; b++) {
+ #pragma HLS LOOP_TRIPCOUNT min = 1 max = 24
+     const Item it = plan_item(c, b);
+-    gemm_item(hp0, hp1, hp2, hp3, io_rd, io_wr, it);
++    gemm_item(hp0, hp1, hp2, hp3, io_rd, io_wr, it, plan_tail(it, c), plan_smx(c, b, it.qks));
+   }
+   return ctr::ME_OK;
+ }
+--- /dev/null
++++ b/fpga/hls/qks_tail.h
+@@ -0,0 +1,339 @@
++// Phase-B fusion qk_softmax: the tail of the GEMM unit's DATAFLOW region for OP_QK_SOFTMAX (contract_qks.h).
++//
++//   ... compute16 -> dequant_ep --ss--> sbuf --sxs/smx--> smx::compute --eq/sq--> smx::divider --rq--> store
++//                    load_io  --rs--> sbuf (rank_k once per item, rank_q per tile; F_MASK only)
++//
++// dequant_ep is the GEMM's own (4 FP32 per clock, the contract epilogue without bias / D), so every score is the
++// unfused GEMM's FP32 value bit for bit. smx::compute and smx::divider are the SOFTMAX unit's processes
++// (fpga/kernels/softmax/softmax_core.h), unchanged: they get the rows in the order and the stream format the
++// SOFTMAX unit's reader gives them (per real row: the row max bits on smx, then L/4 words + 4 visibility bits on
++// sxs). So P and the scales are the unfused pair's bit for bit, and the tail adds no DSP: the only arithmetic of
++// sbuf is the visibility compare and the row max (integer compares on FP32 total-order keys).
++//
++// sbuf: one process, one flat II = 1 loop with two sides (as int16_linear.h's xpose):
++//   fill   takes the dequantizer's words in the engine's order (tile t, group g, block b, token, 8 words of 4
++//          keys), computes the 4 visibility bits (rank_k of the 4 keys, rank_q of the row: 0 <= E[k] <= D[n]),
++//          writes (bits, word) to the score buffer at [half][row][g * 8 + w], and keeps each row's running max
++//          over the visible keys (33-bit key: visible, FP32 total order) in rmax[half][row];
++//   drain  sends tile t's rows once the whole tile is in: per row the max bits, then the row's L/4 words.
++// The score buffer holds two tiles (ping-pong): 2 x NTT rows x 64 words of 132 bits (2 x 64 KB of scores at
++// NTT = 64, L = 256), URAM. Fill of tile t + 1 overlaps the drain (and the softmax) of tile t.
++// Handshakes between the sides go through SB_SETTLE-clock delay lines (the buffer's write-to-read distance),
++// so no decision depends on the other side's state of the same clock.
++// The drain writes with blocking writes (a full sxs / smx stalls the loop; their consumer, smx::compute, never
++// waits on sbuf's fill side, so the stall ends); the fill side reads ss and rs non-blocking.
++#pragma once
++#include <ap_int.h>
++#include <hls_stream.h>
++#include <stdint.h>
++
++#include "../kernels/softmax/softmax_core.h"
++#include "int16_linear.h"
++
++namespace qks {
++
++using fstream::IoWord;
++using fstream16::Fifo16;
++using fstream16::NTT;
++using fstream16::TB;
++
++typedef smx::Word AWord;  // ap_uint<128>
++typedef smx::XW XW;       // ap_uint<132>: 4 FP32 + 4 visibility bits
++typedef smx::Key Key;     // ap_uint<33>
++
++constexpr int WROW = smx::W_MAX;  // buffer words per row (64: L <= 256)
++constexpr int SB_SETTLE = 8;      // clocks between a side's last access of a half and the other side's first
++constexpr int RQW = NTT / 4;      // rank_q words per tile
++#ifdef __VITIS_HLS__
++typedef ap_uint<2> occ2_t;  // 0..2 halves
++#else
++typedef uint8_t occ2_t;
++#endif
++
++// ---------------------------------------------------------------- IoWord <-> ap_uint<128> (same bytes)
++#ifdef __VITIS_HLS__
++static inline AWord io2a(const IoWord& w) {
++#pragma HLS INLINE
++  return (AWord)w;
++}
++static inline IoWord a2io(const AWord& w) {
++#pragma HLS INLINE
++  return (IoWord)w;
++}
++template <class W>
++static inline W a2w(const AWord& a) {
++#pragma HLS INLINE
++  return (W)a;
++}
++#else
++static inline AWord io2a(const IoWord& w) {
++  AWord a = 0;
++  for (int j = 0; j < 4; j++) {
++    uint32_t u;
++    memcpy(&u, &w.v[j], 4);
++    a.range(32 * j + 31, 32 * j) = u;
++  }
++  return a;
++}
++static inline IoWord a2io(const AWord& a) {
++  IoWord w;
++  for (int j = 0; j < 4; j++) {
++    const uint32_t u = (uint32_t)a.range(32 * j + 31, 32 * j);
++    memcpy(&w.v[j], &u, 4);
++  }
++  return w;
++}
++template <class W>
++static inline W a2w(const AWord& a) {
++  static_assert(sizeof(W) == 16, "io words are 128 bits");
++  const IoWord w = a2io(a);
++  W r;
++  memcpy(&r, &w, 16);
++  return r;
++}
++#endif
++
++// ---------------------------------------------------------------- the softmax side of one item
++struct Tail {
++  bool on;            // OP_QK_SOFTMAX (else every tail process runs zero iterations)
++  bool mask;          // F_MASK
++  int N, G, ntiles;   // rows, key groups of 32 (L = 32 G), engine tiles of NTT rows
++  int W;              // L / 4: words per row
++};
++
++// ---------------------------------------------------------------- sbuf
++static void sbuf(Fifo16<IoWord>& ss, Fifo16<IoWord>& rs, smx::XStream& sxs, smx::MStream& smx_s, const Tail tl) {
++  if (!tl.on) return;
++  XW sb[2 * NTT * WROW];  // [half][row][word]
++#pragma HLS BIND_STORAGE variable = sb type = ram_s2p impl = uram
++  Key rmax[2 * NTT];  // [half][row]: running max key of the row over the groups filled so far
++#pragma HLS BIND_STORAGE variable = rmax type = ram_1wnr impl = lutram
++  AWord etab[WROW];  // rank_k of keys 4i..4i+3
++#pragma HLS BIND_STORAGE variable = etab type = ram_s2p impl = lutram
++  AWord rqt[RQW];  // rank_q of the fill tile's rows 4i..4i+3
++#pragma HLS BIND_STORAGE variable = rqt type = ram_s2p impl = lutram
++  if (tl.mask) {
++  rk_in:
++    for (int i = 0; i < tl.W; i++) {
++#pragma HLS PIPELINE II = 1
++#pragma HLS LOOP_TRIPCOUNT min = 8 max = 64
++      etab[i] = io2a(rs.read());
++    }
++  }
++  const int last_m1 = tl.N - (tl.ntiles - 1) * NTT - 1;  // rows of the last tile, minus one
++  // fill side: half, group, block, token, word; the rank_q words still to read for this tile
++  int fg = 0, fb = 0, ftok = 0, fw = 0, frq = tl.mask ? RQW : 0;
++  bool fh = false;
++  int fleft = tl.ntiles - 1;                         // tiles after the fill tile
++  bool fmore = true;                                 // a tile is left to fill
++  int fnv_m1 = fleft == 0 ? last_m1 : NTT - 1;       // rows of the fill tile, minus one
++  int fvb_m1 = fnv_m1 < TB ? fnv_m1 : TB - 1;        // tokens of block fb, minus one
++  Key pm = 0;                                        // the row's max over the words of this group so far
++  // drain side: half, row, word (0: the max, 1..W: data)
++  int drow = 0, dw = 0;
++  bool dh = false;
++  int dleft = tl.ntiles - 1;                         // tiles after the drain tile
++  bool done = false;                                 // the last tile is drained
++  int dnv_m1 = fnv_m1;
++  // 2-bit occupancy counters, not differences of tile counters (as xpose's wbusy / ravail): halves the fill side
++  // holds (filled, their drain not yet seen), and halves the drain side sees filled and has not drained
++  occ2_t ffull = 0, davail = 0;
++  bool fdl[SB_SETTLE], ddl[SB_SETTLE];
++#pragma HLS ARRAY_PARTITION variable = fdl complete
++#pragma HLS ARRAY_PARTITION variable = ddl complete
++  for (int i = 0; i < SB_SETTLE; i++) {
++#pragma HLS UNROLL
++    fdl[i] = false;
++    ddl[i] = false;
++  }
++#ifndef __SYNTHESIS__
++  long idle = 0;  // host model: the processes run one after the other, so a long idle run means a lost word
++#endif
++sbuf_main:
++  while (true) {
++#pragma HLS PIPELINE II = 1
++#pragma HLS DEPENDENCE variable = sb inter false
++#pragma HLS DEPENDENCE variable = sb intra false
++#pragma HLS DEPENDENCE variable = rmax inter false
++#pragma HLS DEPENDENCE variable = rmax intra false
++#pragma HLS LOOP_TRIPCOUNT min = 64 max = 1048576
++    const bool fin = done;  // registered state; the exit is taken at the end of the body
++    // ---------------- fill side
++    bool ffin = false;
++#ifndef __SYNTHESIS__
++    bool prog = false;
++#endif
++    const bool fgo = fmore && ffull != 2;  // the fill tile's half is free (ffull <= 1: the full one is the other)
++    if (fgo && frq > 0) {  // rank_q of the fill tile's rows (F_MASK)
++      IoWord v;
++      if (rs.read_nb(v)) {
++#ifndef __SYNTHESIS__
++        prog = true;
++#endif
++        rqt[RQW - frq] = io2a(v);
++        frq--;
++      }
++    } else if (fgo) {
++      IoWord v;
++      if (ss.read_nb(v)) {
++#ifndef __SYNTHESIS__
++        prog = true;
++#endif
++        const AWord a = io2a(v);
++        const int row = fb * TB + ftok;
++        const int wi = fg * 8 + fw;
++        const AWord ev = etab[wi];
++        const AWord dwd = rqt[row >> 2];
++        const ap_uint<2> nl = row & 3;
++        const ap_uint<32> dv = nl == 0 ? smx::lane32(dwd, 0) : nl == 1 ? smx::lane32(dwd, 1)
++                             : nl == 2 ? smx::lane32(dwd, 2) : smx::lane32(dwd, 3);
++        ap_uint<4> vis;
++        Key k[4];
++        for (int l = 0; l < 4; l++) {
++#pragma HLS UNROLL
++          // 0 <= E <= D in int32: D >= 0 and E <= D as unsigned (a negative E is >= 2^31 unsigned)
++          vis[l] = !tl.mask || (!dv[31] && smx::lane32(ev, l) <= dv);
++          k[l] = smx::okey(smx::lane32(a, l), vis[l]);
++        }
++        const int ra = (fh ? NTT : 0) + row;
++        sb[ra * WROW + wi] = ((XW)vis << 128) | (XW)a;
++        const Key k01 = k[1] > k[0] ? k[1] : k[0], k23 = k[3] > k[2] ? k[3] : k[2];
++        const Key k4 = k23 > k01 ? k23 : k01;
++        // running max of the row's 8 words of group fg (key 0 is below every key), then folded into rmax
++        const Key pin = fw == 0 ? (Key)0 : pm;
++        const Key cur = k4 > pin ? k4 : pin;
++        pm = cur;
++        if (fw == 7) {  // the row's 32 keys of group fg are in (rmax[ra] was last written >= 8 words ago)
++          const Key stored = fg == 0 ? (Key)0 : rmax[ra];
++          rmax[ra] = cur > stored ? cur : stored;
++        }
++        // advance (word, token, block, group, tile)
++        if (fw == 7) {
++          fw = 0;
++          if (ftok == fvb_m1) {
++            ftok = 0;
++            const int rest_m1 = fnv_m1 - (fb + 1) * TB;  // tokens of block fb + 1, minus one (< 0: none)
++            if (rest_m1 >= 0) {
++              fb++;
++              fvb_m1 = rest_m1 < TB ? rest_m1 : TB - 1;
++            } else {
++              fb = 0;
++              if (fg == tl.G - 1) {
++                fg = 0;
++                ffin = true;
++              } else {
++                fg++;
++                fvb_m1 = fnv_m1 < TB ? fnv_m1 : TB - 1;
++              }
++            }
++          } else {
++            ftok++;
++          }
++        } else {
++          fw++;
++        }
++      }
++    }
++    if (ffin) {
++      fh = !fh;
++      frq = tl.mask ? RQW : 0;
++      fmore = fleft != 0;
++      fnv_m1 = fleft == 1 ? last_m1 : NTT - 1;
++      fvb_m1 = fnv_m1 < TB ? fnv_m1 : TB - 1;
++      fleft--;
++    }
++    // ---------------- drain side (blocking writes: smx::compute takes one word per clock)
++    bool dfin = false;
++    if (davail != 0) {
++#ifndef __SYNTHESIS__
++      prog = true;
++#endif
++      const int ra = (dh ? NTT : 0) + drow;
++      if (dw == 0) {
++        smx_s.write(smx::key_bits(rmax[ra]));
++      } else {
++        sxs.write(sb[ra * WROW + (dw - 1)]);
++      }
++      if (dw == tl.W) {
++        dw = 0;
++        if (drow == dnv_m1) {
++          drow = 0;
++          dfin = true;
++        } else {
++          drow++;
++        }
++      } else {
++        dw++;
++      }
++    }
++    if (dfin) {
++      dh = !dh;
++      done = dleft == 0;
++      dnv_m1 = dleft == 1 ? last_m1 : NTT - 1;
++      dleft--;
++    }
++    // ---------------- handshakes, SB_SETTLE clocks late
++    const bool fseen_ev = fdl[SB_SETTLE - 1], dseen_ev = ddl[SB_SETTLE - 1];
++    if (ffin && !dseen_ev) ffull++;
++    if (!ffin && dseen_ev) ffull--;
++    if (fseen_ev && !dfin) davail++;
++    if (!fseen_ev && dfin) davail--;
++    for (int i = SB_SETTLE - 1; i > 0; i--) {
++#pragma HLS UNROLL
++      fdl[i] = fdl[i - 1];
++      ddl[i] = ddl[i - 1];
++    }
++    fdl[0] = ffin;
++    ddl[0] = dfin;
++#ifndef __SYNTHESIS__
++    idle = prog ? 0 : idle + 1;
++    if (idle > 100000000L) {
++      printf("sbuf: no input for 1e8 iterations (%d tiles left to fill, %d to drain)\n", fleft + 1, dleft + 1);
++      exit(9);
++    }
++#endif
++    if (fin) break;
++  }
++}
++
++// smx::divider reads its first sum unconditionally: a GEMM command must not start it.
++static void divider_if(smx::SStream& sq, smx::RStream& rq, const Tail tl) {
++  if (tl.on) smx::divider(sq, rq);
++}
++
++// The P / scale writer of the store process (OP_QK_SOFTMAX): smx::writer for one item. Per block of <= 256 rows:
++// the P rows (one burst when the C pitch is 2 L, else one per row), then the block's scale words (pad lanes 1.0).
++// p.c / p.f are the item's word addresses.
++template <class W>
++static inline void store_p(smx::QStream& eq, smx::RStream& rq, W* io, const smx::Params& p) {
++#pragma HLS INLINE
++  smx::WAddr rc = p.c, rf = p.f;
++blocks_p:
++  for (ap_uint<17> r0 = 0; r0 < p.NP; r0 += smx::BLK) {
++#pragma HLS LOOP_TRIPCOUNT max = 1
++    const ap_uint<17> left = p.NP - r0;
++    const ap_uint<9> rows = left > smx::BLK ? (ap_uint<9>)smx::BLK : (ap_uint<9>)left;
++    const ap_uint<7> nsw = (rows + 3) >> 2;
++    const ap_uint<9> nb = p.c_contig ? (ap_uint<9>)1 : rows;
++    const ap_uint<14> nw = p.c_contig ? (ap_uint<14>)(rows * p.W2) : (ap_uint<14>)p.W2;
++    const ap_uint<28> step = p.c_contig ? (ap_uint<28>)((ap_uint<28>)p.W2 << 8) : p.cp;
++  bursts_p:
++    for (ap_uint<9> j = 0; j <= nb; j++) {
++#pragma HLS LOOP_TRIPCOUNT max = 2
++      const bool sc = j == nb;
++      const smx::WAddr base = sc ? rf : rc;
++      const ap_uint<14> len = sc ? (ap_uint<14>)nsw : nw;
++    words_p:
++      for (ap_uint<14> i = 0; i < len; i++) {
++#pragma HLS PIPELINE II = 1
++#pragma HLS LOOP_FLATTEN off
++#pragma HLS LOOP_TRIPCOUNT max = 8192
++        io[(uint64_t)(base + i)] = a2w<W>(sc ? rq.read() : eq.read());
++      }
++      if (!sc) rc += step;
++    }
++    rf += smx::BLK / 4;
++  }
++}
++
++}  // namespace qks
+--- a/fpga/hls/float_seq.h
++++ b/fpga/hls/float_seq.h
+@@ -1,11 +1,14 @@
+ // The integrated float_top (-DFSTREAM_ARITH=16 -DFSTREAM_SEQ=1): the sequencer's command walk as the body
+ // (fpga/kernels/sequencer/seq_core.h, CONTRACT.md 3 and E-9), dispatching every record to its unit:
+-//   GEMM                          fgemm::gemm_unit (gemm_contract.h: the int16 engine behind the contract record)
++//   GEMM, QK_SOFTMAX              fgemm::gemm_unit (gemm_contract.h: the int16 engine behind the contract record;
++//                                 QK_SOFTMAX adds the score buffer and the softmax arithmetic, qks_tail.h)
+ //   QUANT_X / QUANT_W / QUANT_WT / COPY   qz::row_mode            (fpga/kernels/quantize/quant_mode.h)
+ //   NORM                          nr::norm_mode                    (fpga/kernels/norm_residual/norm_residual.h)
+ //   GELU / SILU_MUL               gs::act_mode                     (fpga/kernels/gelu_silu/gelu_silu.h)
+ //   ROPE                          rope::rope_mode                  (fpga/kernels/rope/rope_mode.h)
+-//   SOFTMAX                       smx::softmax_mode                (fpga/kernels/softmax/softmax_core.h)
++//   SOFTMAX                       smx::softmax_mode                (fpga/kernels/softmax/softmax_core.h), only with
++//                                 -DFSEQ_SOFTMAX_UNIT=1 (bring-up builds); else ME_UNIT: the list builder
++//                                 emits QK_SOFTMAX, whose softmax processes live in the GEMM unit
+ // Every mode function has exactly one call site (below) and is INLINE off: one hardware instance each. The row ops
+ // are four mode functions, not yet the contract's one shared row unit (CONTRACT.md 4.1): each carries its own
+ // reader / quantizer / writer (the kernels' state on 2026-11-21).
+@@ -25,6 +28,10 @@
+ #include "../kernels/gelu_silu/gelu_silu.h"
+ #include "../kernels/rope/rope_mode.h"
+ #include "../kernels/softmax/softmax_core.h"
++
++#ifndef FSEQ_SOFTMAX_UNIT
++#define FSEQ_SOFTMAX_UNIT 0  // phase B qk_softmax: the standalone SOFTMAX unit is not built
++#endif
+ 
+ namespace fseq {
+ 
+@@ -81,7 +88,14 @@
+   template <class WP, class WW>
+   static uint32_t softmax(const ctr::Cmd& c, const WP*, const WP*, const WP*, const WP*, const WW* io_rd, WW* io_wr) {
+ #pragma HLS INLINE
++#if FSEQ_SOFTMAX_UNIT
+     return smx::softmax_mode(c, kw(io_rd), kw(io_wr));
++#else
++    (void)c;
++    (void)io_rd;
++    (void)io_wr;
++    return ctr::ME_UNIT;  // no SOFTMAX unit in this build (nothing is touched)
++#endif
+   }
+ };
+ 
+--- a/fpga/kernels/contract.h
++++ b/fpga/kernels/contract.h
+@@ -45,8 +45,8 @@
+ constexpr uint32_t SLOT_D = 3;  // GEMM addend rows / SOFTMAX rank_q
+ constexpr uint32_t SLOT_E = 4;  // GEMM s_row / NORM gamma,beta / ROPE table / SOFTMAX rank_k
+ constexpr uint32_t SLOT_F = 5;  // scales: GEMM s_tok in, q-out scales out
+-constexpr uint32_t SLOT_G = 6;  // GEMM bias
+-constexpr uint32_t SLOT_H = 7;  // unused in 1.0 (must be 0)
++constexpr uint32_t SLOT_G = 6;  // GEMM bias / QK_SOFTMAX s_tok of Q
++constexpr uint32_t SLOT_H = 7;  // QK_SOFTMAX s_row of K (unused by every other opcode: must be 0)
+ 
+ // parameter indices (p<i> = field PARAM_BASE + i)
+ constexpr uint32_t P_EPS = 0;     // NORM: eps, FP32 bits.  SOFTMAX: score multiplier, FP32 bits
+@@ -94,6 +94,8 @@
+ constexpr uint32_t OP_QUANT_WT = 0x22;  // row unit: FP32 rows transposed -> VW weight tiling, column scales
+ constexpr uint32_t OP_NORM = 0x30;      // row unit: LayerNorm / RMSNorm (-> int16 or FP32)
+ constexpr uint32_t OP_SOFTMAX = 0x40;   // softmax unit: masked rows -> int16 P + 1/sum scale
++constexpr uint32_t OP_QK_SOFTMAX = 0x41;  // engine (GEMM unit): Q.K^T + softmax in one command -> int16 P +
++                                        // 1/sum scale; the scores stay on chip (phase B, qk_softmax)
+ constexpr uint32_t OP_GELU = 0x50;      // row unit: tanh-GELU -> int16
+ constexpr uint32_t OP_SILU_MUL = 0x51;  // row unit: SiLU(A) * B, or SiLU(A) with F_NOMUL -> int16
+ constexpr uint32_t OP_ROPE = 0x60;      // row unit: rotate (i, i+32) per 64-segment -> int16 / KW / FP32
+@@ -119,6 +121,7 @@
+ constexpr uint32_t FLAGS_ACT = F_YIELD | F_QOUT | F_NOMUL;
+ constexpr uint32_t FLAGS_ROPE = F_YIELD | F_QOUT | F_KW;
+ constexpr uint32_t FLAGS_SOFTMAX = F_YIELD | F_QOUT | F_MASK;
++constexpr uint32_t FLAGS_QKSMX = F_YIELD | F_QOUT | F_MASK;
+ constexpr uint32_t FLAGS_COPY = F_YIELD;
+ 
+ // ---------------------------------------------------------------- status codes (ap_return[7:0])
+@@ -141,6 +144,8 @@
+ constexpr uint32_t ME_FLAGS = 4;  // a flag the opcode does not take, or F_ACC with F_ADD_D
+ constexpr uint32_t ME_PARAM = 5;  // a parameter out of range, or non-zero where unused
+ constexpr uint32_t ME_SLOT = 6;   // an unused slot or reserved field not zero
++constexpr uint32_t ME_UNIT = 7;   // the opcode's unit is not in this bitstream (a fused build without the
++                                  // SOFTMAX unit returns it for OP_SOFTMAX)
+ 
+ // ---------------------------------------------------------------- limits
+ constexpr uint64_t ADDR_LIMIT = 1ull << 40;  // KR260 PS DDR: 0x0_0000_0000-0x0_7FFF_FFFF, 0x8_0000_0000-0x8_7FFF_FFFF
+@@ -158,6 +163,7 @@
+ constexpr uint32_t ROPE_SEG = 64;            // ROPE: head dim (pairs i, i + 32)
+ constexpr uint32_t ROPE_TAB_BYTES = 256;     // ROPE: table row = 32 int32 -cos + 32 int32 -sin, Q1.17
+ constexpr uint32_t SMX_L_MAX = 256;          // SOFTMAX keys per row
++constexpr uint32_t QKS_L_MAX = 256;          // QK_SOFTMAX keys per row (M): the score buffer holds 2 x 64 rows
+ constexpr uint32_t SHIFT_MAX = 8;            // |p4|
+ 
+ // ---------------------------------------------------------------- arithmetic constants
+@@ -199,7 +205,7 @@
+ #pragma HLS INLINE
+   return op == OP_NOP || op == OP_END || op == OP_GEMM || op == OP_QUANT_X || op == OP_QUANT_W ||
+          op == OP_QUANT_WT || op == OP_NORM || op == OP_SOFTMAX || op == OP_GELU || op == OP_SILU_MUL ||
+-         op == OP_ROPE || op == OP_COPY;
++         op == OP_ROPE || op == OP_COPY || op == OP_QK_SOFTMAX;
+ }
+ 
+ static inline uint32_t rec_check(const uint32_t f[REC_FIELDS]) {
+@@ -311,12 +317,55 @@
+   return ME_OK;
+ }
+ 
++// OP_QK_SOFTMAX (phase B, fpga/kernels/phaseB/qk_softmax): M = L keys, K = head dim; slots A Q int16 rows, B KW
++// blob, C P int16 rows, D rank_q, E rank_k (F_MASK), F P scales, G s_tok of Q, H s_row of K; p0 score
++// multiplier, p5 NP. The same rules as the GEMM and SOFTMAX branches with these slot roles.
++// validate / validate_hw of OP_QK_SOFTMAX (the same rules as the GEMM and SOFTMAX branches of validate_t,
++// with the slot roles above). FULL adds the extent checks (host).
++template <bool FULL>
++static inline uint32_t validate_qks_t(const Cmd& c) {
++  const uint64_t B = c.B, N = c.N, K = c.K, M = c.M;
++  const uint32_t* p = c.p;
++  if (c.flags & F_RETIRED) return ME_FLAGS;
++  if (c.flags & ~FLAGS_QKSMX) return ME_FLAGS;
++  if (!(c.flags & F_QOUT)) return ME_FLAGS;
++  if (N < 1 || N > N_MAX || B < 1 || B > B_MAX) return ME_DIMS;
++  if (M < ENGINE_LANES || M > QKS_L_MAX || M % ENGINE_LANES) return ME_DIMS;
++  if (K < 8 || K > GEMM_K_MAX || K % 8) return ME_DIMS;
++  const uint64_t NP = p[P_NP] ? p[P_NP] : N;
++  if (NP < N || NP > N_MAX) return ME_PARAM;
++  const float mul = u2f(p[P_EPS]);
++  if (!(mul > 0.0f && mul < 1e30f)) return ME_PARAM;
++  for (uint32_t i = 0; i < NPARAMS; i++)
++    if (i != P_EPS && i != P_NP && p[i]) return ME_PARAM;
++  uint32_t r, used = (1u << SLOT_A) | (1u << SLOT_B) | (1u << SLOT_C) | (1u << SLOT_F) | (1u << SLOT_G) |
++                     (1u << SLOT_H);
++  if ((r = check_slot<FULL>(c.s[SLOT_A], B, N, 2 * K, 2 * K, false))) return r;
++  const uint64_t port_bytes = (M / ENGINE_LANES) * K * 16;
++  if (!slot_aligned(c.s[SLOT_B])) return ME_ALIGN;
++  if (c.s[SLOT_B].pitch < port_bytes) return ME_ALIGN;
++  if (c.s[SLOT_B].addr >= ADDR_LIMIT || (FULL && slot_end(c.s[SLOT_B], B, ENGINE_PORTS, port_bytes) > ADDR_LIMIT))
++    return ME_ADDR;
++  if ((r = check_slot<FULL>(c.s[SLOT_C], B, NP, 2 * M, 2 * M, false))) return r;
++  if ((r = check_slot<FULL>(c.s[SLOT_F], B, 1, 4 * pad4((uint32_t)NP), 0, true))) return r;
++  if ((r = check_slot<FULL>(c.s[SLOT_G], B, 1, 4 * pad4(c.N), 0, true))) return r;
++  if ((r = check_slot<FULL>(c.s[SLOT_H], B, 1, 4 * M, 0, true))) return r;
++  if (c.flags & F_MASK) {
++    used |= (1u << SLOT_D) | (1u << SLOT_E);
++    if ((r = check_slot<FULL>(c.s[SLOT_D], B, 1, 4 * pad4(c.N), 0, true))) return r;
++    if ((r = check_slot<FULL>(c.s[SLOT_E], B, 1, 4 * M, 0, true))) return r;
++  }
++  for (uint32_t s = 0; s < NSLOTS; s++)
++    if (!(used & (1u << s)) && !slot_zero(c.s[s])) return ME_SLOT;
++  return ME_OK;
++}
+ template <bool FULL>
+ static inline uint32_t validate_t(const Cmd& c) {
+   const uint64_t B = c.B, N = c.N, K = c.K, M = c.M;
+   uint32_t allowed = 0, used = 0;  // flags allowed, slots used (bit s)
+   const uint32_t* p = c.p;
+   if (c.flags & F_RETIRED) return ME_FLAGS;
++  if (c.op == OP_QK_SOFTMAX) return validate_qks_t<FULL>(c);
+   if (c.op == OP_NOP || c.op == OP_END) {
+     allowed = F_YIELD;
+   } else if (c.op == OP_GEMM) {
+--- a/fpga/kernels/contract.py
++++ b/fpga/kernels/contract.py
+@@ -222,6 +222,7 @@
+         C.OP_SILU_MUL: C.FLAGS_ACT,
+         C.OP_ROPE: C.FLAGS_ROPE,
+         C.OP_SOFTMAX: C.FLAGS_SOFTMAX,
++        C.OP_QK_SOFTMAX: C.FLAGS_QKSMX,
+         C.OP_COPY: C.FLAGS_COPY,
+     }.get(c.op, 0)
+     if c.flags & ~allowed:
+@@ -270,6 +271,41 @@
+         if bias:
+             used.add("G")
+             if r := _check_slot(S["G"], B, 1, 4 * M, 0, True, full):
++                return r
++    elif c.op == C.OP_QK_SOFTMAX:  # = ctr::validate_qks_t (phase B)
++        if not c.flags & C.F_QOUT:
++            return C.ME_FLAGS
++        if M < C.ENGINE_LANES or M > C.QKS_L_MAX or M % C.ENGINE_LANES or K < 8 or K > C.GEMM_K_MAX or K % 8:
++            return C.ME_DIMS
++        NP = p[C.P_NP] or N
++        if NP < N or NP > C.N_MAX:
++            return C.ME_PARAM
++        mul = bits_f32(p[C.P_EPS])
++        if not (0.0 < mul < 1e30):
++            return C.ME_PARAM
++        if any(v for i, v in enumerate(p) if i not in (C.P_EPS, C.P_NP)):
++            return C.ME_PARAM
++        used = {"A", "B", "C", "F", "G", "H"}
++        if r := _check_slot(S["A"], B, N, 2 * K, 2 * K, False, full):
++            return r
++        port = (M // C.ENGINE_LANES) * K * 16
++        if not _aligned(S["B"]) or S["B"].pitch < port:
++            return C.ME_ALIGN
++        if S["B"].addr >= C.ADDR_LIMIT or (full and _end(S["B"], B, C.ENGINE_PORTS, port) > C.ADDR_LIMIT):
++            return C.ME_ADDR
++        for r in (
++            _check_slot(S["C"], B, NP, 2 * M, 2 * M, False, full),
++            _check_slot(S["F"], B, 1, 4 * pad4(NP), 0, True, full),
++            _check_slot(S["G"], B, 1, 4 * pad4(N), 0, True, full),
++            _check_slot(S["H"], B, 1, 4 * M, 0, True, full),
++        ):
++            if r:
++                return r
++        if c.flags & C.F_MASK:
++            used |= {"D", "E"}
++            if r := _check_slot(S["D"], B, 1, 4 * pad4(N), 0, True, full):
++                return r
++            if r := _check_slot(S["E"], B, 1, 4 * M, 0, True, full):
+                 return r
+     elif c.op == C.OP_SOFTMAX:
+         if K < 8 or K > C.SMX_L_MAX or K % 8:
+@@ -781,6 +817,56 @@
+             ),
+         )
+     )
++    qks = Cmd(  # QK_SOFTMAX (phase B): the expert self-attention shape
++        C.OP_QK_SOFTMAX,
++        C.F_QOUT | C.F_MASK,
++        11,
++        128,
++        64,
++        156,
++        5,
++        {
++            "A": Slot(0x7B00_0000, 128, 156 * 128),
++            "B": Slot(0x7C00_0000, 4 * 64 * 16, 4 * 4 * 64 * 16),
++            "C": Slot(0x7D00_0000, 256, 156 * 256),
++            "D": Slot(0x7E00_0000),
++            "E": Slot(0x7E00_1000),
++            "F": Slot(0x7E00_2000, 0, 624),
++            "G": Slot(0x7E00_4000, 0, 624),
++            "H": Slot(0x7E00_6000, 0, 512),
++        },
++        {C.P_EPS: f32bits(1.0)},
++    )
++
++    def qv(name, **kw):
++        s = dict(qks.s) | kw.pop("s", {})
++        for k in kw.pop("drop", ()):
++            s.pop(k)
++        out.append((name, Cmd(qks.op, kw.pop("flags", qks.flags), 11, kw.pop("M", 128), kw.pop("K", 64),
++                              kw.pop("N", 156), 5, s, kw.pop("p", dict(qks.p)))))
++
++    qv("qks_ok")
++    qv("qks_vision_ok", flags=C.F_QOUT, drop=("D", "E"), M=256, N=256,
++       s={"A": Slot(0x7B00_0000, 128, 256 * 128), "B": Slot(0x7C00_0000, 8 * 64 * 16, 4 * 8 * 64 * 16),
++          "C": Slot(0x7D00_0000, 512, 256 * 512), "F": Slot(0x7E00_2000, 0, 1024), "G": Slot(0x7E00_4000, 0, 1024),
++          "H": Slot(0x7E00_6000, 0, 1024)})
++    qv("qks_np_ok", p={C.P_EPS: f32bits(1.0), C.P_NP: 160})
++    qv("qks_m288", M=288)
++    qv("qks_m48", M=48)
++    qv("qks_k81", K=81)
++    qv("qks_noqout", flags=C.F_MASK)
++    qv("qks_bias_flag", flags=C.F_QOUT | C.F_MASK | C.F_BIAS)
++    qv("qks_retired_flag", flags=C.F_QOUT | C.F_MASK | 0x1000)
++    qv("qks_np_lt_n", p={C.P_EPS: f32bits(1.0), C.P_NP: 100})
++    qv("qks_p0_zero", p={})
++    qv("qks_p2_set", p={C.P_EPS: f32bits(1.0), C.P_SEGC: 4})
++    qv("qks_short_c_pitch", s={"C": Slot(0x7D00_0000, 128, 156 * 256)})
++    qv("qks_short_port", s={"B": Slot(0x7C00_0000, 2048, 4 * 4 * 64 * 16)})
++    qv("qks_unaligned_h", s={"H": Slot(0x7E00_6008, 0, 512)})
++    qv("qks_h_past_40bit", s={"H": Slot((1 << 40) - 2048, 0, 512)})
++    qv("qks_h_bit40", s={"H": Slot(1 << 40, 0, 0)})
++    qv("qks_stray_d", flags=C.F_QOUT)
++    qv("qks_unaligned_e", s={"E": Slot(0x7E00_1004)})
+     return out
+ 
+ 
+@@ -796,6 +882,11 @@
+     "softmax_l264": "DIMS", "softmax_fp32out": "FLAGS", "rope_q": "OK", "rope_seg32": "DIMS",
+     "rope_kw_and_q": "FLAGS", "silu_mul": "OK", "silu_nomul_stray_b": "SLOT", "copy_shuffle": "OK",
+     "copy_flag_q": "FLAGS", "gelu_n0": "DIMS", "gelu_n65536": "DIMS",
++    "qks_ok": "OK", "qks_vision_ok": "OK", "qks_np_ok": "OK", "qks_m288": "DIMS", "qks_m48": "DIMS",
++    "qks_k81": "DIMS", "qks_noqout": "FLAGS", "qks_bias_flag": "FLAGS", "qks_retired_flag": "FLAGS",
++    "qks_np_lt_n": "PARAM", "qks_p0_zero": "PARAM", "qks_p2_set": "PARAM", "qks_short_c_pitch": "ALIGN",
++    "qks_short_port": "ALIGN", "qks_unaligned_h": "ALIGN", "qks_h_past_40bit": "ADDR", "qks_h_bit40": "ADDR",
++    "qks_stray_d": "SLOT", "qks_unaligned_e": "ALIGN",
+ }  # fmt: skip
+ 
+ 
+--- a/fpga/kernels/contract_plan.py
++++ b/fpga/kernels/contract_plan.py
+@@ -871,6 +871,8 @@
+         P.gemm("a_out+euler", W["a_out"], X, 2 * E_D, TQ_E, x_t, 4 * A_D, sX, bias=True, acc=True)
+     P.phase = "end"
+     P.add(Cmd(C.OP_END), "end")
++    if OPT.get("fuse_qk"):
++        P.cmds = fuse_qk_softmax(P.cmds)
+     P.layout = {"status": status, "x_t": x_t, "arena_end": arena_end, "regions": m.regions}  # type: ignore[attr-defined]
+     return P
+ 
+@@ -885,6 +887,7 @@
+ OPT = {
+     "nbx": 2,
+     "item_fixed": None,
++    "fuse_qk": False,
+ }  # --nbx, --item-overhead (engine change E-7: items inside one DATAFLOW run)
+ 
+ 
+@@ -916,6 +919,8 @@
+         clk += max(c.B - 2, 0) * gemm_item_clocks(c.M, c.K, c.N, ddr_bpc, d, False)
+         byts = c.B * (2 * c.M * c.K + 2 * c.N * c.K + 4 * c.N * c.M * (2 if d else 1))
+         return SEQ_FETCH + clk, byts
++    if c.op == C.OP_QK_SOFTMAX:
++        return qks_cmd_clocks(c, ddr_bpc)
+     if c.op == C.OP_SOFTMAX:
+         L = c.K
+         per = max(L / 4, SMX_DIV, L / 8) + 2
+@@ -933,6 +938,81 @@
+     rows = N * per + (np_ - N) * wr
+     byts = int(c.B * (N * rd * 16 * passes + np_ * wr * 16))
+     return SEQ_FETCH + ROW_C0 + c.B * (ROW_ITEM + rows), byts
++
++
++# ---------------------------------------------------------------- phase B: QK_SOFTMAX (fpga/kernels/phaseB/qk_softmax)
++def fuse_qk_softmax(cmds: list[Cmd]) -> list[Cmd]:
++    """Every (GEMM "qk", SOFTMAX) pair -> one QK_SOFTMAX record: A, B of the GEMM (Q rows, KW blob); C, D, E, F of
++    the SOFTMAX (P rows, rank_q, rank_k, P scales); G = the GEMM's s_tok (F), H = its s_row (E); the SOFTMAX's
++    flags and p0 / p5. The score buffer of the pair is no longer written or read. Tags are renumbered."""
++    out: list[Cmd] = []
++    i = 0
++    while i < len(cmds):
++        g = cmds[i]
++        if g.op == C.OP_GEMM and g.note.endswith(":qk"):
++            s = cmds[i + 1]
++            assert s.op == C.OP_SOFTMAX and s.note.endswith(":softmax"), (i, g.note, s.note)
++            a, y = s.slot("A"), g.slot("C")
++            assert (a.addr, a.pitch, a.stride) == (y.addr, y.pitch, y.stride), (i, a, y)
++            assert (s.K, s.N, s.B) == (g.M, g.N, g.B) and not g.flags and not g.p, (i, g, s)
++            sl = {"A": g.slot("A"), "B": g.slot("B"), "C": s.slot("C"), "F": s.slot("F"), "G": g.slot("F"),
++                  "H": g.slot("E")}
++            if s.flags & C.F_MASK:
++                sl["D"], sl["E"] = s.slot("D"), s.slot("E")
++            f = Cmd(C.OP_QK_SOFTMAX, s.flags, 0, g.M, g.K, g.N, g.B, sl, dict(s.p))
++            f.note = g.note[: -len("qk")] + "qk_softmax"
++            out.append(f)
++            i += 2
++        else:
++            out.append(cmds[i])
++            i += 1
++    for j, c in enumerate(out):
++        c.tag = j
++    return out
++
++
++QKS_TAIL = 128  # QK_SOFTMAX: after the last row, the divider (14) and the last scale burst + write response (est.)
++
++
++def qks_item_clocks(L: int, k: int, n: int, ddr_bpc: float, first: bool = True, prev_drain: float = 0.0):
++    """(clocks, drain of the last tile) of one QK_SOFTMAX item. Fill of tile t = the GEMM tile with the 4-lane
++    dequantizer as the pace (the store's Y words now go to the score buffer: no Y in the DDR term); drain of tile t
++    = its rows at smx::compute's pace (W + 1 clocks per row, W = L / 4; at least the divider's 14). Fill of tile
++    t + 1 overlaps drain of tile t (2 halves). With E-7 (item_fixed set) the next item's tile 0 also overlaps this
++    item's last drain (prev_drain)."""
++    nbx = OPT["nbx"]
++    g, nblk = L // 32, math.ceil(n / 32)
++    tiles = [min(nbx, nblk - t * nbx) for t in range(math.ceil(nblk / nbx))]
++    fixed = L0 + TAIL if first or OPT["item_fixed"] is None else OPT["item_fixed"]
++    lanes = OPT.get("qks_lanes", 4)  # dequantizer and softmax lanes (4 as built: no DSP added)
++    row = max(L // lanes + 1, SMX_DIV + 1)
++    fill, drain = [], []
++    for t, nbt in enumerate(tiles):
++        nxt = tiles[t + 1] if t + 1 < len(tiles) else 0
++        blk = YW_BLK * 4 // lanes  # clocks per 32 x 32 block at the dequantizer
++        fill.append(max(g * nbt * max(k, blk, EMIT), g * k, (64 * g * k + 64 * nxt * k) / ddr_bpc, 4 * nxt * k))
++        drain.append(min(32 * nbt, n - 32 * nbx * t) * row)
++    total = fixed + 4 * tiles[0] * k + max(fill[0], prev_drain)
++    for t in range(1, len(tiles)):
++        total += max(fill[t], drain[t - 1])
++    return total, drain[-1]
++
++
++def qks_cmd_clocks(c: Cmd, ddr_bpc: float) -> tuple[float, int]:
++    L, n = c.M, c.N
++    e7 = OPT["item_fixed"] is not None
++    clk, prev = 0.0, 0.0
++    for b in range(c.B):
++        t, d = qks_item_clocks(L, c.K, n, ddr_bpc, b == 0, prev if e7 else 0.0)
++        clk += t if e7 else t + d
++        prev = d
++    if e7:
++        clk += prev  # the last item's drain
++    clk += QKS_TAIL * (1 if e7 else c.B)
++    np_ = c.par(C.P_NP) or n
++    byts = c.B * (2 * L * c.K + 2 * n * c.K + 2 * np_ * L + 4 * pad4(np_) + 4 * pad4(n) + 4 * L
++                  + (4 * pad4(n) + 4 * L if c.flags & C.F_MASK else 0))
++    return SEQ_FETCH + clk, byts
+ 
+ 
+ def report(P: Plan, mhz: float, ddr_gbs: float, arm_ms: float, link_ms: float) -> dict:
+@@ -979,8 +1059,9 @@
+     ap.add_argument("--json", type=Path)
+     ap.add_argument("--nbx", type=int, default=2, help="engine blocks per tile (1: no weight re-use)")
+     ap.add_argument("--item-overhead", type=int, help="clocks per extra GEMM item (default: a full call)")
++    ap.add_argument("--fuse-qk", action="store_true", help="phase B: (GEMM qk, SOFTMAX) -> QK_SOFTMAX")
+     a = ap.parse_args()
+-    OPT["nbx"], OPT["item_fixed"] = a.nbx, a.item_overhead
++    OPT["nbx"], OPT["item_fixed"], OPT["fuse_qk"] = a.nbx, a.item_overhead, a.fuse_qk
+     P = build(a.base)
+     bad = validate_list(P.cmds)
+     for i, r in bad[:20]:
+--- a/fpga/kernels/sequencer/seq_core.h
++++ b/fpga/kernels/sequencer/seq_core.h
+@@ -126,6 +126,7 @@
+ static inline uint32_t unit_of(uint32_t op) {
+ #pragma HLS INLINE
+   if (op == ctr::OP_GEMM) return U_GEMM;
++  if (op == ctr::OP_QK_SOFTMAX) return U_GEMM;  // phase B: the GEMM unit runs Q.K^T + softmax
+   if (op == ctr::OP_SOFTMAX) return U_SMX;
+   if (op == ctr::OP_QUANT_X || op == ctr::OP_QUANT_W || op == ctr::OP_QUANT_WT || op == ctr::OP_NORM ||
+       op == ctr::OP_GELU || op == ctr::OP_SILU_MUL || op == ctr::OP_ROPE || op == ctr::OP_COPY)
+--- a/fpga/kernels/sequencer/exec_ref.py
++++ b/fpga/kernels/sequencer/exec_ref.py
+@@ -59,7 +59,7 @@
+ 
+ 
+ def unit_of(op: int) -> int:
+-    if op == C.OP_GEMM:
++    if op == C.OP_GEMM or op == getattr(C, "OP_QK_SOFTMAX", -1):
+         return U_GEMM
+     if op == C.OP_SOFTMAX:
+         return U_SMX
+@@ -426,6 +426,39 @@
+             for t0, t1 in groups:
+                 out_rows(t0, t1, True).copy_(torch.from_numpy(np.ascontiguousarray(y[t0:t1])))
+ 
++    # ------------------------------------------------------------ QK_SOFTMAX (phase B: GEMM unit)
++    def op_qk_softmax(self, c: K.Cmd) -> None:
++        """Q.K^T with the GEMM epilogue (no bias / D), then the SOFTMAX rule on the FP32 scores of each row; the
++        scores never reach memory. = (GEMM, SOFTMAX) of contract 1.0 minus the score buffer."""
++        assert not self.exact, "QK_SOFTMAX: exact mode not supported"
++        L, Kc, N = c.M, c.K, c.N
++        NP = c.par(C.P_NP) or N
++        mul = K.bits_f32(c.par(C.P_EPS))
++        A, Bw, cs, D, E, fs, G, H = (c.slot(n) for n in "ABCDEFGH")
++        for b in range(c.B):
++            x = self.rows_i16(A, b, N, Kc)
++            w = self.weight(Bw, b, L, Kc)
++            acc = torch.matmul(x, w.T).numpy()
++            y = K.gemm_out(np.rint(acc).astype(np.int64), self.vec_f32(H, b, L).numpy(), self.vec_f32(G, b, N).numpy())
++            xs = torch.from_numpy(np.ascontiguousarray(y, dtype=np.float32))
++            if c.flags & C.F_MASK:
++                rq = self.vec_i32(D, b, N).long()
++                rk = self.vec_i32(E, b, L).long()
++                valid = (rk[None, :] >= 0) & (rk[None, :] <= rq[:, None])
++            else:
++                valid = torch.ones(N, L, dtype=torch.bool)
++            if "smx" in self.kops:
++                q, s = self.smx.kernel(xs, self.smx.c_from_mult(mul), valid, empty="zero")
++                s = torch.where(q.sum(-1, keepdim=True) == 0, torch.ones_like(s), s)
++                q, s = q.numpy().astype(np.int16), s.reshape(-1).numpy().astype(np.float32)
++            else:
++                p = torch.softmax(torch.where(valid, xs * mul, torch.tensor(float("-inf"))), -1)
++                q, s, _ = self.quant(torch.nan_to_num(p, nan=0.0), 0)
++            qp = np.zeros((NP, L), np.int16)
++            qp[:N] = q
++            self.mem.view(cs.addr + b * cs.stride, (NP, L), (cs.pitch, 2), torch.int16).copy_(torch.from_numpy(qp))
++            self.put_scales(fs, b, 0, 0, s, NP)
++
+     # ------------------------------------------------------------ row unit
+     def op_quant_x(self, c: K.Cmd) -> None:
+         for b in range(c.B):
+--- a/fpga/kernels/sequencer/build_smolvla.py
++++ b/fpga/kernels/sequencer/build_smolvla.py
+@@ -339,9 +339,9 @@
+             self.mem.write(e.addr, tab.tobytes())
+         # rank vectors (CONTRACT.md 5): query row t = g TqP + i; pad -1
+         for c, (ph, _name, i, _) in zip(self.cmds, self.roles, strict=True):
+-            if c.op != C.OP_SOFTMAX or not c.flags & C.F_MASK:
++            if c.op not in (C.OP_SOFTMAX, getattr(C, "OP_QK_SOFTMAX", -1)) or not c.flags & C.F_MASK:
+                 continue
+-            nq, L = c.N, c.K
++            nq, L = c.N, (c.K if c.op == C.OP_SOFTMAX else c.M)
+             tq = nq // 3
+             ii = torch.arange(nq) % tq
+             kk = torch.arange(L)

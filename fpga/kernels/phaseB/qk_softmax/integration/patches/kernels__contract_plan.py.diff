@@ -1,0 +1,121 @@
+--- a/fpga/kernels/contract_plan.py
++++ b/fpga/kernels/contract_plan.py
+@@ -871,6 +871,8 @@
+         P.gemm("a_out+euler", W["a_out"], X, 2 * E_D, TQ_E, x_t, 4 * A_D, sX, bias=True, acc=True)
+     P.phase = "end"
+     P.add(Cmd(C.OP_END), "end")
++    if OPT.get("fuse_qk"):
++        P.cmds = fuse_qk_softmax(P.cmds)
+     P.layout = {"status": status, "x_t": x_t, "arena_end": arena_end, "regions": m.regions}  # type: ignore[attr-defined]
+     return P
+ 
+@@ -885,6 +887,7 @@
+ OPT = {
+     "nbx": 2,
+     "item_fixed": None,
++    "fuse_qk": False,
+ }  # --nbx, --item-overhead (engine change E-7: items inside one DATAFLOW run)
+ 
+ 
+@@ -916,6 +919,8 @@
+         clk += max(c.B - 2, 0) * gemm_item_clocks(c.M, c.K, c.N, ddr_bpc, d, False)
+         byts = c.B * (2 * c.M * c.K + 2 * c.N * c.K + 4 * c.N * c.M * (2 if d else 1))
+         return SEQ_FETCH + clk, byts
++    if c.op == C.OP_QK_SOFTMAX:
++        return qks_cmd_clocks(c, ddr_bpc)
+     if c.op == C.OP_SOFTMAX:
+         L = c.K
+         per = max(L / 4, SMX_DIV, L / 8) + 2
+@@ -933,6 +938,81 @@
+     rows = N * per + (np_ - N) * wr
+     byts = int(c.B * (N * rd * 16 * passes + np_ * wr * 16))
+     return SEQ_FETCH + ROW_C0 + c.B * (ROW_ITEM + rows), byts
++
++
++# ---------------------------------------------------------------- phase B: QK_SOFTMAX (fpga/kernels/phaseB/qk_softmax)
++def fuse_qk_softmax(cmds: list[Cmd]) -> list[Cmd]:
++    """Every (GEMM "qk", SOFTMAX) pair -> one QK_SOFTMAX record: A, B of the GEMM (Q rows, KW blob); C, D, E, F of
++    the SOFTMAX (P rows, rank_q, rank_k, P scales); G = the GEMM's s_tok (F), H = its s_row (E); the SOFTMAX's
++    flags and p0 / p5. The score buffer of the pair is no longer written or read. Tags are renumbered."""
++    out: list[Cmd] = []
++    i = 0
++    while i < len(cmds):
++        g = cmds[i]
++        if g.op == C.OP_GEMM and g.note.endswith(":qk"):
++            s = cmds[i + 1]
++            assert s.op == C.OP_SOFTMAX and s.note.endswith(":softmax"), (i, g.note, s.note)
++            a, y = s.slot("A"), g.slot("C")
++            assert (a.addr, a.pitch, a.stride) == (y.addr, y.pitch, y.stride), (i, a, y)
++            assert (s.K, s.N, s.B) == (g.M, g.N, g.B) and not g.flags and not g.p, (i, g, s)
++            sl = {"A": g.slot("A"), "B": g.slot("B"), "C": s.slot("C"), "F": s.slot("F"), "G": g.slot("F"),
++                  "H": g.slot("E")}
++            if s.flags & C.F_MASK:
++                sl["D"], sl["E"] = s.slot("D"), s.slot("E")
++            f = Cmd(C.OP_QK_SOFTMAX, s.flags, 0, g.M, g.K, g.N, g.B, sl, dict(s.p))
++            f.note = g.note[: -len("qk")] + "qk_softmax"
++            out.append(f)
++            i += 2
++        else:
++            out.append(cmds[i])
++            i += 1
++    for j, c in enumerate(out):
++        c.tag = j
++    return out
++
++
++QKS_TAIL = 128  # QK_SOFTMAX: after the last row, the divider (14) and the last scale burst + write response (est.)
++
++
++def qks_item_clocks(L: int, k: int, n: int, ddr_bpc: float, first: bool = True, prev_drain: float = 0.0):
++    """(clocks, drain of the last tile) of one QK_SOFTMAX item. Fill of tile t = the GEMM tile with the 4-lane
++    dequantizer as the pace (the store's Y words now go to the score buffer: no Y in the DDR term); drain of tile t
++    = its rows at smx::compute's pace (W + 1 clocks per row, W = L / 4; at least the divider's 14). Fill of tile
++    t + 1 overlaps drain of tile t (2 halves). With E-7 (item_fixed set) the next item's tile 0 also overlaps this
++    item's last drain (prev_drain)."""
++    nbx = OPT["nbx"]
++    g, nblk = L // 32, math.ceil(n / 32)
++    tiles = [min(nbx, nblk - t * nbx) for t in range(math.ceil(nblk / nbx))]
++    fixed = L0 + TAIL if first or OPT["item_fixed"] is None else OPT["item_fixed"]
++    lanes = OPT.get("qks_lanes", 4)  # dequantizer and softmax lanes (4 as built: no DSP added)
++    row = max(L // lanes + 1, SMX_DIV + 1)
++    fill, drain = [], []
++    for t, nbt in enumerate(tiles):
++        nxt = tiles[t + 1] if t + 1 < len(tiles) else 0
++        blk = YW_BLK * 4 // lanes  # clocks per 32 x 32 block at the dequantizer
++        fill.append(max(g * nbt * max(k, blk, EMIT), g * k, (64 * g * k + 64 * nxt * k) / ddr_bpc, 4 * nxt * k))
++        drain.append(min(32 * nbt, n - 32 * nbx * t) * row)
++    total = fixed + 4 * tiles[0] * k + max(fill[0], prev_drain)
++    for t in range(1, len(tiles)):
++        total += max(fill[t], drain[t - 1])
++    return total, drain[-1]
++
++
++def qks_cmd_clocks(c: Cmd, ddr_bpc: float) -> tuple[float, int]:
++    L, n = c.M, c.N
++    e7 = OPT["item_fixed"] is not None
++    clk, prev = 0.0, 0.0
++    for b in range(c.B):
++        t, d = qks_item_clocks(L, c.K, n, ddr_bpc, b == 0, prev if e7 else 0.0)
++        clk += t if e7 else t + d
++        prev = d
++    if e7:
++        clk += prev  # the last item's drain
++    clk += QKS_TAIL * (1 if e7 else c.B)
++    np_ = c.par(C.P_NP) or n
++    byts = c.B * (2 * L * c.K + 2 * n * c.K + 2 * np_ * L + 4 * pad4(np_) + 4 * pad4(n) + 4 * L
++                  + (4 * pad4(n) + 4 * L if c.flags & C.F_MASK else 0))
++    return SEQ_FETCH + clk, byts
+ 
+ 
+ def report(P: Plan, mhz: float, ddr_gbs: float, arm_ms: float, link_ms: float) -> dict:
+@@ -979,8 +1059,9 @@
+     ap.add_argument("--json", type=Path)
+     ap.add_argument("--nbx", type=int, default=2, help="engine blocks per tile (1: no weight re-use)")
+     ap.add_argument("--item-overhead", type=int, help="clocks per extra GEMM item (default: a full call)")
++    ap.add_argument("--fuse-qk", action="store_true", help="phase B: (GEMM qk, SOFTMAX) -> QK_SOFTMAX")
+     a = ap.parse_args()
+-    OPT["nbx"], OPT["item_fixed"] = a.nbx, a.item_overhead
++    OPT["nbx"], OPT["item_fixed"], OPT["fuse_qk"] = a.nbx, a.item_overhead, a.fuse_qk
+     P = build(a.base)
+     bad = validate_list(P.cmds)
+     for i, r in bad[:20]:

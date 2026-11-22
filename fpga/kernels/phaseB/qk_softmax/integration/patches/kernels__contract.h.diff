@@ -1,0 +1,112 @@
+--- a/fpga/kernels/contract.h
++++ b/fpga/kernels/contract.h
+@@ -45,8 +45,8 @@
+ constexpr uint32_t SLOT_D = 3;  // GEMM addend rows / SOFTMAX rank_q
+ constexpr uint32_t SLOT_E = 4;  // GEMM s_row / NORM gamma,beta / ROPE table / SOFTMAX rank_k
+ constexpr uint32_t SLOT_F = 5;  // scales: GEMM s_tok in, q-out scales out
+-constexpr uint32_t SLOT_G = 6;  // GEMM bias
+-constexpr uint32_t SLOT_H = 7;  // unused in 1.0 (must be 0)
++constexpr uint32_t SLOT_G = 6;  // GEMM bias / QK_SOFTMAX s_tok of Q
++constexpr uint32_t SLOT_H = 7;  // QK_SOFTMAX s_row of K (unused by every other opcode: must be 0)
+ 
+ // parameter indices (p<i> = field PARAM_BASE + i)
+ constexpr uint32_t P_EPS = 0;     // NORM: eps, FP32 bits.  SOFTMAX: score multiplier, FP32 bits
+@@ -94,6 +94,8 @@
+ constexpr uint32_t OP_QUANT_WT = 0x22;  // row unit: FP32 rows transposed -> VW weight tiling, column scales
+ constexpr uint32_t OP_NORM = 0x30;      // row unit: LayerNorm / RMSNorm (-> int16 or FP32)
+ constexpr uint32_t OP_SOFTMAX = 0x40;   // softmax unit: masked rows -> int16 P + 1/sum scale
++constexpr uint32_t OP_QK_SOFTMAX = 0x41;  // engine (GEMM unit): Q.K^T + softmax in one command -> int16 P +
++                                        // 1/sum scale; the scores stay on chip (phase B, qk_softmax)
+ constexpr uint32_t OP_GELU = 0x50;      // row unit: tanh-GELU -> int16
+ constexpr uint32_t OP_SILU_MUL = 0x51;  // row unit: SiLU(A) * B, or SiLU(A) with F_NOMUL -> int16
+ constexpr uint32_t OP_ROPE = 0x60;      // row unit: rotate (i, i+32) per 64-segment -> int16 / KW / FP32
+@@ -119,6 +121,7 @@
+ constexpr uint32_t FLAGS_ACT = F_YIELD | F_QOUT | F_NOMUL;
+ constexpr uint32_t FLAGS_ROPE = F_YIELD | F_QOUT | F_KW;
+ constexpr uint32_t FLAGS_SOFTMAX = F_YIELD | F_QOUT | F_MASK;
++constexpr uint32_t FLAGS_QKSMX = F_YIELD | F_QOUT | F_MASK;
+ constexpr uint32_t FLAGS_COPY = F_YIELD;
+ 
+ // ---------------------------------------------------------------- status codes (ap_return[7:0])
+@@ -141,6 +144,8 @@
+ constexpr uint32_t ME_FLAGS = 4;  // a flag the opcode does not take, or F_ACC with F_ADD_D
+ constexpr uint32_t ME_PARAM = 5;  // a parameter out of range, or non-zero where unused
+ constexpr uint32_t ME_SLOT = 6;   // an unused slot or reserved field not zero
++constexpr uint32_t ME_UNIT = 7;   // the opcode's unit is not in this bitstream (a fused build without the
++                                  // SOFTMAX unit returns it for OP_SOFTMAX)
+ 
+ // ---------------------------------------------------------------- limits
+ constexpr uint64_t ADDR_LIMIT = 1ull << 40;  // KR260 PS DDR: 0x0_0000_0000-0x0_7FFF_FFFF, 0x8_0000_0000-0x8_7FFF_FFFF
+@@ -158,6 +163,7 @@
+ constexpr uint32_t ROPE_SEG = 64;            // ROPE: head dim (pairs i, i + 32)
+ constexpr uint32_t ROPE_TAB_BYTES = 256;     // ROPE: table row = 32 int32 -cos + 32 int32 -sin, Q1.17
+ constexpr uint32_t SMX_L_MAX = 256;          // SOFTMAX keys per row
++constexpr uint32_t QKS_L_MAX = 256;          // QK_SOFTMAX keys per row (M): the score buffer holds 2 x 64 rows
+ constexpr uint32_t SHIFT_MAX = 8;            // |p4|
+ 
+ // ---------------------------------------------------------------- arithmetic constants
+@@ -199,7 +205,7 @@
+ #pragma HLS INLINE
+   return op == OP_NOP || op == OP_END || op == OP_GEMM || op == OP_QUANT_X || op == OP_QUANT_W ||
+          op == OP_QUANT_WT || op == OP_NORM || op == OP_SOFTMAX || op == OP_GELU || op == OP_SILU_MUL ||
+-         op == OP_ROPE || op == OP_COPY;
++         op == OP_ROPE || op == OP_COPY || op == OP_QK_SOFTMAX;
+ }
+ 
+ static inline uint32_t rec_check(const uint32_t f[REC_FIELDS]) {
+@@ -311,12 +317,55 @@
+   return ME_OK;
+ }
+ 
++// OP_QK_SOFTMAX (phase B, fpga/kernels/phaseB/qk_softmax): M = L keys, K = head dim; slots A Q int16 rows, B KW
++// blob, C P int16 rows, D rank_q, E rank_k (F_MASK), F P scales, G s_tok of Q, H s_row of K; p0 score
++// multiplier, p5 NP. The same rules as the GEMM and SOFTMAX branches with these slot roles.
++// validate / validate_hw of OP_QK_SOFTMAX (the same rules as the GEMM and SOFTMAX branches of validate_t,
++// with the slot roles above). FULL adds the extent checks (host).
++template <bool FULL>
++static inline uint32_t validate_qks_t(const Cmd& c) {
++  const uint64_t B = c.B, N = c.N, K = c.K, M = c.M;
++  const uint32_t* p = c.p;
++  if (c.flags & F_RETIRED) return ME_FLAGS;
++  if (c.flags & ~FLAGS_QKSMX) return ME_FLAGS;
++  if (!(c.flags & F_QOUT)) return ME_FLAGS;
++  if (N < 1 || N > N_MAX || B < 1 || B > B_MAX) return ME_DIMS;
++  if (M < ENGINE_LANES || M > QKS_L_MAX || M % ENGINE_LANES) return ME_DIMS;
++  if (K < 8 || K > GEMM_K_MAX || K % 8) return ME_DIMS;
++  const uint64_t NP = p[P_NP] ? p[P_NP] : N;
++  if (NP < N || NP > N_MAX) return ME_PARAM;
++  const float mul = u2f(p[P_EPS]);
++  if (!(mul > 0.0f && mul < 1e30f)) return ME_PARAM;
++  for (uint32_t i = 0; i < NPARAMS; i++)
++    if (i != P_EPS && i != P_NP && p[i]) return ME_PARAM;
++  uint32_t r, used = (1u << SLOT_A) | (1u << SLOT_B) | (1u << SLOT_C) | (1u << SLOT_F) | (1u << SLOT_G) |
++                     (1u << SLOT_H);
++  if ((r = check_slot<FULL>(c.s[SLOT_A], B, N, 2 * K, 2 * K, false))) return r;
++  const uint64_t port_bytes = (M / ENGINE_LANES) * K * 16;
++  if (!slot_aligned(c.s[SLOT_B])) return ME_ALIGN;
++  if (c.s[SLOT_B].pitch < port_bytes) return ME_ALIGN;
++  if (c.s[SLOT_B].addr >= ADDR_LIMIT || (FULL && slot_end(c.s[SLOT_B], B, ENGINE_PORTS, port_bytes) > ADDR_LIMIT))
++    return ME_ADDR;
++  if ((r = check_slot<FULL>(c.s[SLOT_C], B, NP, 2 * M, 2 * M, false))) return r;
++  if ((r = check_slot<FULL>(c.s[SLOT_F], B, 1, 4 * pad4((uint32_t)NP), 0, true))) return r;
++  if ((r = check_slot<FULL>(c.s[SLOT_G], B, 1, 4 * pad4(c.N), 0, true))) return r;
++  if ((r = check_slot<FULL>(c.s[SLOT_H], B, 1, 4 * M, 0, true))) return r;
++  if (c.flags & F_MASK) {
++    used |= (1u << SLOT_D) | (1u << SLOT_E);
++    if ((r = check_slot<FULL>(c.s[SLOT_D], B, 1, 4 * pad4(c.N), 0, true))) return r;
++    if ((r = check_slot<FULL>(c.s[SLOT_E], B, 1, 4 * M, 0, true))) return r;
++  }
++  for (uint32_t s = 0; s < NSLOTS; s++)
++    if (!(used & (1u << s)) && !slot_zero(c.s[s])) return ME_SLOT;
++  return ME_OK;
++}
+ template <bool FULL>
+ static inline uint32_t validate_t(const Cmd& c) {
+   const uint64_t B = c.B, N = c.N, K = c.K, M = c.M;
+   uint32_t allowed = 0, used = 0;  // flags allowed, slots used (bit s)
+   const uint32_t* p = c.p;
+   if (c.flags & F_RETIRED) return ME_FLAGS;
++  if (c.op == OP_QK_SOFTMAX) return validate_qks_t<FULL>(c);
+   if (c.op == OP_NOP || c.op == OP_END) {
+     allowed = F_YIELD;
+   } else if (c.op == OP_GEMM) {

@@ -1,0 +1,51 @@
+--- a/fpga/kernels/sequencer/exec_ref.py
++++ b/fpga/kernels/sequencer/exec_ref.py
+@@ -59,7 +59,7 @@
+ 
+ 
+ def unit_of(op: int) -> int:
+-    if op == C.OP_GEMM:
++    if op == C.OP_GEMM or op == getattr(C, "OP_QK_SOFTMAX", -1):
+         return U_GEMM
+     if op == C.OP_SOFTMAX:
+         return U_SMX
+@@ -426,6 +426,39 @@
+             for t0, t1 in groups:
+                 out_rows(t0, t1, True).copy_(torch.from_numpy(np.ascontiguousarray(y[t0:t1])))
+ 
++    # ------------------------------------------------------------ QK_SOFTMAX (phase B: GEMM unit)
++    def op_qk_softmax(self, c: K.Cmd) -> None:
++        """Q.K^T with the GEMM epilogue (no bias / D), then the SOFTMAX rule on the FP32 scores of each row; the
++        scores never reach memory. = (GEMM, SOFTMAX) of contract 1.0 minus the score buffer."""
++        assert not self.exact, "QK_SOFTMAX: exact mode not supported"
++        L, Kc, N = c.M, c.K, c.N
++        NP = c.par(C.P_NP) or N
++        mul = K.bits_f32(c.par(C.P_EPS))
++        A, Bw, cs, D, E, fs, G, H = (c.slot(n) for n in "ABCDEFGH")
++        for b in range(c.B):
++            x = self.rows_i16(A, b, N, Kc)
++            w = self.weight(Bw, b, L, Kc)
++            acc = torch.matmul(x, w.T).numpy()
++            y = K.gemm_out(np.rint(acc).astype(np.int64), self.vec_f32(H, b, L).numpy(), self.vec_f32(G, b, N).numpy())
++            xs = torch.from_numpy(np.ascontiguousarray(y, dtype=np.float32))
++            if c.flags & C.F_MASK:
++                rq = self.vec_i32(D, b, N).long()
++                rk = self.vec_i32(E, b, L).long()
++                valid = (rk[None, :] >= 0) & (rk[None, :] <= rq[:, None])
++            else:
++                valid = torch.ones(N, L, dtype=torch.bool)
++            if "smx" in self.kops:
++                q, s = self.smx.kernel(xs, self.smx.c_from_mult(mul), valid, empty="zero")
++                s = torch.where(q.sum(-1, keepdim=True) == 0, torch.ones_like(s), s)
++                q, s = q.numpy().astype(np.int16), s.reshape(-1).numpy().astype(np.float32)
++            else:
++                p = torch.softmax(torch.where(valid, xs * mul, torch.tensor(float("-inf"))), -1)
++                q, s, _ = self.quant(torch.nan_to_num(p, nan=0.0), 0)
++            qp = np.zeros((NP, L), np.int16)
++            qp[:N] = q
++            self.mem.view(cs.addr + b * cs.stride, (NP, L), (cs.pitch, 2), torch.int16).copy_(torch.from_numpy(qp))
++            self.put_scales(fs, b, 0, 0, s, NP)
++
+     # ------------------------------------------------------------ row unit
+     def op_quant_x(self, c: K.Cmd) -> None:
+         for b in range(c.B):

@@ -1,0 +1,267 @@
+
+
+================================================================
+== Vitis HLS Report for 'region_ap_uint_128_s'
+================================================================
+* Date:           Sat Nov 21 20:27:26 2026
+
+* Version:        2022.2 (Build 3670227 on Oct 13 2022)
+* Project:        amx_fused_p467_ql2
+* Solution:       sol1 (Vivado IP Flow Target)
+* Product family: zynquplus
+* Target device:  xck26-sfvc784-2LV-c
+
+
+================================================================
+== Performance Estimates
+================================================================
++ Timing: 
+    * Summary: 
+    +--------+---------+-----------+------------+
+    |  Clock |  Target | Estimated | Uncertainty|
+    +--------+---------+-----------+------------+
+    |ap_clk  |  4.67 ns|  26.006 ns|     1.26 ns|
+    +--------+---------+-----------+------------+
+
++ Latency: 
+    * Summary: 
+    +---------+---------+----------+----------+-----+-----+----------+
+    |  Latency (cycles) |  Latency (absolute) |  Interval | Pipeline |
+    |   min   |   max   |    min   |    max   | min | max |   Type   |
+    +---------+---------+----------+----------+-----+-----+----------+
+    |        ?|        ?|         ?|         ?|    ?|    ?|  dataflow|
+    +---------+---------+----------+----------+-----+-----+----------+
+
+    + Detail: 
+        * Instance: 
+        +------------------------+-----------------------+---------+---------+----------+----------+-----+-----+---------+
+        |                        |                       |  Latency (cycles) |  Latency (absolute) |  Interval | Pipeline|
+        |        Instance        |         Module        |   min   |   max   |    min   |    max   | min | max |   Type  |
+        +------------------------+-----------------------+---------+---------+----------+----------+-----+-----+---------+
+        |load_io_ap_uint_128_U0  |load_io_ap_uint_128_s  |        ?|        ?|         ?|         ?|    ?|    ?|       no|
+        |store_ap_uint_128_U0    |store_ap_uint_128_s    |        ?|        ?|         ?|         ?|    ?|    ?|       no|
+        +------------------------+-----------------------+---------+---------+----------+----------+-----+-----+---------+
+
+        * Loop: 
+        N/A
+
+
+
+================================================================
+== Utilization Estimates
+================================================================
+* Summary: 
++-----------------+---------+------+--------+--------+-----+
+|       Name      | BRAM_18K|  DSP |   FF   |   LUT  | URAM|
++-----------------+---------+------+--------+--------+-----+
+|DSP              |        -|     -|       -|       -|    -|
+|Expression       |        -|     -|       0|      16|    -|
+|FIFO             |        -|     -|       -|       -|    -|
+|Instance         |        4|    14|   21580|   29395|    -|
+|Memory           |        -|     -|       -|       -|    -|
+|Multiplexer      |        -|     -|       -|      18|    -|
+|Register         |        -|     -|       2|       -|    -|
++-----------------+---------+------+--------+--------+-----+
+|Total            |        4|    14|   21582|   29429|    0|
++-----------------+---------+------+--------+--------+-----+
+|Available        |      288|  1248|  234240|  117120|   64|
++-----------------+---------+------+--------+--------+-----+
+|Utilization (%)  |        1|     1|       9|      25|    0|
++-----------------+---------+------+--------+--------+-----+
+
++ Detail: 
+    * Instance: 
+    +------------------------+-----------------------+---------+----+-------+-------+-----+
+    |        Instance        |         Module        | BRAM_18K| DSP|   FF  |  LUT  | URAM|
+    +------------------------+-----------------------+---------+----+-------+-------+-----+
+    |load_io_ap_uint_128_U0  |load_io_ap_uint_128_s  |        4|   8|  16568|  23063|    0|
+    |store_ap_uint_128_U0    |store_ap_uint_128_s    |        0|   6|   5012|   6332|    0|
+    +------------------------+-----------------------+---------+----+-------+-------+-----+
+    |Total                   |                       |        4|  14|  21580|  29395|    0|
+    +------------------------+-----------------------+---------+----+-------+-------+-----+
+
+    * DSP: 
+    N/A
+
+    * Memory: 
+    N/A
+
+    * FIFO: 
+    N/A
+
+    * Expression: 
+    +-----------------------------------------+----------+----+---+----+------------+------------+
+    |              Variable Name              | Operation| DSP| FF| LUT| Bitwidth P0| Bitwidth P1|
+    +-----------------------------------------+----------+----+---+----+------------+------------+
+    |ap_idle                                  |       and|   0|  0|   2|           1|           1|
+    |ap_sync_continue                         |       and|   0|  0|   2|           1|           1|
+    |ap_sync_done                             |       and|   0|  0|   2|           1|           1|
+    |ap_sync_ready                            |       and|   0|  0|   2|           1|           1|
+    |load_io_ap_uint_128_U0_ap_start          |       and|   0|  0|   2|           1|           1|
+    |store_ap_uint_128_U0_ap_start            |       and|   0|  0|   2|           1|           1|
+    |ap_sync_load_io_ap_uint_128_U0_ap_ready  |        or|   0|  0|   2|           1|           1|
+    |ap_sync_store_ap_uint_128_U0_ap_ready    |        or|   0|  0|   2|           1|           1|
+    +-----------------------------------------+----------+----+---+----+------------+------------+
+    |Total                                    |          |   0|  0|  16|           8|           8|
+    +-----------------------------------------+----------+----+---+----+------------+------------+
+
+    * Multiplexer: 
+    +---------------------------------------------+----+-----------+-----+-----------+
+    |                     Name                    | LUT| Input Size| Bits| Total Bits|
+    +---------------------------------------------+----+-----------+-----+-----------+
+    |ap_sync_reg_load_io_ap_uint_128_U0_ap_ready  |   9|          2|    1|          2|
+    |ap_sync_reg_store_ap_uint_128_U0_ap_ready    |   9|          2|    1|          2|
+    +---------------------------------------------+----+-----------+-----+-----------+
+    |Total                                        |  18|          4|    2|          4|
+    +---------------------------------------------+----+-----------+-----+-----------+
+
+    * Register: 
+    +---------------------------------------------+---+----+-----+-----------+
+    |                     Name                    | FF| LUT| Bits| Const Bits|
+    +---------------------------------------------+---+----+-----+-----------+
+    |ap_sync_reg_load_io_ap_uint_128_U0_ap_ready  |  1|   0|    1|          0|
+    |ap_sync_reg_store_ap_uint_128_U0_ap_ready    |  1|   0|    1|          0|
+    +---------------------------------------------+---+----+-----+-----------+
+    |Total                                        |  2|   0|    2|          0|
+    +---------------------------------------------+---+----+-----+-----------+
+
+
+
+================================================================
+== Interface
+================================================================
+* Summary: 
++-------------------+-----+-----+------------+-----------------------+--------------+
+|     RTL Ports     | Dir | Bits|  Protocol  |     Source Object     |    C Type    |
++-------------------+-----+-----+------------+-----------------------+--------------+
+|m_axi_io_AWVALID   |  out|    1|       m_axi|                     io|       pointer|
+|m_axi_io_AWREADY   |   in|    1|       m_axi|                     io|       pointer|
+|m_axi_io_AWADDR    |  out|   64|       m_axi|                     io|       pointer|
+|m_axi_io_AWID      |  out|    1|       m_axi|                     io|       pointer|
+|m_axi_io_AWLEN     |  out|   32|       m_axi|                     io|       pointer|
+|m_axi_io_AWSIZE    |  out|    3|       m_axi|                     io|       pointer|
+|m_axi_io_AWBURST   |  out|    2|       m_axi|                     io|       pointer|
+|m_axi_io_AWLOCK    |  out|    2|       m_axi|                     io|       pointer|
+|m_axi_io_AWCACHE   |  out|    4|       m_axi|                     io|       pointer|
+|m_axi_io_AWPROT    |  out|    3|       m_axi|                     io|       pointer|
+|m_axi_io_AWQOS     |  out|    4|       m_axi|                     io|       pointer|
+|m_axi_io_AWREGION  |  out|    4|       m_axi|                     io|       pointer|
+|m_axi_io_AWUSER    |  out|    1|       m_axi|                     io|       pointer|
+|m_axi_io_WVALID    |  out|    1|       m_axi|                     io|       pointer|
+|m_axi_io_WREADY    |   in|    1|       m_axi|                     io|       pointer|
+|m_axi_io_WDATA     |  out|  128|       m_axi|                     io|       pointer|
+|m_axi_io_WSTRB     |  out|   16|       m_axi|                     io|       pointer|
+|m_axi_io_WLAST     |  out|    1|       m_axi|                     io|       pointer|
+|m_axi_io_WID       |  out|    1|       m_axi|                     io|       pointer|
+|m_axi_io_WUSER     |  out|    1|       m_axi|                     io|       pointer|
+|m_axi_io_ARVALID   |  out|    1|       m_axi|                     io|       pointer|
+|m_axi_io_ARREADY   |   in|    1|       m_axi|                     io|       pointer|
+|m_axi_io_ARADDR    |  out|   64|       m_axi|                     io|       pointer|
+|m_axi_io_ARID      |  out|    1|       m_axi|                     io|       pointer|
+|m_axi_io_ARLEN     |  out|   32|       m_axi|                     io|       pointer|
+|m_axi_io_ARSIZE    |  out|    3|       m_axi|                     io|       pointer|
+|m_axi_io_ARBURST   |  out|    2|       m_axi|                     io|       pointer|
+|m_axi_io_ARLOCK    |  out|    2|       m_axi|                     io|       pointer|
+|m_axi_io_ARCACHE   |  out|    4|       m_axi|                     io|       pointer|
+|m_axi_io_ARPROT    |  out|    3|       m_axi|                     io|       pointer|
+|m_axi_io_ARQOS     |  out|    4|       m_axi|                     io|       pointer|
+|m_axi_io_ARREGION  |  out|    4|       m_axi|                     io|       pointer|
+|m_axi_io_ARUSER    |  out|    1|       m_axi|                     io|       pointer|
+|m_axi_io_RVALID    |   in|    1|       m_axi|                     io|       pointer|
+|m_axi_io_RREADY    |  out|    1|       m_axi|                     io|       pointer|
+|m_axi_io_RDATA     |   in|  128|       m_axi|                     io|       pointer|
+|m_axi_io_RLAST     |   in|    1|       m_axi|                     io|       pointer|
+|m_axi_io_RID       |   in|    1|       m_axi|                     io|       pointer|
+|m_axi_io_RFIFONUM  |   in|   13|       m_axi|                     io|       pointer|
+|m_axi_io_RUSER     |   in|    1|       m_axi|                     io|       pointer|
+|m_axi_io_RRESP     |   in|    2|       m_axi|                     io|       pointer|
+|m_axi_io_BVALID    |   in|    1|       m_axi|                     io|       pointer|
+|m_axi_io_BREADY    |  out|    1|       m_axi|                     io|       pointer|
+|m_axi_io_BRESP     |   in|    2|       m_axi|                     io|       pointer|
+|m_axi_io_BID       |   in|    1|       m_axi|                     io|       pointer|
+|m_axi_io_BUSER     |   in|    1|       m_axi|                     io|       pointer|
+|xmem               |   in|   64|     ap_none|                   xmem|        scalar|
+|xmem_ap_vld        |   in|    1|     ap_none|                   xmem|        scalar|
+|ymem               |   in|   64|     ap_none|                   ymem|        scalar|
+|ymem_ap_vld        |   in|    1|     ap_none|                   ymem|        scalar|
+|it_xa              |   in|   64|     ap_none|                  it_xa|        scalar|
+|it_xa_ap_vld       |   in|    1|     ap_none|                  it_xa|        scalar|
+|it_ya              |   in|   64|     ap_none|                  it_ya|        scalar|
+|it_ya_ap_vld       |   in|    1|     ap_none|                  it_ya|        scalar|
+|it_da              |   in|   64|     ap_none|                  it_da|        scalar|
+|it_da_ap_vld       |   in|    1|     ap_none|                  it_da|        scalar|
+|it_ea              |   in|   64|     ap_none|                  it_ea|        scalar|
+|it_ea_ap_vld       |   in|    1|     ap_none|                  it_ea|        scalar|
+|it_fa              |   in|   64|     ap_none|                  it_fa|        scalar|
+|it_fa_ap_vld       |   in|    1|     ap_none|                  it_fa|        scalar|
+|it_ga              |   in|   64|     ap_none|                  it_ga|        scalar|
+|it_ga_ap_vld       |   in|    1|     ap_none|                  it_ga|        scalar|
+|it_xp              |   in|   32|     ap_none|                  it_xp|        scalar|
+|it_xp_ap_vld       |   in|    1|     ap_none|                  it_xp|        scalar|
+|it_yp              |   in|   32|     ap_none|                  it_yp|        scalar|
+|it_yp_ap_vld       |   in|    1|     ap_none|                  it_yp|        scalar|
+|it_dp              |   in|   32|     ap_none|                  it_dp|        scalar|
+|it_dp_ap_vld       |   in|    1|     ap_none|                  it_dp|        scalar|
+|it_yR              |   in|   32|     ap_none|                  it_yR|        scalar|
+|it_yR_ap_vld       |   in|    1|     ap_none|                  it_yR|        scalar|
+|it_yP1             |   in|   32|     ap_none|                 it_yP1|        scalar|
+|it_yP1_ap_vld      |   in|    1|     ap_none|                 it_yP1|        scalar|
+|it_dR              |   in|   32|     ap_none|                  it_dR|        scalar|
+|it_dR_ap_vld       |   in|    1|     ap_none|                  it_dR|        scalar|
+|it_dP1             |   in|   32|     ap_none|                 it_dP1|        scalar|
+|it_dP1_ap_vld      |   in|    1|     ap_none|                 it_dP1|        scalar|
+|it_N               |   in|   32|     ap_none|                   it_N|        scalar|
+|it_N_ap_vld        |   in|    1|     ap_none|                   it_N|        scalar|
+|it_K               |   in|   32|     ap_none|                   it_K|        scalar|
+|it_K_ap_vld        |   in|    1|     ap_none|                   it_K|        scalar|
+|it_groups          |   in|   27|     ap_none|              it_groups|        scalar|
+|it_groups_ap_vld   |   in|    1|     ap_none|              it_groups|        scalar|
+|it_nblk            |   in|   27|     ap_none|                it_nblk|        scalar|
+|it_nblk_ap_vld     |   in|    1|     ap_none|                it_nblk|        scalar|
+|it_ntiles          |   in|   27|     ap_none|              it_ntiles|        scalar|
+|it_ntiles_ap_vld   |   in|    1|     ap_none|              it_ntiles|        scalar|
+|it_nch             |   in|   26|     ap_none|                 it_nch|        scalar|
+|it_nch_ap_vld      |   in|    1|     ap_none|                 it_nch|        scalar|
+|it_bias            |   in|    1|     ap_none|                it_bias|        scalar|
+|it_bias_ap_vld     |   in|    1|     ap_none|                it_bias|        scalar|
+|it_addd            |   in|    1|     ap_none|                it_addd|        scalar|
+|it_addd_ap_vld     |   in|    1|     ap_none|                it_addd|        scalar|
+|it_asg             |   in|   32|     ap_none|                 it_asg|        scalar|
+|it_asg_ap_vld      |   in|    1|     ap_none|                 it_asg|        scalar|
+|it_ha              |   in|   64|     ap_none|                  it_ha|        scalar|
+|it_ha_ap_vld       |   in|    1|     ap_none|                  it_ha|        scalar|
+|it_hp              |   in|   32|     ap_none|                  it_hp|        scalar|
+|it_hp_ap_vld       |   in|    1|     ap_none|                  it_hp|        scalar|
+|it_xq              |   in|   32|     ap_none|                  it_xq|        scalar|
+|it_xq_ap_vld       |   in|    1|     ap_none|                  it_xq|        scalar|
+|it_fpp             |   in|   32|     ap_none|                 it_fpp|        scalar|
+|it_fpp_ap_vld      |   in|    1|     ap_none|                 it_fpp|        scalar|
+|it_shift           |   in|    5|     ap_none|               it_shift|        scalar|
+|it_shift_ap_vld    |   in|    1|     ap_none|               it_shift|        scalar|
+|xr_TDATA           |  out|  128|        axis|                     xr|       pointer|
+|xr_TVALID          |  out|    1|        axis|                     xr|       pointer|
+|xr_TREADY          |   in|    1|        axis|                     xr|       pointer|
+|stok_s_TDATA       |  out|  128|        axis|                 stok_s|       pointer|
+|stok_s_TVALID      |  out|    1|        axis|                 stok_s|       pointer|
+|stok_s_TREADY      |   in|    1|        axis|                 stok_s|       pointer|
+|srow_s_TDATA       |  out|  128|        axis|                 srow_s|       pointer|
+|srow_s_TVALID      |  out|    1|        axis|                 srow_s|       pointer|
+|srow_s_TREADY      |   in|    1|        axis|                 srow_s|       pointer|
+|bias_s_TDATA       |  out|  128|        axis|                 bias_s|       pointer|
+|bias_s_TVALID      |  out|    1|        axis|                 bias_s|       pointer|
+|bias_s_TREADY      |   in|    1|        axis|                 bias_s|       pointer|
+|ds_TDATA           |  out|  128|        axis|                     ds|       pointer|
+|ds_TVALID          |  out|    1|        axis|                     ds|       pointer|
+|ds_TREADY          |   in|    1|        axis|                     ds|       pointer|
+|ys_TDATA           |   in|  128|        axis|                     ys|       pointer|
+|ys_TVALID          |   in|    1|        axis|                     ys|       pointer|
+|ys_TREADY          |  out|    1|        axis|                     ys|       pointer|
+|ap_clk             |   in|    1|  ap_ctrl_hs|  region<ap_uint<128> >|  return value|
+|ap_rst             |   in|    1|  ap_ctrl_hs|  region<ap_uint<128> >|  return value|
+|ap_start           |   in|    1|  ap_ctrl_hs|  region<ap_uint<128> >|  return value|
+|ap_done            |  out|    1|  ap_ctrl_hs|  region<ap_uint<128> >|  return value|
+|ap_ready           |  out|    1|  ap_ctrl_hs|  region<ap_uint<128> >|  return value|
+|ap_idle            |  out|    1|  ap_ctrl_hs|  region<ap_uint<128> >|  return value|
+|ap_continue        |   in|    1|  ap_ctrl_hs|  region<ap_uint<128> >|  return value|
++-------------------+-----+-----+------------+-----------------------+--------------+
+

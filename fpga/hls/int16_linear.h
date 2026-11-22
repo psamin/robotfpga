@@ -3,6 +3,9 @@
 // Y[n][m] = (float(sum_k Xq[n][k] * Wq[m][k]) * s_row[m]) * s_tok[n]      (FP32, round to nearest even)
 //   Wq: int16 weights, per-output-row scale s_row[m] = rowmax|w| / 32767 (pack_float.quantize_int16_rows)
 //   Xq: int16 activations, per-token scale s_tok[n] = tokmax|x| / 32767 (pack_float.quantize_int16_tokens)
+//   Wq and Xq never hold -32768: every producer clamps to +-32767 (review R7). The 43-bit block capture below is
+//   exact only then (|block sum| <= 4096 * 32767^2 < 2^42); a -32768 x -32768 block of K = 4096 reaches +2^42
+//   and flips sign. tb_gemm.cpp asserts it on every operand it generates.
 //   the sum is exact (integer); the dequantization is two FP32 multiplies (the Xilinx core: denormals flush to
 //   zero); bias stays on the host.
 //
@@ -20,7 +23,9 @@
 //    DDR). The weight FIFOs hold a whole group (K_MAX words, URAM), so the next group streams in during the
 //    re-use. NBX = 1 is the same engine without re-use (weight stream = MAC rate, DDR-bound).
 //  - Accumulators are never zeroed. A block's sums are captured into a shadow register file (1,024 x 43 bit)
-//    at the block's last MAC (the DSP outputs, this clock's products included), and the dequantizer takes the
+//    two clocks after the block's last MAC decision, from the accumulator registers (review R1: the MAC operands
+//    sit in registers, the product in the DSP's M register, the accumulator is the register after the post-adder,
+//    i.e. the P register, and the capture reads that register, never the adder output), and the dequantizer takes the
 //    difference to the previous capture of the same accumulator. Two's-complement wrap makes that exact: one
 //    block's sum is below K_MAX * 32767^2 < 2^42 in magnitude, so 43 low bits of the running 48-bit sums carry
 //    it. The loop body stays a pure acc += x * w (no `first ? 0 : acc` mux) and one flat pipelined loop runs a
@@ -28,18 +33,18 @@
 //  - The loop has no blocking FIFO access, so it never stalls (no stall enable fanning out to the ~93k
 //    accumulator/shadow flip-flops); bubbles multiply by zero. The MAC side, the emit side and the X fill side
 //    each decide from their own registered state; the MAC side sees the other two through short delay lines.
-//  - The shadow empties 16 values per clock through an output register (64 clocks per block; the MAC side sees
-//    it free EDONE = 6 clocks later) while the next block computes, so blocks of K >= 71 never wait for the emit.
-//    Dequantization in the emit path, 16 values per clock: 43-bit integer -> FP32 (i43_to_f32), * s_row, * s_tok.
-//    The 128-bit io port then stores 4 FP32 per clock (256 clocks per block of 1,024 outputs), so calls with
-//    K < 256 are bound by the Y store (no SmolVLA engine call is).
+//  - The shadow empties one 16-value word per clock into the emit FIFO (the MAC side sees it free EDONE = 6 clocks
+//    after its last word) while the next block computes. The dequantizer takes 4 values per clock (review R2 /
+//    CONTRACT E-1: 43-bit integer -> FP32 (i43_to_f32), * s_row, * s_tok), the rate of the 128-bit io store, so a
+//    block of 1,024 outputs takes 256 clocks and calls with K < 256 are bound by the Y store (no SmolVLA linear
+//    is; attention's Q.K^T with K = 64 is).
 //  - X is double-buffered (URAM, 4 int16 per 64-bit word, 8 banks, 32 URAMs at NBX = 2): the next tile streams
 //    in over io while the current one computes; the first tile of a call (4 * K * blocks clocks) is loaded
 //    before the MACs start.
 //
 // Processes (one DATAFLOW region per call): load_w16 (hp0..3) -> 4 FIFOs -> compute16 <- xs <- load_io16 (io
-// read: s_tok, X, s_row) ; compute16 -> es (16 x 43-bit captures) -> dequant16 -> ys (16 x FP32) -> store16 (io
-// write).
+// read: s_tok, X, s_row) ; compute16 -> es (16 x 43-bit captures) -> dequant16 -> ys (4 x FP32) -> store16 (io
+// write). The integrated top's GEMM unit (gemm_contract.h) runs the same compute16 behind the contract record.
 //
 // DRIVER CONTRACT (float_top built with -DFSTREAM_ARITH=16; registers as fpga/board/runtime.py REG_*):
 //   0x00 ap_ctrl (bit 0 ap_start, bit 1 ap_done, bit 2 ap_idle), 0x10 ap_return, 64-bit pointers (low word at the
@@ -109,7 +114,6 @@ typedef ap_int<48> Acc;   // the DSP48E2 P register
 typedef ap_uint<CW> Cap;  // low 43 bits of an accumulator
 typedef ap_uint<64> XWord;
 typedef ap_uint<EW * CW> EWord;  // 16 captures, value j in bits [43j+42:43j]
-typedef ap_uint<EW * 32> YWord16;  // 16 FP32, value j in bits [32j+31:32j]
 typedef ap_uint<CW> U43;
 template <class T>
 using Fifo16 = hls::stream<T>;
@@ -138,19 +142,18 @@ static inline void ew_set(EWord& e, int j, const Cap& c) {
 #pragma HLS INLINE
   e.range(CW * j + CW - 1, CW * j) = c;
 }
-static inline void y16_set(YWord16& y, int j, float f) {
+static inline EWord ew_shift4(const EWord& e) {  // value j + 4 -> j (the dequantizer's 4 lanes per clock)
 #pragma HLS INLINE
-  uint32_t u;
-  memcpy(&u, &f, sizeof u);
-  y.range(32 * j + 31, 32 * j) = u;
-}
-static inline IoWord y16_part(const YWord16& y, int p) {
-#pragma HLS INLINE
-  return (IoWord)y.range(128 * p + 127, 128 * p);
+  return e >> (4 * CW);
 }
 static inline void acc_add(Acc& a, const I16& x, const I16& w) {
 #pragma HLS INLINE
-  a += (ap_int<32>)(x * w);
+  // review R1: a named product bound to the DSP with latency 2 gives the MAC core an M register; x, w come from
+  // the operand registers and a is the register after the post-adder (the P register), so no path runs from the
+  // URAM output through the multiplier and the adder in one clock (HLS probe: mac_muladd_..._2_1 with m_reg)
+  ap_int<32> pr = x * w;
+#pragma HLS BIND_OP variable = pr op = mul impl = dsp latency = 2
+  a += pr;
 }
 static inline float fmul_dq(float a, float b) {
 #pragma HLS INLINE
@@ -164,9 +167,6 @@ typedef uint64_t XWord;
 typedef uint64_t U43;
 struct EWord {
   Cap v[EW];
-};
-struct YWord16 {
-  float v[EW];
 };
 // -DFSTREAM_CHAOS=p: every non-blocking FIFO operation fails with probability p % (data "not there yet", FIFO
 // "full"), so the C model runs the stall paths of compute16 (late weights, late X, a full emit FIFO) and must still
@@ -223,11 +223,10 @@ static inline I16 x_lane(const XWord& w, int j) { return (I16)(uint16_t)(w >> (1
 static inline Cap cap_of(const Acc& a) { return (Cap)a & ((1ULL << CW) - 1); }
 static inline Cap ew_get(const EWord& e, int j) { return e.v[j]; }
 static inline void ew_set(EWord& e, int j, const Cap& c) { e.v[j] = c; }
-static inline void y16_set(YWord16& y, int j, float f) { y.v[j] = f; }
-static inline IoWord y16_part(const YWord16& y, int p) {
-  IoWord o;
-  memcpy(&o, &y.v[4 * p], sizeof o);
-  return o;
+static inline EWord ew_shift4(const EWord& e) {
+  EWord r;
+  for (int j = 0; j < EW; j++) r.v[j] = j + 4 < EW ? e.v[j + 4] : 0;
+  return r;
 }
 static inline void acc_add(Acc& a, const I16& x, const I16& w) {
   const uint64_t s = (uint64_t)a + (uint64_t)(int64_t)((int32_t)x * (int32_t)w);
@@ -454,6 +453,18 @@ prefill:
   bool fqlast = false, fblast = fnb_m1 == 0;     // fq == XW_K - 1, fb == fnb_m1
   int tage = SETTLE;                             // clocks since tile t started (saturating at SETTLE)
   bool tsettled = true;                          // tage >= SETTLE: the reads of tile t - 1 are done
+  I16 xd[TB], wd[LANES];  // MAC operand registers (DSP A / B)
+#pragma HLS ARRAY_PARTITION variable = xd complete
+#pragma HLS ARRAY_PARTITION variable = wd complete
+  for (int a = 0; a < TB; a++) {
+#pragma HLS UNROLL
+    xd[a] = 0;
+  }
+  for (int l = 0; l < LANES; l++) {
+#pragma HLS UNROLL
+    wd[l] = 0;
+  }
+  bool cap1 = false, cap2 = false;  // a capture decided 1 / 2 clocks ago (its last products reach acc at cap1)
   for (int i = 0; i < EDONE; i++) {
 #pragma HLS UNROLL
     edl[i] = false;
@@ -542,16 +553,18 @@ main:
       wq[q] = wcur[q];
     }
 #endif
-    for (int a = 0; a < TB; a++) {
+    // 2. the MAC pipeline (review R1): this clock's operands go into registers (xd, wd: the DSP's A / B inputs
+    //    come from flip-flops, not from the URAM output and the live select), the products of the operands
+    //    registered one clock earlier go into acc (acc <= acc + xd * wd: the DSP's P register with its own Z = P
+    //    feedback). A block is captured from the registered acc two clocks after its last MAC decision (cap2),
+    //    i.e. from the P register's output (never from the adder output), before this clock's add.
+    const int er1 = (er + 1) & (EROWS - 1);  // the emit's next row, read before this clock's capture (below)
+    EWord onext;
+    for (int j = 0; j < EW; j++) {
 #pragma HLS UNROLL
-      const I16 xv = live ? x_lane(xr[a / 4], a % 4) : (I16)0;
-      for (int l = 0; l < LANES; l++) {
-#pragma HLS UNROLL
-        acc_add(acc[a][l], xv, w_lane16(wq[l / FL], l % FL));
-      }
+      ew_set(onext, j, shadow[er1 >> 1][(er1 & 1) * EW + j]);
     }
-    // 2. capture at the block's last MAC: the sums including this clock's products (the DSP outputs)
-    if (capture) {
+    if (cap2) {
       for (int a = 0; a < TB; a++) {
 #pragma HLS UNROLL
         for (int l = 0; l < LANES; l++) {
@@ -560,17 +573,34 @@ main:
         }
       }
     }
-    // 3. emit side: obuf (shadow row er; r = 2 * token + half of the 32 lanes) goes to es; its write's own
-    //    result advances the emit (a full() test would be hoisted to the start of the clock and then has to follow
-    //    the previous clock's late write: II = 2). The next row is read from the registered er beside the write,
-    //    after the capture in program order, so only a 2:1 select follows the FIFO handshake.
-    bool edone = false;
-    const int er1 = (er + 1) & (EROWS - 1);
-    EWord onext;
+    EWord orow0;  // the first emit word of a block captured now: token 0, lanes 0..15 (from the P registers)
     for (int j = 0; j < EW; j++) {
 #pragma HLS UNROLL
-      ew_set(onext, j, shadow[er1 >> 1][(er1 & 1) * EW + j]);
+      ew_set(orow0, j, cap_of(acc[0][j]));
     }
+    for (int a = 0; a < TB; a++) {
+#pragma HLS UNROLL
+      for (int l = 0; l < LANES; l++) {
+#pragma HLS UNROLL
+        acc_add(acc[a][l], xd[a], wd[l]);
+      }
+    }
+    for (int a = 0; a < TB; a++) {
+#pragma HLS UNROLL
+      xd[a] = live ? x_lane(xr[a / 4], a % 4) : (I16)0;
+    }
+    for (int l = 0; l < LANES; l++) {
+#pragma HLS UNROLL
+      wd[l] = w_lane16(wq[l / FL], l % FL);
+    }
+    const bool cap_now = cap2;
+    cap2 = cap1;
+    cap1 = capture;
+    // 3. emit side: obuf (shadow row er; r = 2 * token + half of the 32 lanes) goes to es; its write's own
+    //    result advances the emit (a full() test would be hoisted to the start of the clock and then has to follow
+    //    the previous clock's late write: II = 2). The next row (onext) was read from the registered er before
+    //    the capture in program order, so only a 2:1 select follows the FIFO handshake.
+    bool edone = false;
     if (emitting) {
       if (es.write_nb(obuf)) {
         if (er == EROWS - 1) {
@@ -581,11 +611,8 @@ main:
         obuf = onext;
       }
     }
-    if (capture) {  // never while emitting: the MAC side saw the shadow free, EDONE clocks after its last row
-      for (int j = 0; j < EW; j++) {
-#pragma HLS UNROLL
-        ew_set(obuf, j, cap_of(acc[0][j]));  // row 0: token 0, lanes 0..15 of the block just captured
-      }
+    if (cap_now) {  // never while emitting: the MAC side saw the shadow free, EDONE clocks after its last row
+      obuf = orow0;  // row 0: token 0, lanes 0..15 of the block just captured
       emitting = true;
       er = 0;
     }
@@ -711,20 +738,23 @@ main:
   }
 }
 
-// Process 4: block sums -> FP32. Captures of one accumulator differ by exactly its block sum (mod 2^43).
-static void dequant16(Fifo16<IoWord>& srow_s, Fifo16<IoWord>& stok_s, Fifo16<EWord>& es, Fifo16<YWord16>& ys,
+// Process 4: block sums -> FP32, 4 values per clock (review R2 / CONTRACT E-1: the io store takes 4 FP32 per clock,
+// so 16 dequantizer lanes bought nothing but 72 DSPs). One emit word (16 captures) is held for 4 clocks.
+// Captures of one accumulator differ by exactly its block sum (mod 2^43).
+constexpr int DQL = 4;         // dequantizer lanes
+constexpr int DQS = EW / DQL;  // clocks per emit word
+static void dequant16(Fifo16<IoWord>& srow_s, Fifo16<IoWord>& stok_s, Fifo16<EWord>& es, Fifo16<IoWord>& ys,
                       int groups, int nblk, int ntiles) {
   float srow[M_MAX];
-#pragma HLS ARRAY_PARTITION variable = srow cyclic factor = 16
+#pragma HLS ARRAY_PARTITION variable = srow cyclic factor = 4
   float stok[NTT];
-#pragma HLS ARRAY_PARTITION variable = stok cyclic factor = 4
-  Cap prev[EROWS][EW];
+  Cap prev[EROWS * DQS][DQL];  // [row * 4 + quarter][lane]
 #pragma HLS ARRAY_PARTITION variable = prev complete dim = 2
 #pragma HLS BIND_STORAGE variable = prev type = ram_2p impl = lutram
 prev_zero:
-  for (int r = 0; r < EROWS; r++) {
+  for (int r = 0; r < EROWS * DQS; r++) {
 #pragma HLS PIPELINE II = 1
-    for (int j = 0; j < EW; j++) {
+    for (int j = 0; j < DQL; j++) {
 #pragma HLS UNROLL
       prev[r][j] = 0;
     }
@@ -750,52 +780,57 @@ tiles_dq:
         stok[F4 * i + j] = fstream::io_lane(v, j);
       }
     }
-    int g = 0, b = 0, r = 0;
+    int g = 0, b = 0, r = 0, q = 0;
+    EWord cw = EWord();
   dq:
-    for (int it = 0; it < groups * nbt * EROWS; it++) {
+    for (int it = 0; it < groups * nbt * EROWS * DQS; it++) {
 #pragma HLS PIPELINE II = 1
 #pragma HLS DEPENDENCE variable = prev inter false
-      const EWord cw = es.read();
+      if (q == 0) cw = es.read();
       const float st = stok[b * TB + (r >> 1)];
-      YWord16 o;
-      for (int j = 0; j < EW; j++) {
+      IoWord o;
+      for (int j = 0; j < DQL; j++) {
 #pragma HLS UNROLL
-        const Cap c = ew_get(cw, j);
-        const U43 d = cap_diff(c, prev[r][j]);
-        prev[r][j] = c;
-        const float sr = srow[g * LANES + (r & 1) * EW + j];
-        y16_set(o, j, fmul_dq(fmul_dq(i43_to_f32(d), sr), st));
+        const Cap c = ew_get(cw, j);  // lanes 4q..4q+3 of the word: shifted down by 4 values per clock
+        const U43 d = cap_diff(c, prev[r * DQS + q][j]);
+        prev[r * DQS + q][j] = c;
+        const float sr = srow[g * LANES + (r & 1) * EW + DQL * q + j];
+        fstream::io_set(o, j, fmul_dq(fmul_dq(i43_to_f32(d), sr), st));
       }
       ys.write(o);
-      if (r == EROWS - 1) {
-        r = 0;
-        if (b == nbt - 1) {
-          b = 0;
-          g++;
+      cw = ew_shift4(cw);
+      if (q == DQS - 1) {
+        q = 0;
+        if (r == EROWS - 1) {
+          r = 0;
+          if (b == nbt - 1) {
+            b = 0;
+            g++;
+          } else {
+            b++;
+          }
         } else {
-          b++;
+          r++;
         }
       } else {
-        r++;
+        q++;
       }
     }
   }
 }
 
 // Process 5: one burst per (tile, group): Y[g][rows of the tile][32] FP32.
-static void store16(Fifo16<YWord16>& ys, IoWord* ymem, int groups, int nblk, int ntiles) {
+static void store16(Fifo16<IoWord>& ys, IoWord* ymem, int groups, int nblk, int ntiles) {
 tiles_st:
   for (int t = 0; t < ntiles; t++) {
     const int nbt = blocks_of_tile(nblk, t);
   groups_st:
     for (int g = 0; g < groups; g++) {
       const size_t base = ((size_t)g * nblk + (size_t)t * NBX) * YW_BLK;
-      YWord16 cur;
     store_y:
       for (int i = 0; i < nbt * YW_BLK; i++) {
 #pragma HLS PIPELINE II = 1
-        if ((i & 3) == 0) cur = ys.read();
-        ymem[base + i] = y16_part(cur, i & 3);
+        ymem[base + i] = ys.read();
       }
     }
   }
@@ -807,7 +842,7 @@ static void run_all16(const WPort* w0, const WPort* w1, const WPort* w2, const W
   Fifo16<WPort> s0, s1, s2, s3;
   Fifo16<IoWord> xs, srow_s, stok_s;
   Fifo16<EWord> es;
-  Fifo16<YWord16> ys;
+  Fifo16<IoWord> ys;
 #pragma HLS STREAM variable = s0 depth = WFIFO16
 #pragma HLS STREAM variable = s1 depth = WFIFO16
 #pragma HLS STREAM variable = s2 depth = WFIFO16
@@ -822,7 +857,7 @@ static void run_all16(const WPort* w0, const WPort* w1, const WPort* w2, const W
 #pragma HLS STREAM variable = srow_s depth = SFIFO
 #pragma HLS STREAM variable = stok_s depth = SFIFO
 #pragma HLS STREAM variable = es depth = 4
-#pragma HLS STREAM variable = ys depth = 16
+#pragma HLS STREAM variable = ys depth = 16  // 4 FP32 per word
 #pragma HLS BIND_STORAGE variable = xs type = fifo impl = lutram
 #pragma HLS BIND_STORAGE variable = srow_s type = fifo impl = srl
 #pragma HLS BIND_STORAGE variable = stok_s type = fifo impl = srl
@@ -840,7 +875,7 @@ static void run_all16(const WPort* w0, const WPort* w1, const WPort* w2, const W
 // the shim shifts them to run slices of groups). ymem: Y[M/32][Np][32] FP32.
 static int linear_int16_core(const WPort* w0, const WPort* w1, const WPort* w2, const WPort* w3, const IoWord* xmem,
                              IoWord* ymem, int M, int K, int N, int off_stok, int off_x) {
-  if (M % LANES || M < LANES || M > M_MAX || K < 1 || K > K_MAX || N < 1) return 1;
+  if (M % LANES || M < LANES || M > M_MAX || K < 1 || K > K_MAX || N < 1 || N > 65535) return 1;  // N + 31 in int
   const int groups = M / LANES;
   const int nblk = (N + TB - 1) / TB;
   const int ntiles = (nblk + NBX - 1) / NBX;

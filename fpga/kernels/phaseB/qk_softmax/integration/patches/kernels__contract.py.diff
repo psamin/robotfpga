@@ -1,0 +1,121 @@
+--- a/fpga/kernels/contract.py
++++ b/fpga/kernels/contract.py
+@@ -222,6 +222,7 @@
+         C.OP_SILU_MUL: C.FLAGS_ACT,
+         C.OP_ROPE: C.FLAGS_ROPE,
+         C.OP_SOFTMAX: C.FLAGS_SOFTMAX,
++        C.OP_QK_SOFTMAX: C.FLAGS_QKSMX,
+         C.OP_COPY: C.FLAGS_COPY,
+     }.get(c.op, 0)
+     if c.flags & ~allowed:
+@@ -270,6 +271,41 @@
+         if bias:
+             used.add("G")
+             if r := _check_slot(S["G"], B, 1, 4 * M, 0, True, full):
++                return r
++    elif c.op == C.OP_QK_SOFTMAX:  # = ctr::validate_qks_t (phase B)
++        if not c.flags & C.F_QOUT:
++            return C.ME_FLAGS
++        if M < C.ENGINE_LANES or M > C.QKS_L_MAX or M % C.ENGINE_LANES or K < 8 or K > C.GEMM_K_MAX or K % 8:
++            return C.ME_DIMS
++        NP = p[C.P_NP] or N
++        if NP < N or NP > C.N_MAX:
++            return C.ME_PARAM
++        mul = bits_f32(p[C.P_EPS])
++        if not (0.0 < mul < 1e30):
++            return C.ME_PARAM
++        if any(v for i, v in enumerate(p) if i not in (C.P_EPS, C.P_NP)):
++            return C.ME_PARAM
++        used = {"A", "B", "C", "F", "G", "H"}
++        if r := _check_slot(S["A"], B, N, 2 * K, 2 * K, False, full):
++            return r
++        port = (M // C.ENGINE_LANES) * K * 16
++        if not _aligned(S["B"]) or S["B"].pitch < port:
++            return C.ME_ALIGN
++        if S["B"].addr >= C.ADDR_LIMIT or (full and _end(S["B"], B, C.ENGINE_PORTS, port) > C.ADDR_LIMIT):
++            return C.ME_ADDR
++        for r in (
++            _check_slot(S["C"], B, NP, 2 * M, 2 * M, False, full),
++            _check_slot(S["F"], B, 1, 4 * pad4(NP), 0, True, full),
++            _check_slot(S["G"], B, 1, 4 * pad4(N), 0, True, full),
++            _check_slot(S["H"], B, 1, 4 * M, 0, True, full),
++        ):
++            if r:
++                return r
++        if c.flags & C.F_MASK:
++            used |= {"D", "E"}
++            if r := _check_slot(S["D"], B, 1, 4 * pad4(N), 0, True, full):
++                return r
++            if r := _check_slot(S["E"], B, 1, 4 * M, 0, True, full):
+                 return r
+     elif c.op == C.OP_SOFTMAX:
+         if K < 8 or K > C.SMX_L_MAX or K % 8:
+@@ -781,6 +817,56 @@
+             ),
+         )
+     )
++    qks = Cmd(  # QK_SOFTMAX (phase B): the expert self-attention shape
++        C.OP_QK_SOFTMAX,
++        C.F_QOUT | C.F_MASK,
++        11,
++        128,
++        64,
++        156,
++        5,
++        {
++            "A": Slot(0x7B00_0000, 128, 156 * 128),
++            "B": Slot(0x7C00_0000, 4 * 64 * 16, 4 * 4 * 64 * 16),
++            "C": Slot(0x7D00_0000, 256, 156 * 256),
++            "D": Slot(0x7E00_0000),
++            "E": Slot(0x7E00_1000),
++            "F": Slot(0x7E00_2000, 0, 624),
++            "G": Slot(0x7E00_4000, 0, 624),
++            "H": Slot(0x7E00_6000, 0, 512),
++        },
++        {C.P_EPS: f32bits(1.0)},
++    )
++
++    def qv(name, **kw):
++        s = dict(qks.s) | kw.pop("s", {})
++        for k in kw.pop("drop", ()):
++            s.pop(k)
++        out.append((name, Cmd(qks.op, kw.pop("flags", qks.flags), 11, kw.pop("M", 128), kw.pop("K", 64),
++                              kw.pop("N", 156), 5, s, kw.pop("p", dict(qks.p)))))
++
++    qv("qks_ok")
++    qv("qks_vision_ok", flags=C.F_QOUT, drop=("D", "E"), M=256, N=256,
++       s={"A": Slot(0x7B00_0000, 128, 256 * 128), "B": Slot(0x7C00_0000, 8 * 64 * 16, 4 * 8 * 64 * 16),
++          "C": Slot(0x7D00_0000, 512, 256 * 512), "F": Slot(0x7E00_2000, 0, 1024), "G": Slot(0x7E00_4000, 0, 1024),
++          "H": Slot(0x7E00_6000, 0, 1024)})
++    qv("qks_np_ok", p={C.P_EPS: f32bits(1.0), C.P_NP: 160})
++    qv("qks_m288", M=288)
++    qv("qks_m48", M=48)
++    qv("qks_k81", K=81)
++    qv("qks_noqout", flags=C.F_MASK)
++    qv("qks_bias_flag", flags=C.F_QOUT | C.F_MASK | C.F_BIAS)
++    qv("qks_retired_flag", flags=C.F_QOUT | C.F_MASK | 0x1000)
++    qv("qks_np_lt_n", p={C.P_EPS: f32bits(1.0), C.P_NP: 100})
++    qv("qks_p0_zero", p={})
++    qv("qks_p2_set", p={C.P_EPS: f32bits(1.0), C.P_SEGC: 4})
++    qv("qks_short_c_pitch", s={"C": Slot(0x7D00_0000, 128, 156 * 256)})
++    qv("qks_short_port", s={"B": Slot(0x7C00_0000, 2048, 4 * 4 * 64 * 16)})
++    qv("qks_unaligned_h", s={"H": Slot(0x7E00_6008, 0, 512)})
++    qv("qks_h_past_40bit", s={"H": Slot((1 << 40) - 2048, 0, 512)})
++    qv("qks_h_bit40", s={"H": Slot(1 << 40, 0, 0)})
++    qv("qks_stray_d", flags=C.F_QOUT)
++    qv("qks_unaligned_e", s={"E": Slot(0x7E00_1004)})
+     return out
+ 
+ 
+@@ -796,6 +882,11 @@
+     "softmax_l264": "DIMS", "softmax_fp32out": "FLAGS", "rope_q": "OK", "rope_seg32": "DIMS",
+     "rope_kw_and_q": "FLAGS", "silu_mul": "OK", "silu_nomul_stray_b": "SLOT", "copy_shuffle": "OK",
+     "copy_flag_q": "FLAGS", "gelu_n0": "DIMS", "gelu_n65536": "DIMS",
++    "qks_ok": "OK", "qks_vision_ok": "OK", "qks_np_ok": "OK", "qks_m288": "DIMS", "qks_m48": "DIMS",
++    "qks_k81": "DIMS", "qks_noqout": "FLAGS", "qks_bias_flag": "FLAGS", "qks_retired_flag": "FLAGS",
++    "qks_np_lt_n": "PARAM", "qks_p0_zero": "PARAM", "qks_p2_set": "PARAM", "qks_short_c_pitch": "ALIGN",
++    "qks_short_port": "ALIGN", "qks_unaligned_h": "ALIGN", "qks_h_past_40bit": "ADDR", "qks_h_bit40": "ADDR",
++    "qks_stray_d": "SLOT", "qks_unaligned_e": "ALIGN",
+ }  # fmt: skip
+ 
+ 

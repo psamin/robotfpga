@@ -45,6 +45,15 @@ CODE = [
     "fpga/board/profile_arm.py",
     "fpga/board/setup_board.sh",
     "fpga/hls/pack_float.py",
+    # the command-list path (cmdlist.py: --path list) and what it imports from the contract and the builder
+    "fpga/board/cmdlist.py",
+    "fpga/board/test_cmdlist.py",
+    "fpga/kernels/contract.h",
+    "fpga/kernels/contract.py",
+    "fpga/kernels/contract_plan.py",
+    "fpga/kernels/sequencer/build_smolvla.py",
+    "fpga/kernels/sequencer/exec_ref.py",
+    "fpga/kernels/rope/rope_emu.py",
 ]
 CKPT = ["config.json", "model.safetensors", "policy_preprocessor.json", "policy_postprocessor.json"]
 JUP = "/root/jupyter_notebooks"

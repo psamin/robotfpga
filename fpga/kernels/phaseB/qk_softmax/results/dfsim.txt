@@ -1,0 +1,19 @@
+| shape | L x K x N | QK_SOFTMAX model | closed form | ratio | its GEMM item alone: model | closed form | ratio | peak FIFO words (fused) |
+|---|---|---|---|---|---|---|---|---|
+| vision | 256 x 64 x 256 | 21675 | 21248 | 1.020 | 17297 | 16896 | 1.024 | rs 0, es 4, ss 32, sxs 1, eq 1, rq 63 |
+| lm | 64 x 64 x 144 | 4383 | 3984 | 1.100 | 3456 | 3072 | 1.125 | rs 32, es 4, ss 32, sxs 1, eq 1, rq 35 |
+| expert_self | 128 x 64 x 156 | 8110 | 7708 | 1.052 | 6016 | 5632 | 1.068 | rs 32, es 4, ss 32, sxs 1, eq 1, rq 38 |
+| expert_cross | 64 x 64 x 156 | 4590 | 4188 | 1.096 | 3456 | 3072 | 1.125 | rs 32, es 4, ss 32, sxs 1, eq 1, rq 38 |
+| edge_n1 | 32 x 64 x 1 | 864 | 526 | 1.643 | 864 | 512 | 1.688 | rs 1, es 4, ss 1, sxs 1, eq 1, rq 1 |
+| edge_n65_L256 | 256 x 64 x 65 | 9252 | 8833 | 1.047 | 7024 | 6656 | 1.055 | rs 16, es 4, ss 1, sxs 1, eq 1, rq 16 |
+| edge_n300_L32 | 32 x 64 x 300 | 5596 | 5224 | 1.071 | 3488 | 3072 | 1.135 | rs 0, es 4, ss 32, sxs 39, eq 16, rq 62 |
+| edge_k8 | 64 x 8 x 100 | 3344 | 2788 | 1.199 | 2648 | 2112 | 1.254 | rs 16, es 4, ss 1, sxs 1, eq 1, rq 24 |
+| edge_k136 | 96 x 136 x 130 | 6591 | 5874 | 1.122 | 5632 | 4928 | 1.143 | rs 16, es 4, ss 16, sxs 1, eq 1, rq 32 |
+
+(engine s_tok FIFO at 8 words: deadlock: the engine's own s_tok FIFO needs >= 16 words (its pragma depth is 32))
+the fusion's FIFOs at depth 1-2 (rs 1; ss, sxs, smx, eq, sq 2; rq 64 = one block of scales):
+  vision: no deadlock, 21675 clocks
+  lm: no deadlock, 4383 clocks
+  expert_self: no deadlock, 8110 clocks
+  edge_n300_L32: no deadlock, 5625 clocks
+negative control (rq 56 < 64 words, 256-row block): deadlock detected as required: DEADLOCK at clock 40178: blocked ['compute', 'divider', 'sbuf', 'store']; occupancy {'xr': 0, 'xs': 0, 'stok': 0, 'srow'

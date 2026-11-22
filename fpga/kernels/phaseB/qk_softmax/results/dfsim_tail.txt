@@ -1,0 +1,9 @@
+  File "C:\Users\athit\robotfpga\fpga\kernels\phaseB\qk_softmax\dfsim_qks.py", line 377, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "C:\Users\athit\robotfpga\fpga\kernels\phaseB\qk_softmax\dfsim_qks.py", line 360, in main
+    clk, _ = item(L, K, N, mask, small)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\athit\robotfpga\fpga\kernels\phaseB\qk_softmax\dfsim_qks.py", line 321, in item
+    raise RuntimeError(f"DEADLOCK at clock {clk}: blocked {sorted(live)}; occupancy {occ}")
+RuntimeError: DEADLOCK at clock 20003: blocked ['compute', 'compute16', 'dequant', 'divider', 'load_io', 'sbuf', 'store', 'xpose']; occupancy {'xr': 0, 'xs': 0, 'stok': 2, 'srow': 0, 'rs': 0, 'es': 0, 'ss': 0, 'sxs': 0, 'smx': 0, 'eq': 0, 'sq': 0, 'rq': 0}

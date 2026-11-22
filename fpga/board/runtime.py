@@ -967,12 +967,17 @@ def fusion_groups(model) -> list[list[str]]:
     """Names of nn.Linear modules that take the same input tensor, by module structure: q_proj/k_proj/
     v_proj with equal in_features (SigLIP, the LM, the expert's self-attention layers; the expert's
     cross-attention k/v take the prefix cache, so their in_features differ from q's) and gate_proj/
-    up_proj of a gated MLP (one call, outputs un-tiled into q, k, v / gate, up)."""
+    up_proj of a gated MLP (one call, outputs un-tiled into q, k, v / gate, up). Where skip_dead_lm_layer
+    replaced q_proj, k_proj/v_proj (same input) are a pair."""
     from torch import nn
 
     groups = []
     for name, mod in model.named_modules():
-        for attrs in (("q_proj", "k_proj", "v_proj"), ("gate_proj", "up_proj")):
+        dead_q = type(getattr(mod, "q_proj", None)).__name__ == "ZerosModule"
+        for attrs in (
+            ("k_proj", "v_proj") if dead_q else ("q_proj", "k_proj", "v_proj"),
+            ("gate_proj", "up_proj"),
+        ):
             lins = [getattr(mod, a, None) for a in attrs]
             if all(isinstance(li, nn.Linear) for li in lins) and len({li.in_features for li in lins}) == 1:
                 groups.append([f"{name}.{a}" if name else a for a in attrs])
@@ -1219,3 +1224,84 @@ def overlap_image_embedding(
             vwe.embed_image = orig_embed_image
 
     model.embed_prefix = types.MethodType(embed_prefix, model)
+
+
+def trim_tokens(lang_tokens, lang_masks):
+    """Drop the language columns no row of the batch uses (tokenizer padding "max_length" -> "longest"; the
+    -12392 task: 48 -> 12 tokens, prefix 81 -> 45). Exact for the actions: pad tokens neither attend nor are
+    attended (make_att_2d_masks) and do not advance the positions (cumsum of the pad mask), so removing them
+    leaves every valid token's inputs unchanged; only the order of the zero terms in the attention sums
+    moves."""
+    keep = lang_masks.bool().any(0)
+    if bool(keep.all()):
+        return lang_tokens, lang_masks
+    return lang_tokens[:, keep], lang_masks[:, keep]
+
+
+def trim_language(policy) -> None:
+    """policy.model.sample_actions on the real language tokens only (trim_tokens)."""
+    import types
+
+    model = policy.model
+    orig = model.sample_actions
+
+    def sample_actions(self, images, img_masks, lang_tokens, lang_masks, state, noise=None, **kw):
+        lang_tokens, lang_masks = trim_tokens(lang_tokens, lang_masks)
+        return orig(images, img_masks, lang_tokens, lang_masks, state, noise=noise, **kw)
+
+    model.sample_actions = types.MethodType(sample_actions, model)
+    model._fpga_lang_trim = True
+
+
+def skip_dead_lm_layer(policy) -> list[str]:
+    """Skip the work of the last VLM text layer that nothing reads (design study 1.3; contract_plan skips it
+    too): in the prefix prefill only that layer's K/V cache reaches the expert (cross-attention layer 15 reads
+    it); its q_proj, the attention output's o_proj, the MLP and the text model's final norm feed only the
+    prefill's output embeddings, which sample_actions discards. The denoising steps never run the VLM layers
+    (their hidden state is None there). So q_proj / o_proj / mlp of that layer return zeros and the final norm
+    is the identity: the actions are bit-identical. Inference only (training uses those outputs). Call before
+    fpga_linears, so the skipped linears are never packed. Returns the replaced module names."""
+    from torch import nn
+
+    vwe = policy.model.vlm_with_expert
+    if "cross" not in str(vwe.attention_mode):
+        raise ValueError("skip_dead_lm_layer: only for cross-attention experts (the expert reads K/V only)")
+    text = vwe.get_vlm_model().text_model
+    i = vwe.num_vlm_layers - 1
+    layer = text.layers[i]
+    every = vwe.self_attn_every_n_layers
+    if every > 0 and i % every == 0:
+        raise ValueError(
+            "skip_dead_lm_layer: the last layer is a self-attention layer (the expert reads its q)"
+        )
+    a = layer.self_attn
+    old = {"q": a.q_proj, "o": a.o_proj, "mlp": layer.mlp, "norm": text.norm}
+    names = {id(m): n for n, m in policy.named_modules()}
+    a.q_proj = _ZerosModule(a.q_proj.out_features, a.q_proj.weight.dtype)
+    a.o_proj = _ZerosModule(a.o_proj.out_features, a.o_proj.weight.dtype)
+    layer.mlp = _ZerosModule(None, a.o_proj.weight.dtype)
+    text.norm = nn.Identity()
+    return [names[id(m)] for m in old.values()]
+
+
+def _zeros_module_class():
+    import torch
+    from torch import nn
+
+    class ZerosModule(nn.Module):
+        """Zeros of the replaced module's output shape; keeps an empty `weight` of its dtype
+        (smolvlm_with_expert casts its inputs to q_proj.weight.dtype / o_proj.weight.dtype)."""
+
+        def __init__(self, out_features, dtype):
+            super().__init__()
+            self.out_features = out_features
+            self.register_buffer("weight", torch.empty(0, dtype=dtype), persistent=False)
+
+        def forward(self, x):
+            return x.new_zeros(*x.shape[:-1], self.out_features or x.shape[-1])
+
+    return ZerosModule
+
+
+def _ZerosModule(out_features, dtype):  # noqa: N802 - a module factory (torch is imported lazily here)
+    return _zeros_module_class()(out_features, dtype)

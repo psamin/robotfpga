@@ -1,0 +1,339 @@
+// Phase-B fusion qk_softmax: the tail of the GEMM unit's DATAFLOW region for OP_QK_SOFTMAX (contract_qks.h).
+//
+//   ... compute16 -> dequant_ep --ss--> sbuf --sxs/smx--> smx::compute --eq/sq--> smx::divider --rq--> store
+//                    load_io  --rs--> sbuf (rank_k once per item, rank_q per tile; F_MASK only)
+//
+// dequant_ep is the GEMM's own (4 FP32 per clock, the contract epilogue without bias / D), so every score is the
+// unfused GEMM's FP32 value bit for bit. smx::compute and smx::divider are the SOFTMAX unit's processes
+// (fpga/kernels/softmax/softmax_core.h), unchanged: they get the rows in the order and the stream format the
+// SOFTMAX unit's reader gives them (per real row: the row max bits on smx, then L/4 words + 4 visibility bits on
+// sxs). So P and the scales are the unfused pair's bit for bit, and the tail adds no DSP: the only arithmetic of
+// sbuf is the visibility compare and the row max (integer compares on FP32 total-order keys).
+//
+// sbuf: one process, one flat II = 1 loop with two sides (as int16_linear.h's xpose):
+//   fill   takes the dequantizer's words in the engine's order (tile t, group g, block b, token, 8 words of 4
+//          keys), computes the 4 visibility bits (rank_k of the 4 keys, rank_q of the row: 0 <= E[k] <= D[n]),
+//          writes (bits, word) to the score buffer at [half][row][g * 8 + w], and keeps each row's running max
+//          over the visible keys (33-bit key: visible, FP32 total order) in rmax[half][row];
+//   drain  sends tile t's rows once the whole tile is in: per row the max bits, then the row's L/4 words.
+// The score buffer holds two tiles (ping-pong): 2 x NTT rows x 64 words of 132 bits (2 x 64 KB of scores at
+// NTT = 64, L = 256), URAM. Fill of tile t + 1 overlaps the drain (and the softmax) of tile t.
+// Handshakes between the sides go through SB_SETTLE-clock delay lines (the buffer's write-to-read distance),
+// so no decision depends on the other side's state of the same clock.
+// The drain writes with blocking writes (a full sxs / smx stalls the loop; their consumer, smx::compute, never
+// waits on sbuf's fill side, so the stall ends); the fill side reads ss and rs non-blocking.
+#pragma once
+#include <ap_int.h>
+#include <hls_stream.h>
+#include <stdint.h>
+
+#include "../kernels/softmax/softmax_core.h"
+#include "int16_linear.h"
+
+namespace qks {
+
+using fstream::IoWord;
+using fstream16::Fifo16;
+using fstream16::NTT;
+using fstream16::TB;
+
+typedef smx::Word AWord;  // ap_uint<128>
+typedef smx::XW XW;       // ap_uint<132>: 4 FP32 + 4 visibility bits
+typedef smx::Key Key;     // ap_uint<33>
+
+constexpr int WROW = smx::W_MAX;  // buffer words per row (64: L <= 256)
+constexpr int SB_SETTLE = 8;      // clocks between a side's last access of a half and the other side's first
+constexpr int RQW = NTT / 4;      // rank_q words per tile
+#ifdef __VITIS_HLS__
+typedef ap_uint<2> occ2_t;  // 0..2 halves
+#else
+typedef uint8_t occ2_t;
+#endif
+
+// ---------------------------------------------------------------- IoWord <-> ap_uint<128> (same bytes)
+#ifdef __VITIS_HLS__
+static inline AWord io2a(const IoWord& w) {
+#pragma HLS INLINE
+  return (AWord)w;
+}
+static inline IoWord a2io(const AWord& w) {
+#pragma HLS INLINE
+  return (IoWord)w;
+}
+template <class W>
+static inline W a2w(const AWord& a) {
+#pragma HLS INLINE
+  return (W)a;
+}
+#else
+static inline AWord io2a(const IoWord& w) {
+  AWord a = 0;
+  for (int j = 0; j < 4; j++) {
+    uint32_t u;
+    memcpy(&u, &w.v[j], 4);
+    a.range(32 * j + 31, 32 * j) = u;
+  }
+  return a;
+}
+static inline IoWord a2io(const AWord& a) {
+  IoWord w;
+  for (int j = 0; j < 4; j++) {
+    const uint32_t u = (uint32_t)a.range(32 * j + 31, 32 * j);
+    memcpy(&w.v[j], &u, 4);
+  }
+  return w;
+}
+template <class W>
+static inline W a2w(const AWord& a) {
+  static_assert(sizeof(W) == 16, "io words are 128 bits");
+  const IoWord w = a2io(a);
+  W r;
+  memcpy(&r, &w, 16);
+  return r;
+}
+#endif
+
+// ---------------------------------------------------------------- the softmax side of one item
+struct Tail {
+  bool on;            // OP_QK_SOFTMAX (else every tail process runs zero iterations)
+  bool mask;          // F_MASK
+  int N, G, ntiles;   // rows, key groups of 32 (L = 32 G), engine tiles of NTT rows
+  int W;              // L / 4: words per row
+};
+
+// ---------------------------------------------------------------- sbuf
+static void sbuf(Fifo16<IoWord>& ss, Fifo16<IoWord>& rs, smx::XStream& sxs, smx::MStream& smx_s, const Tail tl) {
+  if (!tl.on) return;
+  XW sb[2 * NTT * WROW];  // [half][row][word]
+#pragma HLS BIND_STORAGE variable = sb type = ram_s2p impl = uram
+  Key rmax[2 * NTT];  // [half][row]: running max key of the row over the groups filled so far
+#pragma HLS BIND_STORAGE variable = rmax type = ram_1wnr impl = lutram
+  AWord etab[WROW];  // rank_k of keys 4i..4i+3
+#pragma HLS BIND_STORAGE variable = etab type = ram_s2p impl = lutram
+  AWord rqt[RQW];  // rank_q of the fill tile's rows 4i..4i+3
+#pragma HLS BIND_STORAGE variable = rqt type = ram_s2p impl = lutram
+  if (tl.mask) {
+  rk_in:
+    for (int i = 0; i < tl.W; i++) {
+#pragma HLS PIPELINE II = 1
+#pragma HLS LOOP_TRIPCOUNT min = 8 max = 64
+      etab[i] = io2a(rs.read());
+    }
+  }
+  const int last_m1 = tl.N - (tl.ntiles - 1) * NTT - 1;  // rows of the last tile, minus one
+  // fill side: half, group, block, token, word; the rank_q words still to read for this tile
+  int fg = 0, fb = 0, ftok = 0, fw = 0, frq = tl.mask ? RQW : 0;
+  bool fh = false;
+  int fleft = tl.ntiles - 1;                         // tiles after the fill tile
+  bool fmore = true;                                 // a tile is left to fill
+  int fnv_m1 = fleft == 0 ? last_m1 : NTT - 1;       // rows of the fill tile, minus one
+  int fvb_m1 = fnv_m1 < TB ? fnv_m1 : TB - 1;        // tokens of block fb, minus one
+  Key pm = 0;                                        // the row's max over the words of this group so far
+  // drain side: half, row, word (0: the max, 1..W: data)
+  int drow = 0, dw = 0;
+  bool dh = false;
+  int dleft = tl.ntiles - 1;                         // tiles after the drain tile
+  bool done = false;                                 // the last tile is drained
+  int dnv_m1 = fnv_m1;
+  // 2-bit occupancy counters, not differences of tile counters (as xpose's wbusy / ravail): halves the fill side
+  // holds (filled, their drain not yet seen), and halves the drain side sees filled and has not drained
+  occ2_t ffull = 0, davail = 0;
+  bool fdl[SB_SETTLE], ddl[SB_SETTLE];
+#pragma HLS ARRAY_PARTITION variable = fdl complete
+#pragma HLS ARRAY_PARTITION variable = ddl complete
+  for (int i = 0; i < SB_SETTLE; i++) {
+#pragma HLS UNROLL
+    fdl[i] = false;
+    ddl[i] = false;
+  }
+#ifndef __SYNTHESIS__
+  long idle = 0;  // host model: the processes run one after the other, so a long idle run means a lost word
+#endif
+sbuf_main:
+  while (true) {
+#pragma HLS PIPELINE II = 1
+#pragma HLS DEPENDENCE variable = sb inter false
+#pragma HLS DEPENDENCE variable = sb intra false
+#pragma HLS DEPENDENCE variable = rmax inter false
+#pragma HLS DEPENDENCE variable = rmax intra false
+#pragma HLS LOOP_TRIPCOUNT min = 64 max = 1048576
+    const bool fin = done;  // registered state; the exit is taken at the end of the body
+    // ---------------- fill side
+    bool ffin = false;
+#ifndef __SYNTHESIS__
+    bool prog = false;
+#endif
+    const bool fgo = fmore && ffull != 2;  // the fill tile's half is free (ffull <= 1: the full one is the other)
+    if (fgo && frq > 0) {  // rank_q of the fill tile's rows (F_MASK)
+      IoWord v;
+      if (rs.read_nb(v)) {
+#ifndef __SYNTHESIS__
+        prog = true;
+#endif
+        rqt[RQW - frq] = io2a(v);
+        frq--;
+      }
+    } else if (fgo) {
+      IoWord v;
+      if (ss.read_nb(v)) {
+#ifndef __SYNTHESIS__
+        prog = true;
+#endif
+        const AWord a = io2a(v);
+        const int row = fb * TB + ftok;
+        const int wi = fg * 8 + fw;
+        const AWord ev = etab[wi];
+        const AWord dwd = rqt[row >> 2];
+        const ap_uint<2> nl = row & 3;
+        const ap_uint<32> dv = nl == 0 ? smx::lane32(dwd, 0) : nl == 1 ? smx::lane32(dwd, 1)
+                             : nl == 2 ? smx::lane32(dwd, 2) : smx::lane32(dwd, 3);
+        ap_uint<4> vis;
+        Key k[4];
+        for (int l = 0; l < 4; l++) {
+#pragma HLS UNROLL
+          // 0 <= E <= D in int32: D >= 0 and E <= D as unsigned (a negative E is >= 2^31 unsigned)
+          vis[l] = !tl.mask || (!dv[31] && smx::lane32(ev, l) <= dv);
+          k[l] = smx::okey(smx::lane32(a, l), vis[l]);
+        }
+        const int ra = (fh ? NTT : 0) + row;
+        sb[ra * WROW + wi] = ((XW)vis << 128) | (XW)a;
+        const Key k01 = k[1] > k[0] ? k[1] : k[0], k23 = k[3] > k[2] ? k[3] : k[2];
+        const Key k4 = k23 > k01 ? k23 : k01;
+        // running max of the row's 8 words of group fg (key 0 is below every key), then folded into rmax
+        const Key pin = fw == 0 ? (Key)0 : pm;
+        const Key cur = k4 > pin ? k4 : pin;
+        pm = cur;
+        if (fw == 7) {  // the row's 32 keys of group fg are in (rmax[ra] was last written >= 8 words ago)
+          const Key stored = fg == 0 ? (Key)0 : rmax[ra];
+          rmax[ra] = cur > stored ? cur : stored;
+        }
+        // advance (word, token, block, group, tile)
+        if (fw == 7) {
+          fw = 0;
+          if (ftok == fvb_m1) {
+            ftok = 0;
+            const int rest_m1 = fnv_m1 - (fb + 1) * TB;  // tokens of block fb + 1, minus one (< 0: none)
+            if (rest_m1 >= 0) {
+              fb++;
+              fvb_m1 = rest_m1 < TB ? rest_m1 : TB - 1;
+            } else {
+              fb = 0;
+              if (fg == tl.G - 1) {
+                fg = 0;
+                ffin = true;
+              } else {
+                fg++;
+                fvb_m1 = fnv_m1 < TB ? fnv_m1 : TB - 1;
+              }
+            }
+          } else {
+            ftok++;
+          }
+        } else {
+          fw++;
+        }
+      }
+    }
+    if (ffin) {
+      fh = !fh;
+      frq = tl.mask ? RQW : 0;
+      fmore = fleft != 0;
+      fnv_m1 = fleft == 1 ? last_m1 : NTT - 1;
+      fvb_m1 = fnv_m1 < TB ? fnv_m1 : TB - 1;
+      fleft--;
+    }
+    // ---------------- drain side (blocking writes: smx::compute takes one word per clock)
+    bool dfin = false;
+    if (davail != 0) {
+#ifndef __SYNTHESIS__
+      prog = true;
+#endif
+      const int ra = (dh ? NTT : 0) + drow;
+      if (dw == 0) {
+        smx_s.write(smx::key_bits(rmax[ra]));
+      } else {
+        sxs.write(sb[ra * WROW + (dw - 1)]);
+      }
+      if (dw == tl.W) {
+        dw = 0;
+        if (drow == dnv_m1) {
+          drow = 0;
+          dfin = true;
+        } else {
+          drow++;
+        }
+      } else {
+        dw++;
+      }
+    }
+    if (dfin) {
+      dh = !dh;
+      done = dleft == 0;
+      dnv_m1 = dleft == 1 ? last_m1 : NTT - 1;
+      dleft--;
+    }
+    // ---------------- handshakes, SB_SETTLE clocks late
+    const bool fseen_ev = fdl[SB_SETTLE - 1], dseen_ev = ddl[SB_SETTLE - 1];
+    if (ffin && !dseen_ev) ffull++;
+    if (!ffin && dseen_ev) ffull--;
+    if (fseen_ev && !dfin) davail++;
+    if (!fseen_ev && dfin) davail--;
+    for (int i = SB_SETTLE - 1; i > 0; i--) {
+#pragma HLS UNROLL
+      fdl[i] = fdl[i - 1];
+      ddl[i] = ddl[i - 1];
+    }
+    fdl[0] = ffin;
+    ddl[0] = dfin;
+#ifndef __SYNTHESIS__
+    idle = prog ? 0 : idle + 1;
+    if (idle > 100000000L) {
+      printf("sbuf: no input for 1e8 iterations (%d tiles left to fill, %d to drain)\n", fleft + 1, dleft + 1);
+      exit(9);
+    }
+#endif
+    if (fin) break;
+  }
+}
+
+// smx::divider reads its first sum unconditionally: a GEMM command must not start it.
+static void divider_if(smx::SStream& sq, smx::RStream& rq, const Tail tl) {
+  if (tl.on) smx::divider(sq, rq);
+}
+
+// The P / scale writer of the store process (OP_QK_SOFTMAX): smx::writer for one item. Per block of <= 256 rows:
+// the P rows (one burst when the C pitch is 2 L, else one per row), then the block's scale words (pad lanes 1.0).
+// p.c / p.f are the item's word addresses.
+template <class W>
+static inline void store_p(smx::QStream& eq, smx::RStream& rq, W* io, const smx::Params& p) {
+#pragma HLS INLINE
+  smx::WAddr rc = p.c, rf = p.f;
+blocks_p:
+  for (ap_uint<17> r0 = 0; r0 < p.NP; r0 += smx::BLK) {
+#pragma HLS LOOP_TRIPCOUNT max = 1
+    const ap_uint<17> left = p.NP - r0;
+    const ap_uint<9> rows = left > smx::BLK ? (ap_uint<9>)smx::BLK : (ap_uint<9>)left;
+    const ap_uint<7> nsw = (rows + 3) >> 2;
+    const ap_uint<9> nb = p.c_contig ? (ap_uint<9>)1 : rows;
+    const ap_uint<14> nw = p.c_contig ? (ap_uint<14>)(rows * p.W2) : (ap_uint<14>)p.W2;
+    const ap_uint<28> step = p.c_contig ? (ap_uint<28>)((ap_uint<28>)p.W2 << 8) : p.cp;
+  bursts_p:
+    for (ap_uint<9> j = 0; j <= nb; j++) {
+#pragma HLS LOOP_TRIPCOUNT max = 2
+      const bool sc = j == nb;
+      const smx::WAddr base = sc ? rf : rc;
+      const ap_uint<14> len = sc ? (ap_uint<14>)nsw : nw;
+    words_p:
+      for (ap_uint<14> i = 0; i < len; i++) {
+#pragma HLS PIPELINE II = 1
+#pragma HLS LOOP_FLATTEN off
+#pragma HLS LOOP_TRIPCOUNT max = 8192
+        io[(uint64_t)(base + i)] = a2w<W>(sc ? rq.read() : eq.read());
+      }
+      if (!sc) rc += step;
+    }
+    rf += smx::BLK / 4;
+  }
+}
+
+}  // namespace qks

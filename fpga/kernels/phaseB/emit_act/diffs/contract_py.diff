@@ -1,0 +1,30 @@
+--- a/fpga/kernels/contract.py	2026-11-21 20:08:59.803521600 -0800
++++ b/fpga/kernels/contract.py	2026-11-21 20:08:59.872186100 -0800
+@@ -242,7 +242,13 @@
+         R, P1 = p[C.P_SEGC], p[C.P_SEGF]
+         if R > N or (R == 0 and P1 != 0) or P1 % C.ALIGN:
+             return C.ME_PARAM
+-        if any(v for i, v in enumerate(p) if i not in (C.P_SEGC, C.P_SEGF)):
++        act = p[C.P_ACT]
++        if act > C.EPI_MAX or (act and R):  # no C row groups with an activation
++            return C.ME_PARAM
++        if act and (acc or (act == C.EPI_SILU_MUL and addd)):
++            return C.ME_FLAGS
++        MO = M // 2 if act == C.EPI_SILU_MUL else M  # output columns
++        if any(v for i, v in enumerate(p) if i not in (C.P_SEGC, C.P_SEGF, C.P_ACT)):
+             return C.ME_PARAM
+         used = {"A", "B", "C", "E", "F"}
+         if r := _check_slot(S["A"], B, N, 2 * K, 2 * K, False, full):
+@@ -253,10 +259,10 @@
+         if S["B"].addr >= C.ADDR_LIMIT or (full and _end(S["B"], B, C.ENGINE_PORTS, port) > C.ADDR_LIMIT):
+             return C.ME_ADDR
+         y = S["C"]
+-        if not _aligned(y) or (N > 1 and R != 1 and y.pitch < 4 * M):
++        if not _aligned(y) or (N > 1 and R != 1 and y.pitch < 4 * MO):
+             return C.ME_ALIGN
+         in_grp, ngrp = (min(N, R), (N - 1) // R) if R else (N, 0)
+-        yend = y.addr + (B - 1) * y.stride + ngrp * P1 + (in_grp - 1) * y.pitch + 4 * M
++        yend = y.addr + (B - 1) * y.stride + ngrp * P1 + (in_grp - 1) * y.pitch + 4 * MO
+         if y.addr >= C.ADDR_LIMIT or (full and yend > C.ADDR_LIMIT):
+             return C.ME_ADDR
+         if addd:

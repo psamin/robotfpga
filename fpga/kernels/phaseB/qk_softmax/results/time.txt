@@ -1,0 +1,38 @@
+| clock | engine items | records | F contract | F fused | saved | T fused | margin 1 in flight | margin 2 in flight | DDR GB saved |
+|---|---|---|---|---|---|---|---|---|---|
+| 300.0 MHz | per-item runs | 2701 -> 2514 | 0.6040 s | 0.5846 s | 19.3 ms | 0.6446 s | +0.3442 s (was +0.3055) | +0.4041 s (was +0.3654) | 0.249 |
+| 300.0 MHz | E-7 (200 clk/item) | 2701 -> 2514 | 0.5991 s | 0.5740 s | 25.1 ms | 0.6340 s | +0.3654 s (was +0.3153) | +0.4253 s (was +0.3752) | 0.249 |
+| 250.0 MHz | per-item runs | 2701 -> 2514 | 0.7243 s | 0.7011 s | 23.2 ms | 0.7611 s | +0.1111 s (was +0.0647) | +0.1710 s (was +0.1246) | 0.249 |
+| 250.0 MHz | E-7 (200 clk/item) | 2701 -> 2514 | 0.7185 s | 0.6884 s | 30.1 ms | 0.7484 s | +0.1366 s (was +0.0765) | +0.1965 s (was +0.1364) | 0.249 |
+| 214.3 MHz | per-item runs | 2701 -> 2514 | 0.8448 s | 0.8177 s | 27.1 ms | 0.8777 s | -0.1220 s (was -0.1762) | -0.0621 s (was -0.1163) | 0.249 |
+| 214.3 MHz | E-7 (200 clk/item) | 2701 -> 2514 | 0.8379 s | 0.8028 s | 35.1 ms | 0.8628 s | -0.0922 s (was -0.1625) | -0.0323 s (was -0.1026) | 0.249 |
+| 200.0 MHz | per-item runs | 2701 -> 2514 | 0.9051 s | 0.8761 s | 29.0 ms | 0.9361 s | -0.2388 s (was -0.2968) | -0.1789 s (was -0.2369) | 0.249 |
+| 200.0 MHz | E-7 (200 clk/item) | 2701 -> 2514 | 0.8978 s | 0.8602 s | 37.6 ms | 0.9202 s | -0.2069 s (was -0.2821) | -0.1470 s (was -0.2222) | 0.249 |
+| 187.5 MHz | per-item runs | 2701 -> 2514 | 0.9655 s | 0.9345 s | 31.0 ms | 0.9945 s | -0.3556 s (was -0.4175) | -0.2957 s (was -0.3576) | 0.249 |
+| 187.5 MHz | E-7 (200 clk/item) | 2701 -> 2514 | 0.9576 s | 0.9175 s | 40.1 ms | 0.9775 s | -0.3216 s (was -0.4018) | -0.2617 s (was -0.3419) | 0.249 |
+
+214.3MHz_noE7: attention records the fusion touches
+| site | contract records | contract ms | contract MB | fused records | fused ms | fused MB |
+|---|---|---|---|---|---|---|
+| vision | 24 | 46.79 | 207.6 | 12 | 29.88 | 57.5 |
+| lm | 30 | 2.36 | 8.9 | 15 | 1.74 | 3.5 |
+| steps (self + cross) | 320 | 35.47 | 145.6 | 160 | 25.92 | 51.9 |
+| total | | 84.62 | 362.1 | | 57.54 | 112.9 |
+
+214.3MHz_E7: attention records the fusion touches
+| site | contract records | contract ms | contract MB | fused records | fused ms | fused MB |
+|---|---|---|---|---|---|---|
+| vision | 24 | 45.95 | 207.6 | 12 | 23.60 | 57.5 |
+| lm | 30 | 2.18 | 8.9 | 15 | 1.45 | 3.5 |
+| steps (self + cross) | 320 | 33.53 | 145.6 | 160 | 21.50 | 51.9 |
+| total | | 81.66 | 362.1 | | 46.55 | 112.9 |
+
+250.0MHz_noE7: attention records the fusion touches
+| site | contract records | contract ms | contract MB | fused records | fused ms | fused MB |
+|---|---|---|---|---|---|---|
+| vision | 24 | 40.10 | 207.6 | 12 | 25.61 | 57.5 |
+| lm | 30 | 2.03 | 8.9 | 15 | 1.49 | 3.5 |
+| steps (self + cross) | 320 | 30.40 | 145.6 | 160 | 22.21 | 51.9 |
+| total | | 72.53 | 362.1 | | 49.32 | 112.9 |
+
+wrote C:\Users\athit\robotfpga\fpga\kernels\phaseB\qk_softmax\results\time.json

@@ -1,0 +1,465 @@
+--- a/fpga/hls/gemm_contract.h
++++ b/fpga/hls/gemm_contract.h
+@@ -28,9 +28,17 @@
+ //   store    ys -> io                   row-major Y, one 128-byte burst per (token, group) (E-3)
+ // The dequantizer and the store run 4 FP32 per clock: a block of 1,024 outputs takes 256 clocks, so blocks of
+ // K < 256 are bound by the store (attention Q.K^T, K = 64), as the contract's time model assumes.
++//
++// Phase B emit_amax (fpga/kernels/phaseB/emit_amax/emit_amax.h, INTEGRATION.md):
++//   p7 = P_AMX_SG (producer): the store also writes the absmax of every (row, segment of P_AMX_SG
++//     groups) of the bits it writes to slot H, one word per 4 rows after a segment's last group (the store loop is
++//     word-level at II = 1: one io word a clock as before, + ceil(rows / 4) clocks per segment and tile).
++//   p8 = P_XQ (consumer): slot A holds FP32 rows and F the absmax parts; load_io quantizes X on the way in
++//     (AMX_QL values a clock) with the contract quantizer and sends s_tok = s 2^p4 itself. No QUANT_X command.
+ #pragma once
+ #include "int16_linear.h"
+ #include "../kernels/contract.h"
++#include "../kernels/phaseB/emit_amax/emit_amax.h"
+ 
+ namespace fgemm {
+ 
+@@ -133,6 +141,12 @@
+   uint64_t yR, yP1, dR, dP1;  // row groups of Y and of the addend (F_ACC: C's), R = 0: none
+   int N, K, groups, nblk, ntiles, nch;
+   bool bias, addd;
++  // emit_amax
++  int asg;           // producer: groups per absmax segment (0 = no absmax output)
++  uint64_t ha, hp;   // slot H of this item, bytes between absmax parts
++  int xq;            // consumer: absmax parts at F (0 = int16 X rows, the 1.0 GEMM)
++  uint64_t fpp;      // F pitch: bytes between parts
++  int shift;         // consumer: s_tok = s 2^p4
+ };
+ 
+ // rows per tile that hold tokens n < N
+@@ -204,23 +218,17 @@
+ struct XGen {  // the X unit walk of one item: unit = 8 words (64 k) of one token row; tokens n >= N read row 0
+   int a, c, n0;
+   uint64_t row, blk_row0;
++  int bt;  // block of the tile (emit_amax: the loader's scale bank row is bt * TB + a)
+ };
+-template <class W>
+-static inline void x_unit(const W* io, const Item& it, XGen& x, Fifo16<IoWord>& xr) {
+-#pragma HLS INLINE
+-  const bool live = x.n0 + x.a < it.N;
+-  const uint64_t base = ((live ? x.row : it.xa) + (uint64_t)x.c * (CK * 2)) >> 4;
+-  for (int w = 0; w < UW; w++) {
+-#pragma HLS UNROLL
+-    const IoWord v = to_io(io[base + w]);
+-    xr.write(live ? v : zero_word());
+-  }
++static inline void x_next(const Item& it, XGen& x) {
++#pragma HLS INLINE
+   if (x.a == TB - 1) {
+     x.a = 0;
+     if (x.c == it.nch - 1) {
+       x.c = 0;
+       x.blk_row0 += (uint64_t)TB * it.xp;
+       x.n0 += TB;
++      x.bt = (x.bt + 1) & (NBX - 1);
+     } else {
+       x.c++;
+     }
+@@ -228,6 +236,134 @@
+   } else {
+     x.a++;
+     x.row += it.xp;
++  }
++}
++template <class W>
++static inline void x_unit(const W* io, const Item& it, XGen& x, Fifo16<IoWord>& xr) {
++#pragma HLS INLINE
++  const bool live = x.n0 + x.a < it.N;
++  const uint64_t base = ((live ? x.row : it.xa) + (uint64_t)x.c * (CK * 2)) >> 4;
++  for (int w = 0; w < UW; w++) {
++#pragma HLS UNROLL
++    const IoWord v = to_io(io[base + w]);
++    xr.write(live ? v : zero_word());
++  }
++  x_next(it, x);
++}
++
++// ---- emit_amax consumer: FP32 X rows quantized on load (P_XQ)
++// The quantizer state of the 64 rows of a tile in two banks (tile parity): load_io fills tile t + 1's bank before
++// it reads X(t + 1), and tile 0's before X(0). stk holds the s_tok words of the bank's tile.
++typedef famx::XScale XBank[2][NTT];
++typedef IoWord SBank[2][NTT / F4];
++// Tile t's bank from the absmax parts at F: a = max over the parts (exact), then one row a clock through s, the
++// divider and the stored scale (emit_amax.h xscale: the row unit's path).
++template <class W>
++static inline void xq_scales(const W* io, const Item& it, int t, int bank, XBank& rsb, SBank& stk) {
++#pragma HLS INLINE
++  const uint64_t f_words = (uint64_t)ctr::pad4((uint32_t)it.N) / F4;
++  famx::abits am[NTT / F4][F4];
++#pragma HLS ARRAY_PARTITION variable = am complete dim = 2
++#pragma HLS BIND_STORAGE variable = am type = ram_2p impl = lutram
++  uint64_t pw = it.fa >> 4;  // word index of part j
++  const uint64_t t0 = (uint64_t)t * (NTT / F4);
++  int j = 0, w = 0;
++xq_am:
++  for (int i = 0; i < it.xq * (NTT / F4); i++) {
++#pragma HLS PIPELINE II = 1
++#pragma HLS DEPENDENCE variable = am inter false
++#pragma HLS LOOP_TRIPCOUNT min = 16 max = 1024
++    const uint64_t wi = t0 + (uint64_t)w;
++    const IoWord v = wi < f_words ? to_io(io[pw + wi]) : zero_word();
++    for (int l = 0; l < F4; l++) {
++#pragma HLS UNROLL
++      const famx::abits a = famx::abits(famx::lane_bits(v, l) & 0x7FFFFFFFu);
++      am[w][l] = j == 0 ? a : famx::amax2(am[w][l], a);
++    }
++    if (w == NTT / F4 - 1) {
++      w = 0;
++      j++;
++      pw += it.fpp >> 4;
++    } else {
++      w++;
++    }
++  }
++  ap_uint<32> sv[F4];  // the stored scales of rows 4 w .. 4 w + 3 (constant lanes: no 128-bit shifter)
++#pragma HLS ARRAY_PARTITION variable = sv complete
++xq_sc:
++  for (int r = 0; r < NTT; r++) {
++#pragma HLS PIPELINE II = 1
++    ap_uint<32> st;
++    rsb[bank][r] = famx::xscale(am[r >> 2][r & 3], st, ap_int<5>(it.shift));
++    sv[r & 3] = st;
++    if ((r & 3) == 3) {
++      IoWord sw = zero_word();
++      for (int l = 0; l < F4; l++) {
++#pragma HLS UNROLL
++        famx::set_lane_bits(sw, l, l == 3 ? (uint32_t)st : (uint32_t)sv[l]);
++      }
++      stk[bank][r >> 2] = sw;
++    }
++  }
++}
++// Units of X (x_unit's walk) from FP32 rows until the credit xg reaches thr, AMX_QL values a clock: a live unit reads
++// its chunk's kc / 4 words (16 at most, none past the row's K values) and sends 8 int16 words; a unit of a token
++// n >= N reads nothing and sends 8 zero words (8 clocks).
++template <class W>
++static inline void xq_run(const W* io, const Item& it, XGen& x, Fifo16<IoWord>& xr, const XBank& rsb, int bank,
++                          uint64_t& xg, uint64_t thr, uint64_t step) {
++#pragma HLS INLINE
++  const int klast = it.K - CK * (it.nch - 1);
++  int w = 0;  // clock of the unit
++  bool live = false;
++  uint64_t base = 0;
++  int kw = 0;  // FP32 words of the chunk
++  IoWord v = zero_word();
++  ap_uint<16> qb[2 * F4];  // the output word's 8 int16 (constant lanes when it is sent)
++#pragma HLS ARRAY_PARTITION variable = qb complete
++xq_x:
++  while (xg < thr) {
++#pragma HLS PIPELINE II = 1
++#pragma HLS LOOP_TRIPCOUNT min = 0 max = 65536
++    if (w == 0) {
++      live = x.n0 + x.a < it.N;
++      base = (x.row + (uint64_t)x.c * (CK * 4)) >> 4;
++      kw = (x.c == it.nch - 1 ? klast : CK) / F4;
++    }
++    bool last;
++    if (live) {
++      const int wd = w / famx::QIT, ph = w % famx::QIT;  // FP32 word of the chunk, lane group
++      if (ph == 0) v = wd < kw ? to_io(io[base + (uint64_t)wd]) : zero_word();
++      const famx::XScale rs = rsb[bank][x.bt * TB + x.a];
++      ap_uint<16> qn[famx::QL];
++      for (int l = 0; l < famx::QL; l++) {
++#pragma HLS UNROLL
++        const int lane = ph * famx::QL + l;
++        qn[l] = ap_uint<16>(famx::quant_elem_fab(qz::fbits_t(famx::lane_bits(v, lane)), rs));
++        qb[(wd & 1) * F4 + lane] = qn[l];
++      }
++      if ((wd & 1) && ph == famx::QIT - 1) {
++        IoWord o = zero_word();
++        for (int j = 0; j < 2 * F4; j++) {
++#pragma HLS UNROLL
++          // this clock's lanes straight from the quantizer, the others from qb
++          const bool now = j >= F4 + ph * famx::QL;
++          set16(o, j, (uint16_t)(now ? qn[(j - F4 - ph * famx::QL) & (famx::QL - 1)] : qb[j]));
++        }
++        xr.write(o);
++      }
++      last = w == 2 * UW * famx::QIT - 1;
++    } else {
++      xr.write(zero_word());
++      last = w == UW - 1;
++    }
++    if (last) {
++      w = 0;
++      x_next(it, x);
++      xg += step;
++    } else {
++      w++;
++    }
+   }
+ }
+ template <class W>
+@@ -240,50 +376,42 @@
+   x.n0 = 0;
+   x.row = it.xa;
+   x.blk_row0 = it.xa;
++  x.bt = 0;
+   const int G = it.groups;
+-stok0:
+-  for (int w = 0; w < NTT / F4; w++) {
+-#pragma HLS PIPELINE II = 1
+-    stok_s.write((uint64_t)w < f_words ? to_io(io[(it.fa >> 4) + w]) : ones_word());
+-  }
++  XBank rsb;  // emit_amax consumer (it.xq != 0): quantizer state and s_tok words of tiles t, t + 1
++#pragma HLS BIND_STORAGE variable = rsb type = ram_2p impl = bram
++  SBank stk;
++#pragma HLS ARRAY_PARTITION variable = stk complete dim = 1
++#pragma HLS BIND_STORAGE variable = stk type = ram_2p impl = lutram
++  // One pass t = -1 .. ntiles - 1 (t = -1: the prologue, X(0) as one credit run of step 1), so that every loop, and
++  // the emit_amax quantizer and divider, have one call site each. The io read order is the 1.0 order: s_tok(0),
++  // X(0), s_row, bias, then per tile t: s_tok(t) (t >= 1), per group g: D(t, g), slice g of X(t + 1). With P_XQ the
++  // absmax parts of tile t + 1 come first in iteration t (the s_tok words then come from the bank, on chip).
+   const int units0 = fstream16::blocks_of_tile(it.nblk, 0) * it.nch * TB;
+-load_x0:
+-  for (int u = 0; u < units0; u++) {
+-#pragma HLS PIPELINE II = UW
+-#pragma HLS LOOP_TRIPCOUNT min = 32 max = 32768
+-    x_unit(io, it, x, xr);
+-  }
+-load_srow:
+-  for (int i = 0; i < G * (LANES / F4); i++) {
+-#pragma HLS PIPELINE II = 1
+-    srow_s.write(to_io(io[(it.ea >> 4) + i]));
+-  }
+-  if (it.bias) {
+-  load_bias:
+-    for (int i = 0; i < G * (LANES / F4); i++) {
+-#pragma HLS PIPELINE II = 1
+-      bias_s.write(to_io(io[(it.ga >> 4) + i]));
+-    }
+-  }
+ tiles_io:
+-  for (int t = 0; t < it.ntiles; t++) {
+-    if (t > 0) {
++  for (int t = -1; t < it.ntiles; t++) {
++#pragma HLS LOOP_TRIPCOUNT min = 2 max = 1025
++    if (it.xq && t + 1 < it.ntiles) xq_scales(io, it, t + 1, (t + 1) & 1, rsb, stk);
++    if (t != 0) {  // s_tok of tile ts (t = -1: tile 0)
++      const int ts = t < 0 ? 0 : t;
+     stok_t:
+       for (int w = 0; w < NTT / F4; w++) {
+ #pragma HLS PIPELINE II = 1
+-        const uint64_t wi = (uint64_t)t * (NTT / F4) + w;
+-        stok_s.write(wi < f_words ? to_io(io[(it.fa >> 4) + wi]) : ones_word());
+-      }
+-    }
+-    const int nv = valid_rows(it.N, t);
+-    const int unext = t + 1 < it.ntiles ? fstream16::blocks_of_tile(it.nblk, t + 1) * it.nch * TB : 0;
+-    uint64_t thr = 0, xg = 0;  // credit: (g + 1) * unext against units emitted * G
++        const uint64_t wi = (uint64_t)ts * (NTT / F4) + w;
++        stok_s.write(it.xq ? stk[ts & 1][w] : wi < f_words ? to_io(io[(it.fa >> 4) + wi]) : ones_word());
++      }
++    }
++    const bool pro = t < 0;
++    const int nv = pro ? 0 : valid_rows(it.N, t);
++    const int unext = pro ? units0 : t + 1 < it.ntiles ? fstream16::blocks_of_tile(it.nblk, t + 1) * it.nch * TB : 0;
++    const uint64_t step = pro ? 1 : (uint64_t)G;
++    uint64_t thr = 0, xg = 0;  // credit: (g + 1) * unext against units emitted * step
+     RowWalk rw0;
+-    rw0.start((uint64_t)t * NTT, it.dR, it.dP1, it.dp);
++    rw0.start(pro ? 0 : (uint64_t)t * NTT, it.dR, it.dP1, it.dp);
+   groups_io:
+-    for (int g = 0; g < G; g++) {
++    for (int g = 0; g < (pro ? 1 : G); g++) {
+ #pragma HLS LOOP_TRIPCOUNT min = 1 max = 256
+-      if (it.addd) {
++      if (it.addd && !pro) {
+         RowWalk rw = rw0;
+       load_dr:
+         for (int i = 0; i < nv; i++) {
+@@ -298,12 +426,30 @@
+         }
+       }
+       thr += (uint64_t)unext;
+-    load_xs:
+-      while (xg < thr) {
++      if (it.xq) {
++        xq_run(io, it, x, xr, rsb, (t + 1) & 1, xg, thr, step);
++      } else {
++      load_xs:
++        while (xg < thr) {
+ #pragma HLS PIPELINE II = UW
+ #pragma HLS LOOP_TRIPCOUNT min = 0 max = 1024
+-        x_unit(io, it, x, xr);
+-        xg += (uint64_t)G;
++          x_unit(io, it, x, xr);
++          xg += step;
++        }
++      }
++    }
++    if (pro) {
++    load_srow:
++      for (int i = 0; i < G * (LANES / F4); i++) {
++#pragma HLS PIPELINE II = 1
++        srow_s.write(to_io(io[(it.ea >> 4) + i]));
++      }
++      if (it.bias) {
++      load_bias:
++        for (int i = 0; i < G * (LANES / F4); i++) {
++#pragma HLS PIPELINE II = 1
++          bias_s.write(to_io(io[(it.ga >> 4) + i]));
++        }
+       }
+     }
+   }
+@@ -520,32 +666,100 @@
+ }
+ 
+ // ---------------------------------------------------------------- process 7: row-major Y
++// One io word a clock (the 1.0 loop wrote 8-word units at II = 8). emit_amax (it.asg != 0): the absmax of every
++// (row, segment) over the bits written, as FP32 bits. After a row's unit in a segment's last group its value goes
++// into lane i % 4 of pk, and every 4 rows (and after row nv - 1) pk is written to slot H in an extra clock.
+ template <class W>
+ static void store(Fifo16<IoWord>& ys, W* io, const Item it) {
++  famx::abits amem[NTT];  // running absmax of the tile's rows over the groups of the current segment
++#pragma HLS BIND_STORAGE variable = amem type = ram_2p impl = lutram
++  const bool amx = it.asg != 0;
++  const uint64_t hR4 = it.yR >> 2;  // absmax words per C row group (validate: R % 4 == 0)
++  RowWalk aw;                        // absmax word tw (rows 4 tw .. 4 tw + 3) of the item: continues across tiles
++  aw.start(0, hR4, it.hp, 16);
+ tiles_st:
+   for (int t = 0; t < it.ntiles; t++) {
+     const int nv = valid_rows(it.N, t);
+     RowWalk rw0;
+     rw0.start((uint64_t)t * NTT, it.yR, it.yP1, it.yp);
+     RowWalk rw = rw0;
+-    int g = 0, i = 0;
++    const RowWalk aw0 = aw;  // the tile's first absmax word
++    RowWalk awx = aw;        // the current segment's next absmax word
++    uint64_t sb = 0;         // segment s: s * hp (R = 0)
++    int g = 0, i = 0, w = 0, gs = 0;
++    uint64_t base = 0;
++    famx::abits run = 0;
++    famx::abits pk[F4];  // absmax of rows 4 w .. 4 w + 3 (constant lanes: no 128-bit shifter)
++#pragma HLS ARRAY_PARTITION variable = pk complete
++    for (int l = 0; l < F4; l++) {
++#pragma HLS UNROLL
++      pk[l] = 0;
++    }
++    bool apend = false, afin = false;  // an absmax word is due in this clock; it is the segment's last
+   store_y:
+-    for (int u = 0; u < it.groups * nv; u++) {
+-#pragma HLS PIPELINE II = YU
+-#pragma HLS LOOP_TRIPCOUNT min = 1 max = 16384
+-      const uint64_t base = (it.ya + rw.off() + (uint64_t)g * (LANES * 4)) >> 4;
+-      for (int w = 0; w < YU; w++) {
+-#pragma HLS UNROLL
+-        io[base + w] = from_io<W>(ys.read());
+-      }
+-      if (i == nv - 1) {
+-        i = 0;
+-        g++;
+-        rw = rw0;
++    while (true) {
++#pragma HLS PIPELINE II = 1
++#pragma HLS DEPENDENCE variable = amem inter false
++#pragma HLS LOOP_TRIPCOUNT min = 8 max = 131072
++      bool done = false;
++      uint64_t wa;
++      IoWord wv;
++      if (apend) {
++        wa = (it.ha + sb + awx.off()) >> 4;
++        wv = zero_word();
++        for (int l = 0; l < F4; l++) {
++#pragma HLS UNROLL
++          famx::set_lane_bits(wv, l, (uint32_t)pk[l]);
++          pk[l] = 0;
++        }
++        apend = false;
++        awx.next(hR4, it.hp, 16);
++        if (afin) {
++          if (g == it.groups) {
++            aw = awx;  // the next tile starts 16 words on (only the last tile holds fewer than 64 rows)
++            done = true;
++          } else {
++            awx = aw0;
++            sb += it.hp;
++          }
++        }
+       } else {
+-        i++;
+-        rw.next(it.yR, it.yP1, it.yp);
+-      }
++        if (w == 0) base = (it.ya + rw.off() + (uint64_t)g * (LANES * 4)) >> 4;
++        wv = ys.read();
++        wa = base + (uint64_t)w;
++        const famx::abits m4 = famx::word_amax(wv);
++        const famx::abits r = w == 0 ? m4 : famx::amax2(run, m4);
++        run = r;
++        if (w == YU - 1) {
++          w = 0;
++          if (amx) {
++            const famx::abits a = gs == 0 ? r : famx::amax2(r, amem[i]);
++            if (gs == it.asg - 1) {
++              pk[i & 3] = a;
++              if ((i & 3) == 3 || i == nv - 1) {
++                apend = true;
++                afin = i == nv - 1;
++              }
++            } else {
++              amem[i] = a;
++            }
++          }
++          if (i == nv - 1) {
++            i = 0;
++            g++;
++            rw = rw0;
++            gs = gs == it.asg - 1 ? 0 : gs + 1;
++          } else {
++            i++;
++            rw.next(it.yR, it.yP1, it.yp);
++          }
++          done = g == it.groups && !apend;
++        } else {
++          w++;
++        }
++      }
++      io[wa] = from_io<W>(wv);
++      if (done) break;
+     }
+   }
+ }
+@@ -592,7 +806,8 @@
+   store(ys, ymem, it);
+ }
+ 
+-static inline Item plan_item(const ctr::Cmd& c, uint64_t b) {
++// hoff = b * H.stride, kept as a running sum by gemm_unit (no new multiplier)
++static inline Item plan_item(const ctr::Cmd& c, uint64_t b, uint64_t hoff) {
+ #pragma HLS INLINE
+   Item it;
+   const ctr::Slot &A = c.s[ctr::SLOT_A], &Bw = c.s[ctr::SLOT_B], &C = c.s[ctr::SLOT_C], &D = c.s[ctr::SLOT_D];
+@@ -623,6 +838,13 @@
+   it.nblk = (int)((c.N + TB - 1) / TB);
+   it.ntiles = (it.nblk + NBX - 1) / NBX;
+   it.nch = (int)((c.K + CK - 1) / CK);
++  const ctr::Slot& H = c.s[ctr::SLOT_H];
++  it.asg = (int)c.p[ctr::P_AMX_SG];
++  it.ha = H.addr + hoff;
++  it.hp = H.pitch;
++  it.xq = (int)c.p[ctr::P_XQ];
++  it.fpp = F.pitch;
++  it.shift = (int)(int32_t)c.p[ctr::P_SHIFT];
+   return it;
+ }
+ 
+@@ -633,11 +855,13 @@
+ static uint32_t gemm_unit(const ctr::Cmd& c, const WP* hp0, const WP* hp1, const WP* hp2, const WP* hp3,
+                           const W* io_rd, W* io_wr) {
+ #pragma HLS INLINE off
++  uint64_t hoff = 0;
+ items:
+   for (uint32_t b = 0; b < c.B; b++) {
+ #pragma HLS LOOP_TRIPCOUNT min = 1 max = 24
+-    const Item it = plan_item(c, b);
++    const Item it = plan_item(c, b, hoff);
+     gemm_item(hp0, hp1, hp2, hp3, io_rd, io_wr, it);
++    hoff += c.s[ctr::SLOT_H].stride;
+   }
+   return ctr::ME_OK;
+ }

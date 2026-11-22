@@ -6,7 +6,7 @@ CXXFLAGS ?= -std=c++14 -O2 -Wall -Wextra -Wno-unknown-pragmas -Wno-unused-label
 PY ?= python3
 B := ../../build/stream
 
-.PHONY: test lib clean test-int16 lib-int16 test-int16-top
+.PHONY: test lib clean test-int16 lib-int16 test-int16-top test-gemm lib-seq
 
 build/tb_float: tb_float.cpp float_shim.cpp float_linear.h
 	@mkdir -p build
@@ -53,6 +53,31 @@ build/tb_int16_top: tb_int16_top.cpp float_top.cpp float_linear.h int16_linear.h
 
 test-int16-top: build/tb_int16_top build/tb_float_int16
 	for d in $(B)/int16/case_*; do [ -f $$d/xmem.bin ] || continue; 		TB_DUMP_Y=build/y_host.bin ./build/tb_float_int16 $$d > /dev/null && ./build/tb_int16_top $$d build/y_host.bin || exit 1; done
+
+# The contract GEMM unit (gemm_contract.h) against ctr::ref on random commands (items, row groups, bias, D, ACC),
+# with the stall paths (FSTREAM_CHAOS=30) and without weight re-use (NBX=1). Two DDR bases.
+GEMM_DEPS := tb_gemm.cpp gemm_contract.h int16_linear.h float_linear.h ../kernels/contract.h
+build/tb_gemm: $(GEMM_DEPS)
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) $(I16FLAGS) $(SHIM_STATIC) -o $@ tb_gemm.cpp
+build/tb_gemm_chaos: $(GEMM_DEPS)
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) $(I16FLAGS) $(SHIM_STATIC) -DFSTREAM_CHAOS=30 -o $@ tb_gemm.cpp
+build/tb_gemm_nbx1: $(GEMM_DEPS)
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) $(I16FLAGS) $(SHIM_STATIC) -DFSTREAM_NBX=1 -o $@ tb_gemm.cpp
+test-gemm: build/tb_gemm build/tb_gemm_chaos build/tb_gemm_nbx1
+	./build/tb_gemm 300 11 800000000
+	./build/tb_gemm 300 12 40000000
+	./build/tb_gemm_chaos 100 13 800000000
+	./build/tb_gemm_nbx1 100 14 800000000
+
+# The integrated float_top (float_seq.h: sequencer + GEMM unit + the kernels' mode functions) as a host DLL for
+# e2e_seq.py (the -12392 chunk list in lockstep with the golden executor).
+build/seq_shim.dll: seq_shim.cpp float_seq.h $(GEMM_DEPS)
+	@mkdir -p build
+	$(CXX) -std=c++14 -O2 $(I16FLAGS) -DGS_NSB=10 -Wno-unknown-pragmas -Wno-unused-label -shared $(SHIM_STATIC) 		-I$(HLS_INC) -I../kernels -I../kernels/quantize -o $@ seq_shim.cpp
+lib-seq: build/seq_shim.dll
 
 build/tb_mul: tb_mul.cpp float_linear.h
 	@mkdir -p build

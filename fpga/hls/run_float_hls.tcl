@@ -9,6 +9,8 @@
 #   FSTREAM_BF16_MUL=1 ...                          # one-DSP exact multiplier instead of the core
 #   FSTREAM_ARITH=16 FSTREAM_NBX=2 ...              # the int16 engine (int16_linear.h), NBX token blocks per tile
 #                                                   (project float_hls_i16_nbx<NBX>[_TAG]; FSTREAM_TP is unused)
+#   FSTREAM_ARITH=16 FSTREAM_SEQ=1 ...              # the integrated top (float_seq.h: contract 1.0 lists),
+#                                                   project float_hls_i16seq_nbx<NBX>[_TAG]
 # Target 300 MHz; the four weight bundles go to S_AXI_HP0..HP3_FPD in the block design.
 set here [file dirname [file normalize [info script]]]
 set case [file normalize "$here/../../build/stream/float/case_2560x960x50"]
@@ -24,6 +26,11 @@ if {[info exists ::env(FSTREAM_ARITH)] && $::env(FSTREAM_ARITH) eq "16"} {
     append cflags " -DFSTREAM_ARITH=16 -DFSTREAM_NBX=$nbx"
     set proj float_hls_i16_nbx$nbx
     set case [file normalize "$here/../../build/stream/int16/case_2560x960x50"]
+    if {[info exists ::env(FSTREAM_SEQ)] && $::env(FSTREAM_SEQ) eq "1"} {
+        # the integrated top: sequencer + contract GEMM unit + the kernels' mode functions (float_seq.h)
+        append cflags " -DFSTREAM_SEQ=1 -DGS_NSB=10 -I$here/../kernels -I$here/../kernels/quantize"
+        set proj float_hls_i16seq_nbx$nbx
+    }
 }
 if {[info exists ::env(FSTREAM_TAG)]} {
     append proj "_$::env(FSTREAM_TAG)"  ;# e.g. FSTREAM_TAG=v4: project build/float_hls_tp8_v4

@@ -1,0 +1,60 @@
+{
+ "ckpt": "smolvla-so101_medicine_bottle_pickplace-12392-native",
+ "gate": 0.05,
+ "frames": [
+  {
+   "frame": 0,
+   "contract_s": 2.7,
+   "qks_s": 7.4,
+   "contract_max_abs_err": 7.086992263793945e-05,
+   "qks_max_abs_err": 7.086992263793945e-05,
+   "qks_vs_contract_chunk_bit_equal": true,
+   "gate_pass": true,
+   "calls": 200,
+   "items": 1168,
+   "rows": 210048,
+   "p_mismatch": 0,
+   "s_mismatch": 0,
+   "dumped": 12
+  },
+  {
+   "frame": 3563,
+   "contract_s": 4.5,
+   "qks_s": 8.0,
+   "contract_max_abs_err": 2.5272369384765625e-05,
+   "qks_max_abs_err": 2.5272369384765625e-05,
+   "qks_vs_contract_chunk_bit_equal": true,
+   "gate_pass": true,
+   "calls": 200,
+   "items": 1168,
+   "rows": 210048,
+   "p_mismatch": 0,
+   "s_mismatch": 0,
+   "dumped": 0
+  },
+  {
+   "frame": 7489,
+   "contract_s": 3.5,
+   "qks_s": 8.2,
+   "contract_max_abs_err": 4.458427429199219e-05,
+   "qks_max_abs_err": 4.458427429199219e-05,
+   "qks_vs_contract_chunk_bit_equal": true,
+   "gate_pass": true,
+   "calls": 200,
+   "items": 1168,
+   "rows": 210048,
+   "p_mismatch": 0,
+   "s_mismatch": 0,
+   "dumped": 0
+  }
+ ],
+ "total": {
+  "calls": 600,
+  "items": 3504,
+  "rows": 630144,
+  "p_mismatch": 0,
+  "s_mismatch": 0,
+  "dumped": 12
+ },
+ "worst_qks_max_abs_err": 7.086992263793945e-05
+}
