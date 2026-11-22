@@ -1,26 +1,27 @@
 """Full-policy check of the attention path on checkpoint -12392's 3 replay frames.
 
-Every attention of SmolVLA (the SigLIP vision tower, the LM prefix, the action expert's self- and cross-attention)
-is re-routed through attn_int16; everything else (the linears, norms, GELU, ...) stays torch FP32, so the error
-is the attention path's own. Per frame: predict_action_chunk(d["batch"], noise=d["noise"]) against
-d["ref_chunk_raw"] (the cluster's FP32 chunk) and against this laptop's unpatched run. The policy is loaded once;
-patches go on the instances (nothing in site-packages is modified).
+Every attention of SmolVLA (the SigLIP vision tower, the LM prefix, the action expert's self- and
+cross-attention) is re-routed through attn_int16; everything else (the linears, norms, GELU, ...) stays torch
+FP32, so the error is the attention path's own. Per frame: predict_action_chunk(d["batch"], noise=d["noise"])
+against d["ref_chunk_raw"] (the cluster's FP32 chunk) and against this laptop's unpatched run. The policy is
+loaded once; patches go on the instances (nothing in site-packages is modified).
 
     set HF_HUB_OFFLINE=1
-    C:\\kp\\lerobot-venv\\Scripts\\python.exe fpga\\kernels\\attention\\check_policy.py            # all variants
+    C:\\kp\\lerobot-venv\\Scripts\\python.exe fpga\\kernels\\attention\\check_policy.py   # all variants
     ... --variants contract --frames 0          # a subset
     ... --dump vectors/calls.pt                  # also save the first call of every site (make_vectors.py)
 
 Variants:
   orig              LeRobot as loaded (sdpa vision, eager LM)
   fp32              explicit FP32 Q K^T / softmax / P V through the same stacked-GQA code path
-  contract          the integration contract's arithmetic (attn_int16.attention_contract): int16 Q (p4 = -3), K
-                    (QUANT_W), V^T (QUANT_WT, prefix and suffix parts with their own channel scales), the GEMM
-                    epilogue with sign-keeping FTZ, P from the SOFTMAX unit (smx_emu) with the contract's int32 rank
-                    masks (checked against SmolVLA's mask on every call), the prefix compacted to its valid tokens
+  contract          the integration contract's arithmetic (attn_int16.attention_contract): int16 Q (p4 = -3),
+                    K (QUANT_W), V^T (QUANT_WT, prefix and suffix parts with their own channel scales), the
+                    GEMM epilogue with sign-keeping FTZ, P from the SOFTMAX unit (smx_emu) with the
+                    contract's int32 rank masks (checked against SmolVLA's mask on every call), the prefix
+                    compacted to its valid tokens
   contract_vision / contract_prefix / contract_expert   the contract at one site only, FP32 elsewhere
-  int16, int16_smx  the pre-contract design (attn_pack era: one V^T scale over prefix + suffix, padding keys zeroed;
-                    P from torch FP32 softmax + quantizer, or from the softmax unit)
+  int16, int16_smx  the pre-contract design (attn_pack era: one V^T scale over prefix + suffix, padding keys
+                    zeroed; P from torch FP32 softmax + quantizer, or from the softmax unit)
   bf16              Q, K, V, P rounded to BF16, FP32 sums (comparison)
 """
 

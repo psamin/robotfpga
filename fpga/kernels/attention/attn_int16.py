@@ -1,34 +1,35 @@
-"""SmolVLA attention under the float_top integration contract (fpga/kernels/CONTRACT.md 2, 5): exact torch emulation
-of the arithmetic the hardware runs, used by the full-policy check (check_policy.py) and checked bit for bit against
-the record-level chain (make_vectors.py + tb_attn.cpp).
+"""SmolVLA attention under the float_top integration contract (fpga/kernels/CONTRACT.md 2, 5): an exact torch
+emulation of the arithmetic the hardware runs, used by the full-policy check (check_policy.py) and checked bit
+for bit against the record-level chain (make_vectors.py, then tb_attn.cpp on the units' HLS mode code).
 
 Per attention site, per KV head j (one GEMM item; G = H / Hkv query heads per KV head, head dim 64):
 
-  Q      row unit (QUANT_X, or ROPE with F_QOUT): per (head, query) the contract quantizer with p4 = -3, so the
-         stored scale is s / 8 (exact) and the Q.K^T GEMM output already is the scaled score. Head-major
-         Q[h][TqP][64], TqP = pad4(Tq); rows [Tq, TqP) zero with scale 1.0. The G heads of KV head j are rows
-         t = g * TqP + i of item j.
-  K      QUANT_W (attn_kv.h; ROPE F_KW is the same writer): per (KV head, key) the contract quantizer, the KW weight
-         tiling, Mk = pad32(keys) rows; expert self-attention: prefix keys in rows [0, pad32(45)), suffix keys from
-         row pad32(45) on. Pad rows zero with scale 1.0.
-  Q.K^T  GEMM: acc exact, y = fmul(fmul(fl(acc), s_row = s_k), s_tok = s_q / 8), FP32 cores, denormals flushed
-         with the sign kept (contract.gemm_out).
-  P      SOFTMAX unit (fpga/kernels/softmax/smx_emu.kernel, c = fl32(p0 log2 e), p0 = 1): int16 q in [0, 32767]
-         with scale RN(1 / sum q), a fully masked row q = 0 with scale 1.0. Masks: int32 rank vectors, key k visible
-         to row n iff 0 <= E[k] <= D[n] (CONTRACT.md 5, step 4 table; checked against SmolVLA's own mask on every
-         call).
-  V      QUANT_WT (attn_kv.h): V^T per (KV head, channel) over the part's keys, the VW tiling, keys [N, pad32(N))
-         zero. The expert self-attention has two parts (prefix V^T written by the LM, suffix V^T every step), each
-         with its own channel scales.
-  P.V    GEMM, K = pad32(keys of the part), X = P's columns of the part; the expert's suffix part adds onto the
-         prefix part's output (F_ACC: y = fadd(y_suffix, O)). Output rows t = g * TqP + i go to O[i][(G j + g) 64]
-         through the C row groups (R = TqP, P1 = 256 B): O is [Tq][H * 64], the o_proj input order.
+  Q      row unit (QUANT_X, or ROPE with F_QOUT): per (head, query) the contract quantizer with p4 = -3,
+         so the stored scale is s / 8 (exact) and the Q.K^T GEMM output already is the scaled score.
+         Head-major Q[h][TqP][64], TqP = pad4(Tq); rows [Tq, TqP) zero with scale 1.0. The G heads of KV
+         head j are rows t = g * TqP + i of item j.
+  K      row unit (QUANT_W; ROPE F_KW writes the same tiling): per (KV head, key) the contract quantizer,
+         the KW weight tiling, Mk = pad32(keys) rows; expert self-attention: prefix keys in rows
+         [0, pad32(45)), suffix keys from row pad32(45) on. Pad rows zero with scale 1.0.
+  Q.K^T  GEMM: acc exact, y = fmul(fmul(fl(acc), s_row = s_k), s_tok = s_q / 8), FP32 cores, denormals
+         flushed with the sign kept (contract.gemm_out).
+  P      SOFTMAX unit (fpga/kernels/softmax/smx_emu.kernel, c = fl32(p0 log2 e), p0 = 1): int16 q in
+         [0, 32767] with scale RN(1 / sum q), a fully masked row q = 0 with scale 1.0. Masks: int32 rank
+         vectors, key k visible to row n iff 0 <= E[k] <= D[n] (CONTRACT.md 5, step 4 table; checked
+         against SmolVLA's own mask on every call).
+  V      row unit (QUANT_WT): V^T per (KV head, channel) over the part's keys, the VW tiling, keys
+         [N, pad32(N)) zero. The expert self-attention has two parts (prefix V^T written by the LM, suffix
+         V^T every step), each with its own channel scales.
+  P.V    GEMM, K = pad32(keys of the part), X = P's columns of the part; the expert's suffix part adds onto
+         the prefix part's output (F_ACC: y = fadd(y_suffix, O)). Output rows t = g * TqP + i go to
+         O[i][(G j + g) 64] through the C row groups (R = TqP, P1 = 256 B): O is [Tq][H * 64], the o_proj
+         input order.
 
 The prefix is compacted to its valid tokens (the contract's list has 45 prefix tokens: 2 x 16 image tokens,
 12 language tokens, the state); padding queries get a zero output (no valid query or key depends on them).
 
-The pre-contract design (`attention`, the attn_pack era: one V^T scale over prefix + suffix, P from a torch FP32
-softmax or the old softmax arithmetic) stays for comparison; its ftz now keeps the sign as the FP32 cores do.
+The pre-contract design (`attention`, the attn_pack era: one V^T scale over prefix + suffix, P from a torch
+FP32 softmax or the old softmax arithmetic) stays for comparison; its ftz keeps the sign as the FP32 cores do.
 """
 
 from __future__ import annotations
@@ -76,8 +77,9 @@ def fadd_hw(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
 
 def quant_c(x: torch.Tensor, dim: int = -1, shift: int = 0):
-    """The contract quantizer along `dim`: (q integer-valued FP32, stored scale FP32 keepdim). s = fl32(max(amax,
-    1e-30) / 32767), q = clamp(rne(fl32(x / s)), +-32767); stored = s * 2^shift, 1.0 for an all-zero row."""
+    """The contract quantizer along `dim`: (q integer-valued FP32, stored scale FP32 keepdim).
+    s = fl32(max(amax, 1e-30) / 32767), q = clamp(rne(fl32(x / s)), +-32767);
+    stored = s * 2^shift, 1.0 for an all-zero row."""
     x = x.to(torch.float32)
     amax = x.abs().amax(dim, keepdim=True)
     zero = amax == 0
@@ -120,7 +122,8 @@ def contract_ranks(site: str, tq: int, tqp: int, nkeys, mk: int, key_rows):
 
 
 def site_geometry(site: str, tk: int, n_suffix: int = 0):
-    """Key parts of a site: [(first key, keys, blob row)], Mk. Expert self: prefix keys + n_suffix suffix keys."""
+    """Key parts of a site: [(first key, keys, blob row)], Mk. Expert self: prefix keys + n_suffix suffix
+    keys."""
     if site == "expert_self":
         npre = tk - n_suffix
         lp = pad_to(npre, 32)
@@ -246,7 +249,8 @@ def quant(x: torch.Tensor, dim: int, scale_mul: float = 1.0, pow2: bool = False)
 
 
 def engine(xq, s_tok, wq, s_row):
-    """The int16 engine: xq (..., N, K), s_tok (..., N, 1), wq (..., M, K), s_row (..., 1, M) -> (..., N, M)."""
+    """The int16 engine: xq (..., N, K), s_tok (..., N, 1), wq (..., M, K), s_row (..., 1, M)
+    -> (..., N, M)."""
     acc = torch.matmul(xq.double(), wq.double().transpose(-1, -2))
     return fmul_hw(fmul_hw(acc.float(), s_row), s_tok)
 

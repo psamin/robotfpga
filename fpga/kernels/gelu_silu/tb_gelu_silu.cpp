@@ -1,18 +1,29 @@
 // Host testbench of gs::act_mode (the GELU / SILU_MUL mode, C model of the HLS code; Vitis MinGW g++ with the HLS
 // headers, -ffp-contract=off).
-//   tb_gelu_silu CASE_DIR [CASE_DIR ...]
+//   tb_gelu_silu [--plan LIST.bin] CASE_DIR [CASE_DIR ...]
+// Build with -DGS_DFSIM -Idfsim (ahead of the Vitis include) for the threaded bounded-FIFO model: every DATAFLOW
+// process a thread, every stream at its pragma depth (GS_D_*); a deadlock prints DEADLOCK and exits 7.
+//
 // Each case (make_vectors.py / policy_check.py --dump): meta.txt "mode N K nsb check", x.bin, [u.bin], y.bin, q.bin,
-// s.bin. Every case runs as contract 1.0 records (ctr::encode -> ctr::decode -> ctr::validate == ME_OK) through
-// act_mode on a sparse 40-bit memory (only the declared buffers exist; any other access aborts), in 3 layouts:
+// s.bin. Every case runs as contract 1.0 records (ctr::encode -> ctr::decode -> ctr::validate == validate_hw ==
+// ME_OK) through act_mode on a sparse 40-bit memory (only the declared buffers exist; any other access aborts), in 5
+// layouts that between them take every reader and writer path (the expected path is checked through gs_plan):
 //   plan    the -12392 list's layout (contract_plan.py): rows contiguous (SILU_MUL: the fused gate|up row, B = A + 4K),
-//           q rows contiguous, F_QOUT, base 0x8_0000_0000 (high DDR)
-//   padded  padded pitches with guard words, B in its own buffer, 2 items (item strides), NP = N + 3 zero rows,
-//           p4 = -3, base 0xFF_0000_0000 (top of the 40-bit space)
-//   fp32    FP32 output rows (no F_QOUT), pitch padded, base 0x4000_0000 (low DDR)
-// Checks: y bits (fp32) == gs_emu; q and stored s == contract.quant_rows of gs_emu's y (q.bin, s.bin) ==
+//           q rows contiguous, F_QOUT, base 0x8_0000_0000 (high DDR)              -> dense read, dense write
+//   padded  A pitch + 48 B, B in its own buffer, C pitch + 32 B, 2 items, NP = N + 3 zero rows, p4 = -3,
+//           base 0xFF_0000_0000 (top of the 40-bit space)          -> dense read with gaps (SILU_MUL sparse), sparse write
+//   wide    A pitch + 2 KB (fused gate|up for SILU_MUL), C contiguous, 2 items with gaps between them, NP = N + 5,
+//           p4 = +2, base 0x2_0000_0000                            -> sparse read (N > 1), dense write with zero rows
+//   fp32    FP32 rows out (no F_QOUT), A pitch + 48 B (fused), C pitch + 16 B, base 0x4000_0000 -> dense, sparse
+//   fp32d   FP32 rows out, everything contiguous, 2 items                                       -> dense, dense
+// Checks: y bits (FP32 layouts) == gs_emu; q and stored s == contract.quant_rows of gs_emu's y (q.bin, s.bin) ==
 // ctr::ref::quant_row (C++ reference); zero rows / pad lanes; guards and inputs untouched; nothing outside the
-// buffers touched. Then bad commands (act_mode returns non-zero and touches nothing) and the csynth top's pointer
-// instantiation. Prints the error against a float64 activation in units of the token's step s. Exit 1 on failure.
+// buffers touched. Cases with non-finite inputs (check 0): rows with only finite inputs are checked as above, rows
+// with a NaN / Inf must store a non-finite scale. Then bad commands (act_mode returns non-zero and touches nothing),
+// the csynth top's pointer instantiation, and with --plan the path census of every GELU / SILU_MUL record of the
+// -12392 list (contract_plan.py --out): all must take the dense read and the dense write.
+// Prints the error against a float64 activation in units of the token's step s. Exit 1 on failure.
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -27,6 +38,20 @@ uint32_t gelu_silu_top(const gs::Word* xmem, gs::Word* ymem, uint32_t opflags, u
                        uint64_t a, uint32_t pa, uint32_t sa, uint64_t b, uint32_t pb, uint32_t sb, uint64_t c, uint32_t pc,
                        uint32_t sc, uint64_t f, uint32_t sf, uint32_t p4, uint32_t p5);
 
+#ifdef GS_DFSIM
+int gs_dfsim_depth(const std::string& n) {
+  static const std::map<std::string, int> d = {{"gs_xin", GS_D_XIN}, {"gs_yf", GS_D_YF}, {"gs_ys", GS_D_YS},
+                                               {"gs_am", GS_D_AM},   {"gs_rsf", GS_D_RSF}, {"gs_sst", GS_D_SST},
+                                               {"gs_ow", GS_D_OW}};
+  auto it = d.find(n);
+  if (it == d.end()) {
+    fprintf(stderr, "DFSIM: unknown stream %s\n", n.c_str());
+    exit(9);
+  }
+  return it->second;
+}
+#endif
+
 using gs::Word;
 
 // ------------------------------------------------------------------ sparse memory (word addressed)
@@ -36,7 +61,7 @@ struct Mem {
     std::vector<Word> w;
   };
   std::vector<Region> r;
-  long accesses = 0;
+  std::atomic<long> accesses{0};
   uint64_t add(uint64_t byte_addr, size_t words, const Word& fill) {
     r.push_back(Region{byte_addr >> 4, std::vector<Word>(words, fill)});
     return byte_addr;
@@ -76,6 +101,7 @@ static uint32_t f2b(float f) {
   memcpy(&b, &f, 4);
   return b;
 }
+static bool finite_bits(uint32_t b) { return ((b >> 23) & 0xFF) != 0xFF; }
 static double act_ref(int mode, double x, double u) {
   if (mode == 0) return 0.5 * x * (1.0 + std::tanh(std::sqrt(2.0 / 3.14159265358979323846) * (x + 0.044715 * x * x * x)));
   if (mode == 2) return x / (1.0 + std::exp(-x));
@@ -92,9 +118,31 @@ struct Case {
   std::vector<float> x, u;
   std::vector<uint32_t> y, s;
   std::vector<int16_t> q;
+  std::vector<char> rowok;  // all inputs of the row finite
 };
 
-static uint32_t run_cmd(const ctr::Cmd& c0, Mem& mem, bool* valid) {
+struct Layout {
+  const char* name;
+  bool qout;
+  int items;      // 2 when N is even, else 1
+  int np_extra;   // NP = N_item + np_extra
+  int shift;      // p4
+  uint64_t base;  // buffers from here
+  uint32_t a_gap;  // bytes of pitch gap after each input row (A; fused SILU_MUL: after gate | up)
+  bool fused;     // SILU_MUL: up at A + 4K in the same row (else its own buffer, pitch 4K + 80)
+  uint32_t c_gap;  // bytes of pitch gap after each output row
+};
+static const Layout LAYOUTS[] = {
+    {"plan", true, 1, 0, 0, 0x800000000ull, 0, true, 0},
+    {"padded", true, 2, 3, -3, 0xFF00000000ull, 48, false, 32},
+    {"wide", true, 2, 5, 2, 0x200000000ull, 2048, true, 0},
+    {"fp32", false, 1, 0, 0, 0x40000000ull, 48, true, 16},
+    {"fp32d", false, 2, 0, 0, 0x60000000ull, 0, true, 0},
+};
+
+static long g_paths[2][2];  // [rdense][wdense] commands run
+
+static uint32_t run_cmd(const ctr::Cmd& c0, Mem& mem, bool* valid, gs::GsCmd* plan) {
   uint32_t f[ctr::REC_FIELDS];
   ctr::encode(c0, f);
   ctr::Cmd c;
@@ -105,18 +153,19 @@ static uint32_t run_cmd(const ctr::Cmd& c0, Mem& mem, bool* valid) {
     fprintf(stderr, "  record invalid: decode %u validate %u validate_hw %u\n", st, v, vh);
     return 99;
   }
+  *plan = gs::gs_plan(c);
   return gs::act_mode(c, MemRef{&mem}, MemRef{&mem});
 }
 
 // One layout of one case; returns the number of failures.
-static long run_layout(const Case& cs, const char* lay, double* emax, double* esum2, long* cnt) {
+static long run_layout(const Case& cs, const Layout& L, double* emax, double* esum2, long* cnt) {
   const int N = cs.N, K = cs.K;
-  const bool mul = cs.mode == 1, plan = !strcmp(lay, "plan"), fp32 = !strcmp(lay, "fp32");
-  const int items = (!strcmp(lay, "padded") && N % 2 == 0) ? 2 : 1;
-  const int Ni = N / items;                     // rows per item
-  const int NP = !strcmp(lay, "padded") ? Ni + 3 : Ni;
-  const int shift = !strcmp(lay, "padded") ? -3 : 0;
-  const uint64_t base = plan ? 0x800000000ull : (fp32 ? 0x40000000ull : 0xFF00000000ull);
+  const bool mul = cs.mode == 1, fp32 = !L.qout;
+  const int items = (L.items == 2 && N % 2 == 0) ? 2 : 1;
+  const int Ni = N / items;  // rows per item
+  const int NP = L.qout ? Ni + L.np_extra : Ni;
+  const int shift = L.qout ? L.shift : 0;
+  const bool fused = mul && L.fused;
   Mem mem;
   ctr::Cmd c = {};
   c.op = cs.mode == 0 ? ctr::OP_GELU : ctr::OP_SILU_MUL;
@@ -130,31 +179,21 @@ static long run_layout(const Case& cs, const char* lay, double* emax, double* es
   const uint32_t rowb = 4 * K;
   // ---- inputs
   ctr::Slot &A = c.s[ctr::SLOT_A], &Bs = c.s[ctr::SLOT_B], &C = c.s[ctr::SLOT_C], &F = c.s[ctr::SLOT_F];
-  uint64_t a_bytes, b_bytes = 0;
-  if (plan) {
-    A.pitch = mul ? 2 * rowb : rowb;
-    A.stride = 0;
-    A.addr = base;
-    a_bytes = (uint64_t)N * A.pitch;
-    if (mul) Bs = ctr::Slot{A.addr + rowb, A.pitch, 0};
-  } else {
-    A.pitch = rowb + 48;
-    A.stride = (uint32_t)al16((uint64_t)Ni * A.pitch + 32);
-    A.addr = base + 0x1000;
-    a_bytes = (uint64_t)items * A.stride;
-    if (mul) {
-      Bs.pitch = rowb + 80;
-      Bs.stride = (uint32_t)al16((uint64_t)Ni * Bs.pitch + 16);
-      Bs.addr = base + 0x100000 + al16(a_bytes);
-      b_bytes = (uint64_t)items * Bs.stride;
-    }
-  }
-  if (items == 1) {
-    A.stride = 0;
-    Bs.stride = 0;
+  A.addr = L.base + 0x1000;
+  A.pitch = (fused ? 2 * rowb : rowb) + L.a_gap;
+  A.stride = items > 1 ? (uint32_t)al16((uint64_t)Ni * A.pitch + 32) : 0;
+  const uint64_t a_bytes = items > 1 ? (uint64_t)items * A.stride : (uint64_t)Ni * A.pitch;
+  uint64_t b_bytes = 0;
+  if (fused) {
+    Bs = ctr::Slot{A.addr + rowb, A.pitch, A.stride};
+  } else if (mul) {
+    Bs.pitch = rowb + 80;
+    Bs.stride = items > 1 ? (uint32_t)al16((uint64_t)Ni * Bs.pitch + 16) : 0;
+    Bs.addr = L.base + 0x100000 + al16(a_bytes);
+    b_bytes = items > 1 ? (uint64_t)items * Bs.stride : (uint64_t)Ni * Bs.pitch;
   }
   mem.add(A.addr, a_bytes / 16 + 4, GUARD);
-  if (mul && !plan) mem.add(Bs.addr, b_bytes / 16 + 4, GUARD);
+  if (mul && !fused) mem.add(Bs.addr, b_bytes / 16 + 4, GUARD);
   for (int bi = 0; bi < items; bi++)
     for (int n = 0; n < Ni; n++)
       for (int k = 0; k < K; k++) {
@@ -166,9 +205,9 @@ static long run_layout(const Case& cs, const char* lay, double* emax, double* es
       }
   // ---- outputs
   const uint32_t orow = fp32 ? 4 * K : 2 * K;
-  C.pitch = plan ? orow : orow + (fp32 ? 16 : 32);
+  C.pitch = orow + L.c_gap;
   C.stride = items > 1 ? (uint32_t)al16((uint64_t)NP * C.pitch + 48) : 0;
-  C.addr = base + 0x4000000;
+  C.addr = L.base + 0x4000000;
   const uint64_t c_bytes = (uint64_t)(items - 1) * C.stride + (uint64_t)NP * C.pitch;
   mem.add(C.addr, c_bytes / 16 + 4, GUARD);
   const uint32_t fwords = (NP + 3) / 4;
@@ -181,27 +220,38 @@ static long run_layout(const Case& cs, const char* lay, double* emax, double* es
   // snapshot the inputs
   std::vector<Mem::Region> before = mem.r;
   bool valid;
+  gs::GsCmd plan;
   mem.accesses = 0;
-  const uint32_t rc = run_cmd(c, mem, &valid);
+  const uint32_t rc = run_cmd(c, mem, &valid, &plan);
   long fails = 0;
   if (!valid || rc != 0) {
-    fprintf(stderr, "%s [%s]: act_mode returned %u\n", cs.d.c_str(), lay, rc);
+    fprintf(stderr, "%s [%s]: act_mode returned %u\n", cs.d.c_str(), L.name, rc);
     return 1;
   }
+  // the path the layout is meant to take
+  const bool exp_rd = (Ni == 1 || L.a_gap / 16 <= (uint32_t)gs::GAPW) && (!mul || fused);
+  const bool exp_wr = NP == 1 || L.c_gap == 0;
+  g_paths[plan.rdense][plan.wdense]++;
+  if (plan.rdense != exp_rd || plan.wdense != exp_wr) {
+    fprintf(stderr, "  [%s] path: rdense %d wdense %d, expected %d %d\n", L.name, (int)plan.rdense, (int)plan.wdense,
+            (int)exp_rd, (int)exp_wr);
+    fails++;
+  }
   // inputs unchanged
-  for (size_t i = 0; i < 1 + (mul && !plan ? 1u : 0u); i++)
+  for (size_t i = 0; i < 1 + (mul && !fused ? 1u : 0u); i++)
     if (mem.r[i].w != before[i].w) {
       fprintf(stderr, "  input buffer %zu modified\n", i);
       fails++;
     }
-  if (!cs.check) return fails;  // undefined inputs: termination and extents only
-  long bq = 0, bs = 0, by = 0, bg = 0;
+  long bq = 0, bs = 0, by = 0, bg = 0, bnf = 0;
   for (int bi = 0; bi < items; bi++) {
     for (int n = 0; n < NP; n++) {
+      const bool real = n < Ni;
+      const size_t rowi = (size_t)bi * Ni + (real ? n : 0);
+      const bool ok = !real || cs.rowok[rowi];
       const uint64_t row = C.addr + (uint64_t)bi * C.stride + (uint64_t)n * C.pitch;
-      for (int k = 0; k < K; k++) {
-        const bool real = n < Ni;
-        const size_t e = (size_t)(bi * Ni + (real ? n : 0)) * K + k;
+      for (int k = 0; k < K && ok; k++) {
+        const size_t e = rowi * K + k;
         if (fp32) {
           const uint32_t yv = lane32(mem.byte(row + 4 * k), k % 4);
           if (yv != cs.y[e]) {
@@ -218,13 +268,20 @@ static long run_layout(const Case& cs, const char* lay, double* emax, double* es
         }
       }
       // guard words between rows (pitch padding)
-      for (uint64_t g = al16(fp32 ? 4 * K : 2 * K); g < C.pitch; g += 16)
+      for (uint64_t g = al16(orow); g < C.pitch; g += 16)
         if (mem.byte(row + g) != GUARD) bg++;
     }
     if (!fp32) {
       for (int n = 0; n < 4 * (int)fwords; n++) {
         const uint64_t fa = F.addr + (uint64_t)bi * F.stride + 4 * n;
         const uint32_t sv = lane32(mem.byte(fa), n % 4);
+        if (n < Ni && !cs.rowok[bi * Ni + n]) {  // non-finite input: the stored scale must not hide it
+          if (finite_bits(sv)) {
+            if (bnf < 5) fprintf(stderr, "  item %d row %d: non-finite input, finite stored scale %08x\n", bi, n, sv);
+            bnf++;
+          }
+          continue;
+        }
         uint32_t se;
         if (n < Ni) {
           se = cs.s[bi * Ni + n];
@@ -242,19 +299,20 @@ static long run_layout(const Case& cs, const char* lay, double* emax, double* es
           if (mem.byte(F.addr + g) != GUARD) bg++;
     }
   }
-  // guard words after the output extents
+  // guard words after the output extents and between items
   for (auto& g : mem.r) {
-    if (g.base == (C.addr >> 4) || g.base == (F.addr >> 4)) {
-      const uint64_t used = g.base == (C.addr >> 4) ? (c_bytes + 15) / 16 : (uint64_t)(items - 1) * (F.stride / 16) + fwords;
+    if (g.base == (C.addr >> 4) || (!fp32 && g.base == (F.addr >> 4))) {
+      const bool isc = g.base == (C.addr >> 4);
+      const uint64_t used = isc ? (c_bytes + 15) / 16 : (uint64_t)(items - 1) * (F.stride / 16) + fwords;
       for (uint64_t i = used; i < g.w.size(); i++)
         if (g.w[i] != GUARD) bg++;
-      if (items > 1 && g.base == (C.addr >> 4))
+      if (items > 1 && isc)
         for (uint64_t i = ((uint64_t)NP * C.pitch + 15) / 16; i < C.stride / 16; i++)
           if (g.w[i] != GUARD) bg++;
     }
   }
   // error against float64 (plan layout only: no shift)
-  if (plan)
+  if (!strcmp(L.name, "plan") && cs.check)
     for (int n = 0; n < N; n++) {
       const double s = b2f(cs.s[n]);
       for (int k = 0; k < K; k++) {
@@ -267,8 +325,9 @@ static long run_layout(const Case& cs, const char* lay, double* emax, double* es
         (*cnt)++;
       }
     }
-  if (bq || bs || by || bg) fprintf(stderr, "  [%s] q %ld s %ld y %ld guard %ld mismatches\n", lay, bq, bs, by, bg);
-  return fails + bq + bs + by + bg;
+  if (bq || bs || by || bg || bnf)
+    fprintf(stderr, "  [%s] q %ld s %ld y %ld guard %ld non-finite %ld mismatches\n", L.name, bq, bs, by, bg, bnf);
+  return fails + bq + bs + by + bg + bnf;
 }
 
 static int run_case(const std::string& d) {
@@ -291,12 +350,25 @@ static int run_case(const std::string& d) {
   cs.y = slurp<uint32_t>(d + "/y.bin", ne);
   cs.q = slurp<int16_t>(d + "/q.bin", ne);
   cs.s = slurp<uint32_t>(d + "/s.bin", cs.N);
+  cs.rowok.assign(cs.N, 1);
+  int nbad = 0;
+  for (int n = 0; n < cs.N; n++)
+    for (int k = 0; k < cs.K; k++) {
+      const size_t e = (size_t)n * cs.K + k;
+      if (!finite_bits(f2b(cs.x[e])) || !finite_bits(f2b(cs.u[e]))) cs.rowok[n] = 0;
+    }
+  for (int n = 0; n < cs.N; n++) nbad += !cs.rowok[n];
+  if (cs.check && nbad) {
+    fprintf(stderr, "%s: check = 1 with %d non-finite rows\n", d.c_str(), nbad);
+    return 1;
+  }
   long fails = 0, rq = 0;
-  // the C++ reference quantizer (ctr::ref) on gs_emu's y == contract.quant_rows (q.bin, s.bin)
-  if (cs.check) {
+  // the C++ reference quantizer (ctr::ref) on gs_emu's y == contract.quant_rows (q.bin, s.bin), finite rows
+  {
     std::vector<float> yr(cs.K);
     std::vector<int16_t> qr(cs.K);
     for (int n = 0; n < cs.N; n++) {
+      if (!cs.rowok[n]) continue;
       for (int k = 0; k < cs.K; k++) yr[k] = b2f(cs.y[(size_t)n * cs.K + k]);
       const float s = ctr::ref::quant_row(yr.data(), cs.K, qr.data());
       if (f2b(s) != cs.s[n]) rq++;
@@ -306,10 +378,10 @@ static int run_case(const std::string& d) {
   }
   double emax = 0, esum2 = 0;
   long cnt = 0;
-  for (const char* lay : {"plan", "padded", "fp32"}) fails += run_layout(cs, lay, &emax, &esum2, &cnt);
-  printf("%-34s mode %d N %4d K %4d%s: %s; |q s - y_ref| / s max %.4f rms %.4f (%ld el.)\n", d.c_str(), cs.mode, cs.N,
-         cs.K, cs.check ? "" : " (undefined inputs: extents only)", (fails + rq) ? "FAIL" : "pass", emax,
-         cnt ? std::sqrt(esum2 / cnt) : 0.0, cnt);
+  for (const Layout& L : LAYOUTS) fails += run_layout(cs, L, &emax, &esum2, &cnt);
+  printf("%-34s mode %d N %4d K %4d: %s; |q s - y_ref| / s max %.4f rms %.4f (%ld el.)%s\n", d.c_str(), cs.mode, cs.N,
+         cs.K, (fails + rq) ? "FAIL" : "pass", emax, cnt ? std::sqrt(esum2 / cnt) : 0.0, cnt,
+         nbad ? " [rows with NaN / Inf: scale non-finite checked]" : "");
   return (fails + rq) ? 1 : 0;
 }
 
@@ -341,7 +413,7 @@ static int bad_commands() {
     const uint32_t r = gs::act_mode(c, MemRef{&mem}, MemRef{&mem});
     if (r == 0 || mem.accesses != 0) {
       fprintf(stderr, "bad command op %#x flags %#x K %u N %u np %u sh %d: returned %u, %ld accesses\n", b.op, b.flags,
-              b.K, b.N, b.np, (int)b.sh, r, mem.accesses);
+              b.K, b.N, b.np, (int)b.sh, r, (long)mem.accesses);
       fails++;
     }
   }
@@ -384,11 +456,71 @@ static int top_check() {
   return bad ? 1 : 0;
 }
 
+// Path census of the GELU / SILU_MUL records of an encoded list (contract_plan.py --out): every record must decode,
+// validate and take the dense read and the dense write (the burst-per-item / per-chunk paths).
+static int plan_census(const std::string& path) {
+  FILE* f = fopen(path.c_str(), "rb");
+  if (!f) {
+    fprintf(stderr, "cannot read %s\n", path.c_str());
+    return 1;
+  }
+  std::vector<unsigned char> bin;
+  unsigned char buf[ctr::REC_BYTES];
+  while (fread(buf, 1, ctr::REC_BYTES, f) == ctr::REC_BYTES) bin.insert(bin.end(), buf, buf + ctr::REC_BYTES);
+  fclose(f);
+  const size_t n = bin.size() / ctr::REC_BYTES;
+  int fails = 0;
+  std::map<std::string, long> shapes;
+  long cnt = 0, dense = 0;
+  for (size_t i = 0; i < n; i++) {
+    uint32_t fl[ctr::REC_FIELDS];
+    memcpy(fl, &bin[i * ctr::REC_BYTES], ctr::REC_BYTES);
+    ctr::Cmd c;
+    if (ctr::decode(fl, c) != ctr::ST_END) {
+      fails++;
+      continue;
+    }
+    if (c.op != ctr::OP_GELU && c.op != ctr::OP_SILU_MUL) continue;
+    cnt++;
+    if (ctr::validate(c) != ctr::ME_OK || ctr::validate_hw(c) != ctr::ME_OK) {
+      fprintf(stderr, "plan record %zu invalid\n", i);
+      fails++;
+      continue;
+    }
+    const gs::GsCmd p = gs::gs_plan(c);
+    const bool ok = p.rdense && p.wdense;
+    dense += ok;
+    if (!ok) fails++;
+    char key[160];
+    snprintf(key, sizeof key, "%s%s K %u N %u B %u A.pitch %u C.pitch %u: rdense %d wdense %d qout %d",
+             c.op == ctr::OP_GELU ? "GELU" : "SILU_MUL", (c.flags & ctr::F_NOMUL) ? "+NOMUL" : "", c.K, c.N, c.B,
+             c.s[ctr::SLOT_A].pitch, c.s[ctr::SLOT_C].pitch, (int)p.rdense, (int)p.wdense, (int)p.qout);
+    shapes[key]++;
+  }
+  printf("plan %s: %zu records, %ld GELU / SILU_MUL, %ld on the dense read + dense write paths\n", path.c_str(), n, cnt,
+         dense);
+  for (auto& s : shapes) printf("  %4ld x %s\n", s.second, s.first.c_str());
+  return fails;
+}
+
 int main(int argc, char** argv) {
   int fails = 0;
-  for (int i = 1; i < argc; i++) fails += run_case(argv[i]);
+#ifdef GS_DFSIM
+  printf("threaded bounded-FIFO model (GS_DFSIM): every process a thread, every stream at its pragma depth "
+         "(xin %d yf %d ys %d am %d rsf %d sst %d ow %d)\n",
+         GS_D_XIN, GS_D_YF, (int)(GS_D_YS), GS_D_AM, GS_D_RSF, GS_D_SST, GS_D_OW);
+#endif
+  for (int i = 1; i < argc; i++) {
+    if (!strcmp(argv[i], "--plan") && i + 1 < argc) {
+      fails += plan_census(argv[++i]);
+      continue;
+    }
+    fails += run_case(argv[i]);
+  }
   fails += bad_commands();
   fails += top_check();
+  printf("paths run (rdense, wdense): 00 %ld, 01 %ld, 10 %ld, 11 %ld\n", g_paths[0][0], g_paths[0][1], g_paths[1][0],
+         g_paths[1][1]);
   printf(fails ? "FAIL (%d)\n" : "PASS\n", fails);
   return fails ? 1 : 0;
 }

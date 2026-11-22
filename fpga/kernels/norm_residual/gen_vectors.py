@@ -338,11 +338,29 @@ def synth_cases(out):
     K = 1024  # the longest row
     make_case(out, "ln1024", rnd(1, 9, K, scale=2.0, off=1.0), gam(K), rnd(K, scale=0.2), 1e-6, True, True)
     make_case(out, "rms1024_f32", rnd(1, 7, K), gam(K), None, 1e-5, False, False)
+    # K = 1024 FP32 z over two writer chunks: 256-row flat bursts of 65,536 words (the review's rec = 512
+    # truncation lived on this path in the records layout)
+    make_case(out, "ln1024_f32_n260", rnd(1, 260, 1024, off=0.5), gam(1024), rnd(1024), 1e-6, True, False)
+    # running-exponent statistics: rows whose exponent grows word by word (a renormalization almost every
+    # word), the row max in the last word, a tiny first word then a jump of 2^60, alternating signs
+    K = 768
+    j = np.arange(K, dtype=np.float64)
+    grow = [
+        np.exp2(j / 24.0) * np.where(j % 2, -1, 1),
+        np.exp2(j / 8.0 - 40.0),
+        np.r_[rng.standard_normal(K - 4), [1e3, -2e3, 4e3, -8e3]],
+        np.r_[[1e-30, -1e-30, 3e-31, 0.0], rng.standard_normal(K - 4) * 1e-12, np.zeros(0)][:K],
+        np.r_[rng.standard_normal(K - 1) * 1e-3, [1e15]],
+        rng.standard_normal(K) * np.exp2(np.floor(j / 4) % 30),
+    ]
+    A = np.stack(grow).astype(np.float32)[None]
+    make_case(out, "renorm_ln768", A, gam(K), rnd(K, scale=0.2), 1e-6, True, True)
+    make_case(out, "renorm_rms768_f32", A, gam(K), None, 1e-5, False, False)
     K = 8  # the shortest rows (scalar-bound: the per-row processes, not io, set the pace)
     make_case(out, "rms8_q", rnd(1, 37, K), gam(K), None, 1e-5, False, True, np_extra=3)
     make_case(out, "ln8_f32", rnd(3, 5, K, off=1.0), gam(K), rnd(K), 1e-6, True, False)
     # all-equal LayerNorm rows (review: the double-rounded mean gave +-32767 noise; torch gives beta)
-    for K in (768, 960, 720):
+    for K in (768, 960, 720, 1024):
         vals = [-1e4, 2.0, 3.7, 0.1, -7.25, 1e-3, 123456.79, -0.3333333, 0.0]
         A = np.stack([np.full(K, v, np.float32) for v in vals])[None]
         z = make_case(out, f"const_ln{K}", A, gam(K), rnd(K, scale=0.2), 1e-6, True, True)

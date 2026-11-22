@@ -1,90 +1,96 @@
-"""Summarise the sequencer csynth projects: totals, the per-instance breakdown, and how many hardware
-instances of the GEMM engine (and of its MAC pipeline) each variant has.
+"""Summary of the sequencer's csynth runs (build/hls_<tag>/sol1/syn/report): estimated clock, the totals of
+the
+top, the m_axi / control adapters, the sequencer region (walk + cycle counter), the null units, validate_hw,
+and the cycles per command (cmd_loop iteration latency).
 
-    python hls_summary.py [build] [--out build/hls_summary.json]
+    python hls_summary.py [build/hls_p40 build/hls_p40_u0 ...] [--json out.json]
 """
 
 from __future__ import annotations
 
-import argparse
 import json
-import pathlib
 import re
-import xml.etree.ElementTree as ET
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
 
 
-def res(node):
-    r = node.find("AreaEstimates/Resources")
-    return {k: int(r.findtext(k, "0")) for k in ("BRAM_18K", "DSP", "FF", "LUT", "URAM")}
-
-
-def walk_instances(rpt_dir: pathlib.Path, module: str, path=(), out=None, depth=0):
-    """Expand the instance tree from the per-module .rpt files ("Instance" tables)."""
-    out = [] if out is None else out
-    f = rpt_dir / f"{module}_csynth.rpt"
-    if not f.exists() or depth > 12:
-        return out
-    txt = f.read_text(errors="replace")
-    m = re.search(r"\* Instance:\s*\n(.*?)\n\s*\n", txt[txt.find("== Utilization Estimates"):], re.S)
-    if not m:
-        return out
-    for ln in m.group(1).splitlines():
-        cols = [c.strip() for c in ln.strip().strip("|").split("|")]
-        if len(cols) < 7 or cols[0] in ("Instance", "Total") or cols[0].startswith("+"):
-            continue
-        inst, mod = cols[0], cols[1]
-        try:
-            bram, dsp, ff, lut = (int(cols[i]) for i in range(2, 6))
-        except ValueError:
-            continue
-        out.append(dict(path="/".join(path + (inst,)), module=mod, BRAM_18K=bram, DSP=dsp, FF=ff, LUT=lut))
-        walk_instances(rpt_dir, mod, path + (inst,), out, depth + 1)
+def rows(rpt: str) -> dict[str, list[str]]:
+    """Module rows of csynth.rpt's 'Performance & Resource Estimates' table, by name."""
+    sec = rpt.split("Performance & Resource Estimates", 1)[1].split("+ HW Interfaces", 1)[0]
+    out = {}
+    for ln in sec.splitlines():
+        p = [x.strip() for x in ln.split("|")]
+        if len(p) > 14 and p[1][:1] in "+o":
+            out.setdefault(p[1].lstrip("+o ").strip(), p)
     return out
 
 
-def summarize(proj: pathlib.Path):
-    sol = proj / "sol1/syn/report"
-    xml = sol / "csynth.xml"
-    if not xml.exists():
-        return None
-    root = ET.parse(xml).getroot()
-    tot = res(root)
-    timing = root.find("PerformanceEstimates/SummaryOfTimingAnalysis")
-    est = float(timing.findtext("EstimatedClockPeriod"))
-    target = float(root.findtext("UserAssignments/TargetClockPeriod"))
-    inst = walk_instances(sol, "seq_top")
-    # the engine proper (gemm_mode is a thin wrapper around it; its Pipeline_* children are its loops)
-    gemm = [i for i in inst if i["module"].startswith("gemm_stub_") and "Pipeline" not in i["module"]]
-    mac = [i for i in inst if i["module"].endswith("_Pipeline_mac")]
-    return dict(project=proj.name, target_ns=target, estimated_ns=est, total=tot,
-                gemm_instances=[(i["path"], i["module"], i["LUT"], i["DSP"]) for i in gemm],
-                mac_pipeline_instances=[(i["path"], i["LUT"], i["DSP"]) for i in mac],
-                instances=[i for i in inst if i["path"].count("/") <= 1])
+def num(s: str) -> int:
+    m = re.match(r"\s*(\d+)", s)
+    return int(m.group(1)) if m else 0
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("build", nargs="?", default=str(pathlib.Path(__file__).resolve().parent / "build"))
-    ap.add_argument("--out", default="")
-    args = ap.parse_args()
-    allres = []
-    for proj in sorted(pathlib.Path(args.build).glob("seq_v*_p*")):
-        s = summarize(proj)
-        if not s:
-            print(proj.name, ": no csynth report")
-            continue
-        allres.append(s)
-        t = s["total"]
-        print(f"== {s['project']}: target {s['target_ns']} ns, estimated {s['estimated_ns']} ns; "
-              f"LUT {t['LUT']} FF {t['FF']} DSP {t['DSP']} BRAM18 {t['BRAM_18K']} URAM {t['URAM']}")
-        print(f"   GEMM engine instances: {len(s['gemm_instances'])} {s['gemm_instances']}")
-        print(f"   MAC pipeline instances: {len(s['mac_pipeline_instances'])} {s['mac_pipeline_instances']}")
-        for i in s["instances"]:
-            print(f"     {i['path']:60s} {i['module']:45s} LUT {i['LUT']:6d} FF {i['FF']:6d} DSP {i['DSP']:4d} "
-                  f"BRAM18 {i['BRAM_18K']}")
-    if args.out:
-        pathlib.Path(args.out).write_text(json.dumps(allres, indent=1))
+def summary(d: Path) -> dict:
+    rep = d / "sol1/syn/report"
+    r = rows((rep / "csynth.rpt").read_text())
+    top = (rep / "seq_top_csynth.rpt").read_text()
+    est = re.search(r"\|ap_clk\s*\|\s*([\d.]+) ns\|\s*([\d.]+) ns\|", top)
+    inst = {}
+    for ln in top.split("* Instance:", 1)[1].split("* DSP:", 1)[0].splitlines():
+        p = [x.strip() for x in ln.split("|")]
+        if len(p) > 7 and p[1] and not p[1].startswith(("Instance", "Total")):
+            inst[p[2]] = {"dsp": num(p[4]), "ff": num(p[5]), "lut": num(p[6])}
+
+    def res(name: str) -> dict:
+        for k, p in r.items():
+            if k.startswith(name):
+                return {
+                    "lut": num(p[13]),
+                    "ff": num(p[12]),
+                    "dsp": num(p[11]),
+                    "lat": num(p[4]),
+                    "iter": num(p[6]),
+                }
+        return {}
+
+    nulls = [res(k) for k in r if k.startswith("null_unit")]
+    return {
+        "target_ns": float(est.group(1)) if est else None,
+        "estimated_ns": float(est.group(2)) if est else None,
+        "top": res("seq_top"),
+        "adapters_lut": sum(v["lut"] for k, v in inst.items() if k.endswith(("_m_axi", "_s_axi"))),
+        "region": res("region_"),
+        "null_units_lut": sum(n["lut"] for n in nulls),
+        "validate_hw": res("validate_t"),
+        "cycles_per_cmd": res("cmd_loop").get("iter"),
+    }
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    out = argv.pop(argv.index("--json") + 1) if "--json" in argv else None
+    args = [a for a in argv if not a.startswith("--")]
+    dirs = [Path(a) for a in args] or sorted((HERE / "build").glob("hls_p*"))
+    res = {}
+    for d in dirs:
+        if (d / "sol1/syn/report/csynth.rpt").exists():
+            s = summary(d)
+            res[d.name] = s
+            seq = s["region"]["lut"] - s["null_units_lut"]
+            print(
+                f"{d.name}: est {s['estimated_ns']} ns (target {s['target_ns']}); top {s['top']['lut']} LUT "
+                f"{s['top']['ff']} FF {s['top']['dsp']} DSP; adapters {s['adapters_lut']} LUT; region "
+                f"{s['region']['lut']} LUT {s['region']['ff']} FF; null units {s['null_units_lut']} LUT; "
+                f"sequencer {seq} LUT; validate_hw {s['validate_hw'].get('lut')} LUT / "
+                f"{s['validate_hw'].get('lat')} "
+                f"clocks; {s['cycles_per_cmd']} clocks per command"
+            )
+    if out:
+        Path(out).write_text(json.dumps(res, indent=1))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

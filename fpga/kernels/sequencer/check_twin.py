@@ -1,6 +1,7 @@
-"""Replays every start tb_seq.cpp logged (--twin DIR) through exec_ref.py and compares, start by start: the return
-value, status words 0-9 (all but the cycle count), the dispatch trace (every unit call with every decoded field)
-and the output bytes the testbench checked. This is the C++ / Python twin check of the walk (review defect 11).
+"""Replays every start tb_seq.cpp logged (--twin DIR) through exec_ref.py and compares, start by start: the
+return value, status words 0-9 (all but the cycle count), the dispatch trace (every unit call with every
+decoded field) and the output bytes the testbench checked. This is the C++ / Python twin check of the walk
+(review defect 11).
 
     python check_twin.py build/twin/twin_lo.txt build/twin/twin_hi.txt
 """
@@ -63,27 +64,32 @@ def replay(path: Path) -> int:
             want = list(s["status"])
             if got[5] == want[5] == 0x53455153:  # written by this start (the magic word)
                 if offset is None:
-                    offset = want[6] - got[6]  # starts since configuration: the C++ process ran other starts first
+                    offset = (
+                        want[6] - got[6]
+                    )  # starts since configuration: the C++ process ran other starts first
                 got[6] += offset
             if got != want:
                 bad.append(f"status {[hex(v) for v in got]} != {[hex(v) for v in want]}")
         if ex.trace != s["trace"]:
             bad.append(f"trace {len(ex.trace)} vs {len(s['trace'])} lines")
-            for a, b in zip(ex.trace, s["trace"]):
+            for a, b in zip(ex.trace, s["trace"], strict=False):
                 if a != b:
                     bad.append(f"  py  {a}\n  c++ {b}")
                     break
         for a, raw in s["outs"]:
             got = mem.read(a, len(raw))
             if got != raw:
-                nd = sum(x != y for x, y in zip(got, raw))
+                nd = sum(x != y for x, y in zip(got, raw, strict=True))
                 bad.append(f"output 0x{a:x}+{len(raw)}: {nd} bytes differ")
         if bad:
             fails += 1
             print(f"FAIL {path.name} start {i} (M=0x{s['M']:x}):\n  " + "\n  ".join(bad))
     n_out = sum(len(s["outs"]) for s in starts)
-    print(f"{path.name}: {len(starts)} starts, {sum(len(s['trace']) for s in starts)} unit calls, {n_out} output "
-          f"ranges: {'identical' if not fails else f'{fails} starts differ'}")
+    print(
+        f"{path.name}: {len(starts)} starts, {sum(len(s['trace']) for s in starts)} unit calls, "
+        f"{n_out} output "
+        f"ranges: {'identical' if not fails else f'{fails} starts differ'}"
+    )
     return fails
 
 

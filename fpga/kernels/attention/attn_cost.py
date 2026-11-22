@@ -1,18 +1,14 @@
-"""Time per chunk of the QUANT_W / QUANT_WT mode (attn_kv.h) on the contract's -12392 command list.
+"""Time per chunk of the attention path under the contract: its records in contract_plan's -12392 list.
 
-Takes every QUANT_W and QUANT_WT record of contract_plan.build() (the 2,701-record chunk, CONTRACT.md 6) and times it
-with a clock model of attn_kv.h's loops, against contract_plan's own row-unit rule for the same records.
+Attention is no unit of its own (CONTRACT.md 5): it is GEMMs (Q.K^T, P.V), SOFTMAX and row-unit records
+(the Q producer with p4 = -3, the K blob by QUANT_W or ROPE F_KW, the V^T blob by QUANT_WT, the o_proj
+input QUANT_X). This picks those records out of contract_plan.build() (the 2,701-record chunk) and sums
+contract_plan's own clock model (cmd_clocks: the engine's cycle model for GEMM, the row-unit and softmax
+rules, 80 clocks of sequencer fetch per record), per role, at several clocks, with and without engine change
+E-7 (items inside one DATAFLOW run). Estimates: nothing here ran in co-simulation or on the board, and the
+DDR rate is the contract's unmeasured 14 GB/s.
 
-Model (clocks at the kernel clock; estimates, nothing here ran on the board or in co-simulation):
-  - every burst costs its beats + its latency (L for a read burst until the first beat, Lw for a write burst until
-    its write response: HLS waits for BRESP at the end of each burst loop) + LOOP clocks of loop entry and exit;
-    L and Lw on the KR260 are unknown (contract BT-2), so they are swept
-  - a DATAFLOW pass costs PASS0 to start and drain; per (block, chunk) the slowest of reader / quant / writer counts
-    (the FIFOs between them hold more than one chunk, tb_attn's bounded-FIFO model checks they never deadlock)
-  - the scaler: one scale per 13 clocks (2 dividers of 26 clocks); QUANT_WT waits for its table (13 cw clocks)
-  - SEQ: the sequencer's 80 clocks per record (contract_plan's figure), included on both sides
-
-    C:\\kp\\lerobot-venv\\Scripts\\python.exe fpga\\kernels\\attention\\attn_cost.py [--mhz 250]
+    C:\\kp\\lerobot-venv\\Scripts\\python.exe fpga\\kernels\\attention\\attn_cost.py [--ddr 14]
 """
 
 from __future__ import annotations
@@ -28,104 +24,79 @@ sys.path.insert(0, str(HERE.parent))
 import contract_plan as CP  # noqa: E402
 from contract import C  # noqa: E402
 
-PASS0 = 60  # DATAFLOW start + pipeline fill / drain of 4 processes (quant_elem is about 12 stages)
-MODE0 = 20  # mode entry and pass setup
-LOOP = 3  # entry / exit of one burst loop
-DIV = 13  # clocks per scale (2 staggered dividers of 26 clocks)
+# the pre-contract design (attn_pack era, results/cost.json before this conform), prefix compacted to 45,
+# ms at 250 MHz: engine 57.2 (61.8 with the engine's own call model, review), packer 72.4 (single-beat
+# bursts: est. 180-290), softmax 27.8; and 948 kernel calls per chunk (19-95 ms of host time)
+PRE_CONTRACT_MS = {"engine": 57.2, "engine_review": 61.8, "packer": 72.4, "softmax": 27.8}
 
 
-def chunks(k: int, cw: int) -> list[int]:
-    n = -(-k // cw)
-    return [cw] * (n - 1) + [k - (n - 1) * cw]
+def role(c) -> str | None:
+    n = c.note or ""
+    if c.op == C.OP_GEMM:
+        if n.endswith(":qk"):
+            return "GEMM Q.K^T"
+        if ":pv" in n:
+            return "GEMM P.V"
+        return None
+    if c.op == C.OP_SOFTMAX:
+        return "SOFTMAX"
+    if c.op == C.OP_QUANT_W or (c.op == C.OP_ROPE and c.flags & C.F_KW):
+        return "K blob (QUANT_W / ROPE F_KW)"
+    if c.op == C.OP_QUANT_WT:
+        return "V^T blob (QUANT_WT)"
+    if c.op in (C.OP_QUANT_X, C.OP_ROPE) and c.par(C.P_SHIFT) == (-3 & 0xFFFFFFFF):
+        return "Q (QUANT_X / ROPE, p4 = -3)"
+    if c.op == C.OP_QUANT_X and n.endswith("o.in"):
+        return "o_proj input (QUANT_X)"
+    return None
 
 
-def kw_clocks(c, L: float, Lw: float) -> tuple[float, int, int]:
-    """(clocks, read bursts, write bursts) of one QUANT_W record."""
-    K, N, NP = c.K, c.N, c.par(C.P_NP) or c.N
-    seg64 = c.par(C.P_SEG) != 0
-    W = 64 if seg64 else K
-    long = W > 256
-    cws = chunks(K, 256 if (seg64 or long) else K)
-    nblk = NP // 8
-    t, rb, wb = 0.0, 0, 0
-    for _ in range(c.B):
-        if not long:
-            t += PASS0
-            for _blk in range(nblk):
-                for cw in cws:
-                    segs = cw // 64 if seg64 else 1
-                    rd = 8 * (cw / 4 + L + LOOP)
-                    qt = 2 * cw
-                    wr = cw + 8 * segs + segs * ((W + Lw + LOOP) + (2 + Lw + LOOP))
-                    t += max(rd, qt, wr)
-                    rb += 8
-                    wb += 2 * segs
-        else:
-            for _blk in range(nblk):
-                t += sum(8 * (cw / 4 + L + LOOP) for cw in cws) + 8 * DIV + 26 + PASS0 + 8 + Lw + LOOP
-                t += sum(max(8 * (cw / 4 + L + LOOP), 2 * cw, 2 * cw + Lw + LOOP) for cw in cws)
-                rb += 16 * len(cws)
-                wb += len(cws) + 1
-    return CP.SEQ_FETCH + MODE0 + t, rb, wb
-
-
-def vw_clocks(c, L: float, Lw: float) -> tuple[float, int, int]:
-    """(clocks, read bursts, write bursts) of one QUANT_WT record."""
-    K, N, NP = c.K, c.N, c.par(C.P_NP) or c.N
-    seg64 = c.par(C.P_SEG) != 0
-    t, rb, wb = 0.0, 0, 0
-    for _ in range(c.B):
-        for cw in chunks(K, 128):
-            t += 32 + N * (cw / 4 + L + LOOP)  # scan: clear, then the column absmax
-            two = seg64 and cw > 64
-            runs, runw = (2, 16) if two else (1, cw // 4)
-            t += PASS0 + DIV * cw + 26 + runs * (4 * runw + Lw + LOOP)  # table, then its scale words (II = 4)
-            rb += N
-            wb += runs
-            n0 = 0
-            while n0 < NP:
-                r = min(16, NP - n0)
-                rd = r * (cw / 4 + L + LOOP)
-                qt = r * cw / 4
-                wr = r * cw / 8 + (cw / 8) * (r + Lw + LOOP)
-                t += max(rd, qt, wr)
-                rb += r
-                wb += cw // 8
-                n0 += r
-    return CP.SEQ_FETCH + MODE0 + t, rb, wb
+def tally(plan, mhz: float, ddr: float) -> dict:
+    bpc = ddr * 1e9 / (mhz * 1e6)
+    ms = 1e3 / (mhz * 1e6)
+    out = defaultdict(lambda: {"records": 0, "items": 0, "ms": 0.0})
+    total = 0.0
+    for c in plan.cmds:
+        clk = CP.cmd_clocks(c, bpc)[0]
+        total += clk
+        r = role(c)
+        if r is None:
+            continue
+        out[r]["records"] += 1
+        out[r]["items"] += c.B
+        out[r]["ms"] += clk * ms
+    res = {k: {**v, "ms": round(v["ms"], 2)} for k, v in sorted(out.items(), key=lambda x: -x[1]["ms"])}
+    att = sum(v["ms"] for v in out.values())
+    return {
+        "mhz": mhz,
+        "roles": res,
+        "attention_ms": round(att, 1),
+        "chunk_F_ms": round(total * ms, 1),
+        "attention_share": round(att / (total * ms), 3),
+    }
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mhz", type=float, default=250.0)
-    ap.add_argument("--ddr", type=float, default=14.0, help="GB/s for contract_plan's own rule")
+    ap.add_argument("--ddr", type=float, default=14.0, help="GB/s (contract figure, unmeasured)")
     ap.add_argument("--out", default=str(HERE / "results" / "cost.json"))
-    args = ap.parse_args()
+    a = ap.parse_args()
     plan = CP.build(0x8_0000_0000)
-    recs = [c for c in plan.cmds if c.op in (C.OP_QUANT_W, C.OP_QUANT_WT)]
-    ddr_bpc = args.ddr * 1e9 / (args.mhz * 1e6)
-    ms = 1e3 / (args.mhz * 1e6)
-    res = dict(mhz=args.mhz, records={}, plan_rule_ms={}, mode_ms={}, bursts={})
-    counts = defaultdict(int)
-    for c in recs:
-        counts[C.opnames[c.op]] += 1
-    res["records"] = dict(counts)
-    for op in (C.OP_QUANT_W, C.OP_QUANT_WT):
-        res["plan_rule_ms"][C.opnames[op]] = (
-            sum(CP.cmd_clocks(c, ddr_bpc)[0] for c in recs if c.op == op) * ms
-        )
-    for L in (0, 32, 64, 100):
-        row, br = {}, {}
-        for op, fn in ((C.OP_QUANT_W, kw_clocks), (C.OP_QUANT_WT, vw_clocks)):
-            tot = [fn(c, L, L) for c in recs if c.op == op]
-            row[C.opnames[op]] = sum(x[0] for x in tot) * ms
-            br[C.opnames[op]] = dict(read=sum(x[1] for x in tot), write=sum(x[2] for x in tot))
-        row["total"] = sum(row.values())
-        res["mode_ms"][f"L={L}"] = row
-        res["bursts"] = br
-    res["plan_rule_ms"]["total"] = sum(res["plan_rule_ms"].values())
-    print(json.dumps(res, indent=1))
-    Path(args.out).write_text(json.dumps(res, indent=1))
+    runs = {}
+    for mhz in (250.0, 222.0, 200.0):
+        CP.OPT["item_fixed"] = None
+        runs[f"{mhz:.0f}MHz"] = tally(plan, mhz, a.ddr)
+        CP.OPT["item_fixed"] = 200  # E-7
+        runs[f"{mhz:.0f}MHz_E7"] = tally(plan, mhz, a.ddr)
+    CP.OPT["item_fixed"] = None
+    res = {"ddr_GBps": a.ddr, "pre_contract_ms_250": PRE_CONTRACT_MS, "runs": runs}
+    for k, v in runs.items():
+        share = v["attention_share"]
+        print(f"{k:10s} attention {v['attention_ms']:6.1f} ms of F {v['chunk_F_ms']:6.1f} ms ({share:.1%})")
+        if k == "250MHz":
+            for r, x in v["roles"].items():
+                print(f"    {r:30s} {x['records']:4d} records {x['items']:5d} items {x['ms']:6.1f} ms")
+    Path(a.out).write_text(json.dumps(res, indent=1))
     return 0
 
 

@@ -36,7 +36,7 @@
 #define QZ_RECIP_BITS 2  // 2 quotient bits per clock: 3 chained steps miss 250 MHz (csynth 5.5 ns), 2 still give a
                          // scale every 14 clocks, inside the 16 clocks of one 16-word row
 #endif
-#include "../quantize/quant_int16.h"
+#include "../../quantize/quant_int16.h"
 
 namespace attnpack {
 

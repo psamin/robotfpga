@@ -13,7 +13,7 @@
 //   q_row      int16 in-row segments (p2 = 128), NP = T (scale pad lanes 1.0), p4 = +2
 //   kw         KW blob (port pitch, p2 = item stride, NP = pad32(T) + 32: zero keys with scale 1.0)
 //   kw_g1      KW written at group 1 of a blob (the expert suffix keys), p4 = -1
-//   q_hm_b2, kw_b2   two items with item strides (item 1 = -x: exact, so its outputs are -y / -q)
+//   q_hm_b2, f32_b2, kw_b2   two items with item strides (item 1 = -x: exact, so its outputs are -y / -q)
 // Every layout runs at a low base (0x4000_0000), and q_hm, kw_g1 also at 0x8_0000_0000 and 0xFF_0000_0000 (64-bit
 // address arithmetic). Then malformed records: rope_mode must return the ME code and touch nothing.
 //
@@ -45,7 +45,10 @@ int rope_dfsim_depth(const std::string& n) {
   if (n == "rope_sp") return ROPE_D_SP;
   if (n == "rope_rf") return ROPE_D_RF;
   if (n == "rope_ow") return ROPE_D_OW;
+  if (n == "rope_ot") return ROPE_D_OT;
   if (n == "rope_ss") return ROPE_D_SS;
+  if (n == "rope_hd") return ROPE_D_HD;
+  if (n == "rope_dd") return ROPE_D_DD;
   fprintf(stderr, "unknown stream %s\n", n.c_str());
   exit(3);
 }
@@ -142,6 +145,7 @@ static const Layout LAYOUTS[] = {
     {"kw", K_KW, 1, false, false, false, 0, 32, 256},
     {"kw_g1", K_KW, 1, false, false, true, -1, 0, 256},
     {"q_hm_b2", K_Q, 2, false, true, false, -3, 0, 256},
+    {"f32_b2", K_F32, 2, true, false, false, 0, 0, 512},
     {"kw_b2", K_KW, 2, false, false, false, 0, 0, 256},
 };
 

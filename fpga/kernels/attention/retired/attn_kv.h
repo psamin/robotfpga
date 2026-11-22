@@ -44,8 +44,8 @@
 #include <hls_stream.h>
 #include <stdint.h>
 
-#include "../contract.h"
-#include "../quantize/quant_int16.h"
+#include "../../contract.h"
+#include "../../quantize/quant_int16.h"
 
 #ifndef ATTN_STREAM
 #define ATTN_STREAM hls::stream

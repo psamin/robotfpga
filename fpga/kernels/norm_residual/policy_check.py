@@ -1,10 +1,10 @@
-"""Full-policy effect of the NORM mode (contract 1.0) on checkpoint -12392 (3 replay frames).
+r"""Full-policy effect of the NORM mode (contract 1.0) on checkpoint -12392 (3 replay frames).
 
 Every LayerNorm (vision) and RMSNorm (LM prefix, action expert) module instance gets its forward replaced by
-the mode's exact arithmetic (nr_emul.py: integer statistics, correctly rounded mean / var, FP32 cores with
-denormals flushed, the contract quantizer). The residual adds stay torch's: under the contract they are the
-GEMM epilogue's FP32 add (contract 2.3), the same IEEE operation. Variants, all with FP32 linears so that only
-the norms change:
+the mode's exact arithmetic (nr_emul.py: one-pass integer statistics with a running exponent,
+correctly rounded mean / var / rstd in integers, FP32 cores with denormals flushed, the contract quantizer).
+The residual adds stay torch's: under the contract they are the GEMM epilogue's FP32 add (contract 2.3), the
+same IEEE operation. Variants, all with FP32 linears so that only the norms change:
 
   torch      no patch (sanity: the laptop against the cluster reference)
   zf32       the mode's statistics + normalize, FP32 z out everywhere (the normalize arithmetic alone)

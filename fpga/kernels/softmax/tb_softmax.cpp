@@ -150,8 +150,10 @@ static int test_divider() {
   for (uint32_t s = 0; s < (1u << 23); s++) sq.write(s);
   smx::divider(sq, rq, p);
   long long bad = 0;
+  smx::Word w = 0;
   for (uint32_t s = 0; s < (1u << 23); s++) {
-    const uint32_t got = (uint32_t)rq.read();
+    if (s % 4 == 0) w = rq.read();  // the divider packs 4 rows' scales per word, row n in lane n % 4
+    const uint32_t got = (uint32_t)w.range(32 * (s % 4) + 31, 32 * (s % 4));
     const uint32_t want = s ? ctr::f2u(1.0f / (float)s) : ctr::ONE_BITS;
     if (got != want) {
       if (bad < 5) printf("  divider S=%u: 0x%08x want 0x%08x\n", s, got, want);

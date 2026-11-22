@@ -1,25 +1,29 @@
 """Golden executor of contract 1.0 command lists (fpga/kernels/CONTRACT.md), in torch + numpy.
 
-The walk is seq_core.h's walk() line for line: fetch (256 B), contract.decode -> BAD_*, contract.validate(full=False)
-(= ctr::validate_hw) -> MODE_ERROR, END / YIELD / STEP / LIMIT / NO_LEGACY, the 3-word status block (cycles 0).
-check_twin.py replays every start of tb_seq.cpp through it and compares return, status words 0-9 and the dispatch
-trace.
+The walk is seq_core.h's walk() line for line: fetch (256 B), contract.decode (= seq::decode_hw) -> BAD_*,
+contract.validate(full=False) (= ctr::validate_hw) -> MODE_ERROR, END / YIELD / STEP / LIMIT / NO_LEGACY, the
+3-word status block (cycles 0). check_twin.py replays every start of tb_seq.cpp through it and compares
+return, status words 0-9 and the dispatch trace.
 
-Every opcode follows the contract's layouts (C1: rows with pitch and item stride, scale vectors with pad lanes 1.0,
-segments, NP zero rows, the KW / VW weight tilings, GEMM row groups) and arithmetic (C2):
+Every opcode follows the contract's layouts (C1: rows with pitch and item stride, scale vectors with pad lanes
+1.0, segments, NP zero rows, the KW / VW weight tilings, GEMM row groups) and arithmetic (C2):
   - int16 outputs: contract.quant_rows (the one quantizer; shift p4 on the stored scale; zero rows 1.0),
-  - GEMM: exact integer sums (float64 holds |acc| < 2^53), then contract.gemm_out (FP32 steps, FTZ, sign kept),
+  - GEMM: exact integer sums (float64 holds |acc| < 2^53), then contract.gemm_out (FP32 steps, FTZ, sign
+    kept),
   - the softmax's own P rule (fe="kernels") or the quantizer on FP32 torch P (fe="torch").
 Front ends (the FP32 value that reaches the quantizer):
-  fe="torch":   FP32 torch (LayerNorm / RMSNorm as the policy computes them, tanh-GELU, SiLU, softmax, rotation with
-                the table's Q1.17 cos / sin);
+  fe="torch":   FP32 torch (LayerNorm / RMSNorm as the policy computes them, tanh-GELU, SiLU, softmax,
+                rotation with the table's Q1.17 cos / sin);
   fe="kernels": the kernels' bit-exact emulators, as conformed to contract 1.0: norm_residual/nr_emul.kernel
                 (statistics with correctly rounded mean / var + affine: its z), gelu_silu/gs_emu.act (NSB 9),
                 softmax/smx_emu.kernel (q and 1/sum), rope/rope_emu.rope_rows (MODE_F32 rotation) - gate T-P1.
 exact=True: no quantization at all. Every int16 buffer has an FP32 shadow (one float per int16 element, same
-addresses); quantizers store x itself with scale 2^p4 (1.0 for zero rows), GEMM reads the shadows. With fe="torch"
-this runs the policy through the list in FP32: it checks the list (addresses, pitches, tilings, order, aliasing,
-the folded constants), not the arithmetic.
+addresses); quantizers store x itself with scale 2^p4 (1.0 for zero rows), GEMM reads the shadows. With
+fe="torch" this runs the policy through the list in FP32: it checks the list (addresses, pitches, tilings,
+order, aliasing, the folded constants), not the arithmetic. Every write poisons the other representation of
+the bytes it covers (an FP32 write sets the shadow under it to NaN, an int16 write sets its bytes to 0xFFFF),
+so a buffer that one command overwrites with the other type while it is still live comes out as NaN instead of
+a stale shadow.
 """
 
 from __future__ import annotations
@@ -38,10 +42,19 @@ for sub in ("", "norm_residual", "gelu_silu", "softmax", "rope"):
     if p not in sys.path:
         sys.path.insert(0, p)
 import contract as K  # noqa: E402
-from contract import C, SLOTS  # noqa: E402
+from contract import SLOTS, C  # noqa: E402
 
 U_NONE, U_GEMM, U_ROW, U_SMX = 0, 1, 2, 3
-ROW_OPS = (C.OP_QUANT_X, C.OP_QUANT_W, C.OP_QUANT_WT, C.OP_NORM, C.OP_GELU, C.OP_SILU_MUL, C.OP_ROPE, C.OP_COPY)
+ROW_OPS = (
+    C.OP_QUANT_X,
+    C.OP_QUANT_W,
+    C.OP_QUANT_WT,
+    C.OP_NORM,
+    C.OP_GELU,
+    C.OP_SILU_MUL,
+    C.OP_ROPE,
+    C.OP_COPY,
+)
 
 
 def unit_of(op: int) -> int:
@@ -88,8 +101,12 @@ class Memory:
         raise IndexError(f"access 0x{addr:x} + {extent} outside every region")
 
     def write(self, addr: int, raw: bytes) -> None:
-        base, t, _ = self._find(addr, len(raw))
+        base, t, sh = self._find(addr, len(raw))
         t[addr - base : addr - base + len(raw)] = torch.frombuffer(bytearray(raw), dtype=torch.uint8)
+        if (
+            sh is not None
+        ):  # exact mode: an int16 element under these bytes no longer exists (poison its shadow)
+            sh[(addr - base) // 2 : (addr - base + len(raw) + 1) // 2] = float("nan")
 
     def read(self, addr: int, n: int) -> bytes:
         base, t, _ = self._find(addr, n)
@@ -98,15 +115,40 @@ class Memory:
     def view(self, addr: int, shape, strides_b, dtype=torch.float32) -> torch.Tensor:
         """Strided view (byte strides, 0 = broadcast), bounds-checked."""
         isz = torch.empty(0, dtype=dtype).element_size()
-        ext = isz + sum((n - 1) * s for n, s in zip(shape, strides_b))
+        ext = isz + sum((n - 1) * s for n, s in zip(shape, strides_b, strict=True))
         base, t, _ = self._find(addr, ext)
         off = addr - base
         assert off % isz == 0 and all(s % isz == 0 for s in strides_b), (hex(addr), strides_b, isz)
         return torch.as_strided(t.view(dtype), tuple(shape), tuple(s // isz for s in strides_b), off // isz)
 
+    def wview(self, addr: int, shape, strides_b, dtype=torch.float32) -> torch.Tensor:
+        """view() for a write. Exact mode: the FP32 shadow under the written bytes is set to NaN, so a later
+        int16 read of them (a GEMM operand, a weight blob) shows the aliasing instead of a stale shadow."""
+        v = self.view(addr, shape, strides_b, dtype)
+        if self.shadow:
+            isz = v.element_size()
+            ext = isz + sum((n - 1) * s for n, s in zip(shape, strides_b, strict=True))
+            base, _, sh = self._find(addr, ext)
+            sv = torch.as_strided(
+                sh, tuple(shape) + (isz // 2,), tuple(s // 2 for s in strides_b) + (1,), (addr - base) // 2
+            )
+            sv.fill_(float("nan"))
+        return v
+
+    def wsview(self, addr: int, shape, strides_b) -> torch.Tensor:
+        """sview() for a write (exact mode): the int16 bytes under the shadow are set to 0xFFFF, so a later
+        FP32 read of them is NaN (aliasing between an int16 output and FP32 data)."""
+        v = self.sview(addr, shape, strides_b)
+        ext = 2 + sum((n - 1) * s for n, s in zip(shape, strides_b, strict=True))
+        base, t, _ = self._find(addr, ext)
+        torch.as_strided(
+            t.view(torch.int16), tuple(shape), tuple(s // 2 for s in strides_b), (addr - base) // 2
+        ).fill_(-1)
+        return v
+
     def sview(self, addr: int, shape, strides_b) -> torch.Tensor:
         """The FP32 shadow of int16 elements (byte strides of the int16 layout)."""
-        ext = 2 + sum((n - 1) * s for n, s in zip(shape, strides_b))
+        ext = 2 + sum((n - 1) * s for n, s in zip(shape, strides_b, strict=True))
         base, _, sh = self._find(addr, ext)
         assert sh is not None and (addr - base) % 2 == 0 and all(s % 2 == 0 for s in strides_b)
         return torch.as_strided(sh, tuple(shape), tuple(s // 2 for s in strides_b), (addr - base) // 2)
@@ -114,7 +156,8 @@ class Memory:
 
 # ---------------------------------------------------------------- the tilings
 def tile_words(w: torch.Tensor) -> torch.Tensor:
-    """[Mp][K] -> the 4 port arrays [4][Mp/32][K][8]: port p, group g, word k, lane l = w[32 g + 8 p + l][k]."""
+    """[Mp][K] -> the 4 port arrays [4][Mp/32][K][8]: port p, group g, word k, lane l =
+    w[32 g + 8 p + l][k]."""
     mp, k = w.shape
     return w.reshape(mp // 32, 4, 8, k).permute(1, 0, 3, 2).contiguous()
 
@@ -128,14 +171,24 @@ def untile_words(a: torch.Tensor) -> torch.Tensor:
 class Executor:
     """One instance = one IP: `starts` is the IP's sequencer start counter."""
 
+    KOPS = (
+        "norm",
+        "act",
+        "rope",
+        "smx",
+    )  # the front ends fe="kernels" replaces (fe="kernels:norm+smx": a subset)
+
     def __init__(self, mem: Memory, *, exact: bool = False, fe: str = "torch", dry: bool = False):
-        assert fe in ("torch", "kernels")
-        self.mem, self.exact, self.fe, self.dry = mem, exact, fe, dry
+        kind, _, sub = fe.partition(":")
+        assert kind in ("torch", "kernels") and (kind == "kernels" or not sub), fe
+        self.kops = set() if kind == "torch" else set(sub.split("+")) if sub else set(self.KOPS)
+        assert self.kops <= set(self.KOPS), fe
+        self.mem, self.exact, self.fe, self.dry = mem, exact, kind, dry
         self.starts = 0
         self.trace: list[str] | None = None  # set to a list to record every unit call
         self.fault = 0  # the next unit call returns this ME code (tb_seq twin replay)
         self.counts: dict[str, int] = {}
-        if fe == "kernels":
+        if self.kops:
             import gs_emu
             import nr_emul
             import rope_emu
@@ -185,7 +238,20 @@ class Executor:
                 code = C.ST_LIMIT
                 break
         if N:
-            w = [code, idx, tag, done, merr, C.STATUS_MAGIC, self.starts, lastop, C.CONTRACT_VERSION, last_fin, 0, 0]
+            w = [
+                code,
+                idx,
+                tag,
+                done,
+                merr,
+                C.STATUS_MAGIC,
+                self.starts,
+                lastop,
+                C.CONTRACT_VERSION,
+                last_fin,
+                0,
+                0,
+            ]
             self.mem.write(N << 4, struct.pack("<12I", *[v & 0xFFFFFFFF for v in w]))
         return ((idx << 8) | code) & 0xFFFFFFFF
 
@@ -193,7 +259,9 @@ class Executor:
         """Start at `first`, restart after every YIELD (as the ARM does); returns (code, next, starts)."""
         idx, starts = first, 0
         while True:
-            r = self.start(K.start_regs(list_addr, status_addr, idx)[C.REG_M], list_addr >> 4, status_addr >> 4)
+            r = self.start(
+                K.start_regs(list_addr, status_addr, idx)[C.REG_M], list_addr >> 4, status_addr >> 4
+            )
             starts += 1
             idx, code = r >> 8, r & 0xFF
             if code != C.ST_YIELD:
@@ -250,7 +318,9 @@ class Executor:
             t = tile_words(x.float())
             for p in range(4):
                 g, kb, _ = t[p].shape
-                self.mem.sview(s.addr + b * s.stride + off + p * s.pitch, (g, kb, 8), (kb * 16, 16, 2)).copy_(t[p])
+                self.mem.wsview(
+                    s.addr + b * s.stride + off + p * s.pitch, (g, kb, 8), (kb * 16, 16, 2)
+                ).copy_(t[p])
         else:
             t = tile_words(torch.from_numpy(np.ascontiguousarray(q)))
             for p in range(4):
@@ -275,8 +345,8 @@ class Executor:
         self.mem.write(fsl.addr + b * fsl.stride + j * segf, v.tobytes())
 
     def put_qrows(self, c: K.Cmd, b: int, y: torch.Tensor) -> None:
-        """y [N][K] FP32 -> the op's output: int16 rows + scales (F_QOUT) per segment with NP zero rows, the KW tiling
-        (QUANT_W, ROPE + F_KW), or FP32 rows (segment j of row n at C + n pitch + j segc)."""
+        """y [N][K] FP32 -> the op's output: int16 rows + scales (F_QOUT) per segment with NP zero rows, the
+        KW tiling (QUANT_W, ROPE + F_KW), or FP32 rows (segment j of row n at C + n pitch + j segc)."""
         N, Kc = y.shape
         seg = c.par(C.P_SEG) or Kc
         nseg = Kc // seg
@@ -300,8 +370,8 @@ class Executor:
                 q, s, x = self.quant(yj, sh)
                 a = cs.addr + b * cs.stride + j * segc
                 if self.exact:
-                    self.mem.sview(a, (NP, seg), (cs.pitch, 2)).zero_()
-                    self.mem.sview(a, (N, seg), (cs.pitch, 2)).copy_(x)
+                    self.mem.wsview(a, (NP, seg), (cs.pitch, 2)).zero_()
+                    self.mem.wsview(a, (N, seg), (cs.pitch, 2)).copy_(x)
                 else:
                     qp = np.zeros((NP, seg), np.int16)
                     qp[:N] = q
@@ -309,7 +379,7 @@ class Executor:
                 self.put_scales(fs, b, j, segf, s, NP)
             else:
                 a = cs.addr + b * cs.stride + j * segc
-                self.mem.view(a, (N, seg), (cs.pitch, 4), torch.float32).copy_(yj)
+                self.mem.wview(a, (N, seg), (cs.pitch, 4)).copy_(yj)
 
     # ------------------------------------------------------------ GEMM (engine)
     def op_gemm(self, c: K.Cmd) -> None:
@@ -319,15 +389,19 @@ class Executor:
         for b in range(c.B):
             x = self.rows_i16(A, b, N, Kc)
             w = self.weight(Bw, b, M, Kc)
-            acc = torch.matmul(x, w.T).numpy()  # exact integers (|acc| < 2^42 < 2^53) or FP64 sums (exact mode)
+            acc = torch.matmul(
+                x, w.T
+            ).numpy()  # exact integers (|acc| < 2^42 < 2^53) or FP64 sums (exact mode)
             srow = self.vec_f32(E, b, M).numpy()
             stok = self.vec_f32(Fs, b, N).numpy()
             bias = self.vec_f32(G, b, M).numpy() if c.flags & C.F_BIAS else None
             groups = [(0, N)] if R == 0 else [(g * R, min(N, (g + 1) * R)) for g in range((N + R - 1) // R)]
 
-            def out_rows(t0, t1):
+            def out_rows(t0, t1, write=False, b=b):
                 a = Cy.addr + b * Cy.stride + ((t0 // R) * P1 if R else t0 * Cy.pitch)
-                return self.mem.view(a, (t1 - t0, M), (Cy.pitch, 4), torch.float32)
+                return (self.mem.wview if write else self.mem.view)(
+                    a, (t1 - t0, M), (Cy.pitch, 4), torch.float32
+                )
 
             if c.flags & C.F_ADD_D:
                 add = self.rows_f32(D, b, N, M).numpy()
@@ -345,7 +419,7 @@ class Executor:
             else:
                 y = K.gemm_out(np.rint(acc).astype(np.int64), srow, stok, bias, add)
             for t0, t1 in groups:
-                out_rows(t0, t1).copy_(torch.from_numpy(np.ascontiguousarray(y[t0:t1])))
+                out_rows(t0, t1, True).copy_(torch.from_numpy(np.ascontiguousarray(y[t0:t1])))
 
     # ------------------------------------------------------------ row unit
     def op_quant_x(self, c: K.Cmd) -> None:
@@ -361,7 +435,9 @@ class Executor:
         for b in range(c.B):
             x = self.rows_f32(c.slot("A"), b, c.N, c.K)
             for j in range(c.K // seg):
-                xt = x[:, j * seg : (j + 1) * seg].T.contiguous()  # [channels][keys], scale per channel over N keys
+                xt = x[
+                    :, j * seg : (j + 1) * seg
+                ].T.contiguous()  # [channels][keys], scale per channel over N keys
                 q, s, xs = self.quant(xt, sh)
                 qp = np.zeros((seg, NP), np.int16)
                 xp = torch.zeros(seg, NP)
@@ -380,7 +456,7 @@ class Executor:
         be = self.mem.view(e.addr + 4 * Kc, (Kc,), (4,), torch.float32).clone() if ln else None
         for b in range(c.B):
             y = self.rows_f32(c.slot("A"), b, c.N, Kc).clone()
-            if self.fe == "kernels" and not self.exact:  # nr_emul.kernel: stats, correctly rounded mean / var, affine
+            if "norm" in self.kops and not self.exact:  # nr_emul.kernel: statistics, mean / var, affine
                 gn, bn = g.numpy(), None if be is None else be.numpy()
                 z = torch.from_numpy(np.ascontiguousarray(self.nr.kernel(y.numpy(), gn, bn, eps, ln)[0]))
             elif ln:
@@ -393,7 +469,7 @@ class Executor:
         for b in range(c.B):
             x = self.rows_f32(c.slot("A"), b, c.N, c.K).clone()
             u = self.rows_f32(c.slot("B"), b, c.N, c.K).clone() if mode == 1 else None
-            if self.fe == "kernels" and not self.exact:
+            if "act" in self.kops and not self.exact:
                 y = self.gs.act(x, u, mode, 9)  # gs_emu: the table front end, NSB 9, natural order
             elif mode == 0:
                 y = F.gelu(x, approximate="tanh")
@@ -416,7 +492,7 @@ class Executor:
         for b in range(c.B):
             x = self.rows_f32(c.slot("A"), b, N, Kc).clone().reshape(N, nseg, C.ROPE_SEG)
             tab = self.mem.view(e.addr + b * e.stride, (N, 64), (e.pitch, 4), torch.int32).clone()
-            if self.fe == "kernels" and not self.exact:
+            if "rope" in self.kops and not self.exact:
                 y = self.rope.rope_rows(x, tab)  # rope_emu: the MODE_F32 rotation from the Q1.17 table
             else:
                 cos = (-tab[:, :32].double() / 2**17).float()[:, None, :]
@@ -428,7 +504,8 @@ class Executor:
     def op_copy(self, c: K.Cmd) -> None:
         for b in range(c.B):
             src = self.rows_f32(c.slot("A"), b, c.N, c.K).clone()
-            self.rows_f32(c.slot("C"), b, c.N, c.K).copy_(src)
+            cs = c.slot("C")
+            self.mem.wview(cs.addr + b * cs.stride, (c.N, c.K), (cs.pitch, 4)).copy_(src)
 
     # ------------------------------------------------------------ softmax unit
     def op_softmax(self, c: K.Cmd) -> None:
@@ -445,9 +522,11 @@ class Executor:
             else:
                 valid = torch.ones(N, L, dtype=torch.bool)
             a = cs.addr + b * cs.stride
-            if self.fe == "kernels" and not self.exact:
+            if "smx" in self.kops and not self.exact:
                 q, s = self.smx.kernel(x, self.smx.c_from_mult(mul), valid, empty="zero")
-                s = torch.where(q.sum(-1, keepdim=True) == 0, torch.ones_like(s), s)  # contract: zero rows 1.0
+                s = torch.where(
+                    q.sum(-1, keepdim=True) == 0, torch.ones_like(s), s
+                )  # contract: zero rows 1.0
                 assert bool((q >= 0).all() & (q <= C.QMAX).all())
                 qp = np.zeros((NP, L), np.int16)
                 qp[:N] = q.numpy().astype(np.int16)
@@ -458,8 +537,8 @@ class Executor:
             p = torch.nan_to_num(p, nan=0.0)  # a fully masked row: P = 0 (scale 1.0)
             q, s, xs = self.quant(p, 0)
             if self.exact:
-                self.mem.sview(a, (NP, L), (cs.pitch, 2)).zero_()
-                self.mem.sview(a, (N, L), (cs.pitch, 2)).copy_(xs)
+                self.mem.wsview(a, (NP, L), (cs.pitch, 2)).zero_()
+                self.mem.wsview(a, (N, L), (cs.pitch, 2)).copy_(xs)
             else:
                 qp = np.zeros((NP, L), np.int16)
                 qp[:N] = q

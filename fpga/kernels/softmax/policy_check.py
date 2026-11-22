@@ -1,4 +1,4 @@
-"""Full-policy effect of the SOFTMAX unit (integration contract 1.0) on SmolVLA -12392 (3 replay frames), plus
+r"""Full-policy effect of the SOFTMAX unit (integration contract 1.0) on SmolVLA -12392 (3 replay frames), plus
 the softmax inventory and the unit's time model.
 
 Every attention softmax of the policy (SigLIP vision tower, VLM prefix, action expert self- and
@@ -11,8 +11,12 @@ is replaced by the unit's bit-exact torch emulation (smx_emu.py); everything els
             (0 <= E[k] <= D[n]); P = q * scale with q in [0, 32767], scale = RN(1 / sum q), fully masked rows
             q = 0 with scale 1.0; P V in FP32
   smx_p0    the same unit on the raw scores with p0 = 1/8 (the pre-contract way): must give the same chunk
-  bit for
-            bit (1/8 is exact, and fix() only moves the exponent); checked, not assumed
+            bit for bit (1/8 is exact, and fix() only moves the exponent); checked, not assumed
+  smx_pv16  smx, and P V as the contract's GEMM computes it from the unit's output (CONTRACT.md 2.3, 5):
+            X = q (int16 P rows), s_tok = the unit's 1/sum scale, W = V^T quantized per (head, channel) over
+            the keys by contract.quant_rows, acc exact, y = ftz(ftz(fl32(acc) * s_row) * s_tok); the expert
+            self-attention as two GEMMs (prefix keys, then suffix keys with F_ACC: + C, one FP32 add), each
+            with its own V^T blob and channel scales. Q K^T stays FP32 (the attention kernel's part)
 Errors: max |chunk - ref_chunk_raw| (normalized action units, gate 0.05) per frame, and max |chunk -
 chunk_explicit|
 (the unit's own effect).
@@ -85,7 +89,7 @@ def smx_softmax(scores: torch.Tensor, temp: float, mask, where: str) -> torch.Te
         if mask is not None:
             s = torch.where(mask, s, BIG_NEG)
         return torch.softmax(s, dim=-1)
-    if mode == "smx":  # contract: x = scores * 1/8 exactly in FP32 (Q's stored scale), p0 = 1
+    if mode in ("smx", "smx_pv16"):  # contract: x = scores * 1/8 exactly in FP32 (Q's stored scale), p0 = 1
         x, p0 = (scores * torch.tensor(temp, dtype=torch.float32)).reshape(-1, Tk), 1.0
     elif mode == "smx_p0":
         x, p0 = scores.reshape(-1, Tk), temp
@@ -101,8 +105,46 @@ def smx_softmax(scores: torch.Tensor, temp: float, mask, where: str) -> torch.Te
         assert torch.equal(v, m.bool()), where
         STATE["ranked"] = STATE.get("ranked", 0) + 1
         v = v[:, None].expand(B, H, Tq, Tk).reshape(-1, Tk)
+    if mode == "smx_pv16":
+        q, sc = E.kernel(x, c, v)
+        return q.reshape(B, H, Tq, Tk), sc.reshape(B, H, Tq)
     p = E.softmax_u16(x, c, v)
     return p.reshape(B, H, Tq, Tk)
+
+
+def _ftz(x: torch.Tensor) -> torch.Tensor:
+    """contract.ftz in torch: FP32 denormals to zero, sign kept."""
+    u = x.contiguous().view(torch.int32)
+    den = (u & 0x7F800000) == 0
+    return torch.where(den, u & torch.tensor(-0x80000000, dtype=torch.int32), u).view(torch.float32)
+
+
+def _pv_gemm(q: torch.Tensor, s_tok: torch.Tensor, v: torch.Tensor, acc_c: torch.Tensor | None = None):
+    """One contract GEMM of P V: q (..., Tq, Tk) int, s_tok (..., Tq) FP32, v (..., Tk, 64) FP32. W = V^T with
+    one scale per (head, channel) over these Tk keys (contract quantizer); y = ftz(ftz(fl32(acc) s_row) s_tok)
+    [+ C, F_ACC]."""
+    vt = v.to(torch.float32).transpose(-1, -2).contiguous()  # (..., 64, Tk): blob rows = channels
+    a = vt.abs().amax(-1, keepdim=True)
+    sv = torch.where(a == 0, torch.ones_like(a), torch.clamp(a, min=1e-30) / torch.tensor(32767.0))
+    qv = torch.clamp(torch.round(vt / sv), -32767, 32767)  # torch.round: half to even, as np.rint
+    acc = q.to(torch.float64) @ qv.to(torch.float64).transpose(-1, -2)  # exact: |acc| < 2^38
+    y = _ftz(_ftz(acc.to(torch.float32)) * _ftz(sv[..., 0][..., None, :]))
+    y = _ftz(y * _ftz(s_tok[..., :, None]))
+    if acc_c is not None:
+        y = _ftz(y + _ftz(acc_c))
+    return y
+
+
+def attn_out(p, v: torch.Tensor, where: str) -> torch.Tensor:
+    """P V for every mode: FP32 matmul, or (smx_pv16) the contract's GEMMs on the unit's (q, scale)."""
+    if STATE["mode"] != "smx_pv16":
+        return torch.matmul(p.to(v.dtype), v)
+    q, sc = p
+    if where == "expert_self":  # prefix keys, then the suffix keys accumulated into the same rows (F_ACC)
+        n0 = PREFIX_LEN[0]
+        y = _pv_gemm(q[..., :n0], sc, v[..., :n0, :])
+        return _pv_gemm(q[..., n0:], sc, v[..., n0:, :], acc_c=y).to(v.dtype)
+    return _pv_gemm(q, sc, v).to(v.dtype)
 
 
 def make_vision_forward(orig):
@@ -121,7 +163,7 @@ def make_vision_forward(orig):
         k = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         v = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         p = smx_softmax(q @ k.transpose(-1, -2), self.scale, None, "vision")
-        out = (p @ v).transpose(1, 2).contiguous().reshape(*input_shape, -1).contiguous()
+        out = attn_out(p, v, "vision").transpose(1, 2).contiguous().reshape(*input_shape, -1).contiguous()
         return self.out_proj(out), None
 
     return forward
@@ -163,13 +205,9 @@ def make_lm_attention(orig):
         q = query_states.to(torch.float32).transpose(1, 2)
         k = k.to(torch.float32).transpose(1, 2)
         v = v.transpose(1, 2)
-        p = smx_softmax(
-            q @ k.transpose(-1, -2),
-            head_dim**-0.5,
-            attention_mask[:, None, :, :],
-            lm_site(query_states, key_states),
-        )
-        out = torch.matmul(p.to(v.dtype), v)
+        site = lm_site(query_states, key_states)
+        p = smx_softmax(q @ k.transpose(-1, -2), head_dim**-0.5, attention_mask[:, None, :, :], site)
+        out = attn_out(p, v, site)
         return out.permute(0, 2, 1, 3).reshape(batch_size, -1, H * head_dim)
 
     return eager_attention_forward
@@ -232,8 +270,7 @@ def run(policy, frame, mode):
 
 def inventory(log):
     """Softmax calls, rows and elements per site of the LeRobot forward (uncompacted: the prefix is 81 tokens
-    here,
-    45 in the contract's list). The unit's time is smx_time.py's, on the contract list itself."""
+    here, 45 in the contract's list). The unit's time is smx_time.py's, on the contract list itself."""
     sites = defaultdict(lambda: dict(calls=0, rows=0, elems=0, shapes=set()))
     for e in log:
         s = sites[e["site"]]
@@ -254,7 +291,7 @@ def inventory(log):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--frames", default="0,1,2")
-    ap.add_argument("--modes", default="orig,explicit,smx,smx_p0")
+    ap.add_argument("--modes", default="orig,explicit,smx,smx_p0,smx_pv16")
     ap.add_argument("--threads", type=int, default=0)
     ap.add_argument("--dump-scores", action="store_true")
     ap.add_argument("--out", default=str(OUT / "policy_check.json"))
@@ -297,6 +334,8 @@ def main():
                 r["max_abs_vs_explicit"] = float((ch - chunks["explicit"]).abs().max())
             if "orig" in chunks and m != "orig":
                 r["max_abs_vs_orig"] = float((ch - chunks["orig"]).abs().max())
+            if m == "smx_pv16" and "smx" in chunks:
+                r["max_abs_vs_smx"] = float((ch - chunks["smx"]).abs().max())
             if m == "smx_p0" and "smx" in chunks:
                 r["bit_equal_to_smx"] = bool(torch.equal(ch, chunks["smx"]))
             res["modes"].setdefault(m, {})[int(fr["frame"])] = r
@@ -305,6 +344,7 @@ def main():
                 + f" mean {r['mean_abs_err']:.3e}"
                 + (f"  vs explicit {r['max_abs_vs_explicit']:.3e}" if "max_abs_vs_explicit" in r else "")
                 + (f"  bit-equal to smx: {r['bit_equal_to_smx']}" if "bit_equal_to_smx" in r else "")
+                + (f"  vs smx {r['max_abs_vs_smx']:.3e}" if "max_abs_vs_smx" in r else "")
                 + f"  ({dt:.1f} s)",
                 flush=True,
             )

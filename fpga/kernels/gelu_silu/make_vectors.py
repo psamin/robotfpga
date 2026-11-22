@@ -3,8 +3,9 @@
     python make_vectors.py OUT_DIR [--nsb 9]       # synthetic cases (random, edge, small shapes, adversarial)
     policy_check.py --dump OUT_DIR                   # real activations of checkpoint -12392 (same format)
 
-Case directory: meta.txt "mode N K nsb check" (mode 0 GELU, 1 SiLU(x) * u, 2 SiLU(x); check 0 = undefined inputs
-(NaN / Inf): the testbench only checks that the run ends and stays inside its extents), x.bin (N x K FP32),
+Case directory: meta.txt "mode N K nsb check" (mode 0 GELU, 1 SiLU(x) * u, 2 SiLU(x); check 0 = rows with
+NaN / Inf inputs: q is undefined there, the testbench checks that their stored scale is non-finite, the other
+rows bit for bit, and that the run stays inside its extents), x.bin (N x K FP32),
 u.bin (mode 1), y.bin (N x K uint32: FP32 bits of y), q.bin (N x K int16), s.bin (N uint32: FP32 scale bits).
 """
 
@@ -13,13 +14,14 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import gs_emu
 import numpy as np
 import torch
 
-import gs_emu
 
-
-def write_case(d: Path, mode: int, x: torch.Tensor, u: torch.Tensor | None, nsb: int, check: bool = True) -> None:
+def write_case(
+    d: Path, mode: int, x: torch.Tensor, u: torch.Tensor | None, nsb: int, check: bool = True
+) -> None:
     d.mkdir(parents=True, exist_ok=True)
     x = x.to(torch.float32).contiguous()
     N, K = x.shape
@@ -68,7 +70,13 @@ def main() -> None:
     write_case(o / "gelu_rand", 0, x, None, a.nsb)
     write_case(o / "gelu_edge", 0, edge_rows(3072, 8.0, g), None, a.nsb)
     # SiLU * up, K = 2560 (LM) and 2048 (expert)
-    write_case(o / "silu_rand_2560", 1, torch.randn(20, 2560, generator=g) * 2.0, torch.randn(20, 2560, generator=g), a.nsb)
+    write_case(
+        o / "silu_rand_2560",
+        1,
+        torch.randn(20, 2560, generator=g) * 2.0,
+        torch.randn(20, 2560, generator=g),
+        a.nsb,
+    )
     e = edge_rows(2048, 16.0, g)
     e = torch.where(e.abs() > 1e4, torch.sign(e) * 1e4, e)  # keep |x * up| finite (y = Inf is undefined)
     ue = torch.randn(e.shape, generator=g)
@@ -93,8 +101,16 @@ def main() -> None:
                 xk = torch.randn(N, K, generator=g) * 4.0
                 uk = torch.randn(N, K, generator=g) if mode == 1 else None
                 write_case(o / f"small_m{mode}_k{K}_n{N}", mode, xk, uk, a.nsb)
+    # writer chunks (WCH = 64 rows): N = 133 = 2 full chunks + 5 rows, short rows (the scale unit's pace)
+    for mode in (0, 1, 2):
+        xc = torch.randn(133, 16, generator=g) * 3.0
+        xc[70] = 0.0  # an all-zero row inside the second chunk: q = 0, s = 1.0
+        uc = torch.randn(133, 16, generator=g) if mode == 1 else None
+        write_case(o / f"chunks_m{mode}_k16_n133", mode, xc, uc, a.nsb)
     # amax at the bottom of the range (2^-109 .. 2^-125) and tiny gates
-    xa = torch.stack([torch.full((64,), 2.0**-e) * torch.sign(torch.randn(64, generator=g)) for e in range(109, 126)])
+    xa = torch.stack(
+        [torch.full((64,), 2.0**-e) * torch.sign(torch.randn(64, generator=g)) for e in range(109, 126)]
+    )
     write_case(o / "tiny_m0", 0, xa, None, a.nsb)
     write_case(o / "tiny_m1", 1, xa, torch.full_like(xa, 3.0), a.nsb)
     # undefined inputs: NaN / Inf rows (only the run's termination and extents are checked)
@@ -103,7 +119,14 @@ def main() -> None:
     xn[3, 7] = float("inf")
     xn[4, 9] = float("-inf")
     for mode in (0, 1, 2):
-        write_case(o / f"nan_m{mode}", mode, xn, torch.randn(6, 256, generator=g) if mode == 1 else None, a.nsb, check=False)
+        write_case(
+            o / f"nan_m{mode}",
+            mode,
+            xn,
+            torch.randn(6, 256, generator=g) if mode == 1 else None,
+            a.nsb,
+            check=False,
+        )
     print("wrote", o)
 
 

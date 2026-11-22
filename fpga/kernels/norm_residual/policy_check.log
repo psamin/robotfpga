@@ -1,34 +1,33 @@
-C:\Users\athit\robotfpga\fpga\kernels\norm_residual\policy_check.py:19: SyntaxWarning: invalid escape sequence '\k'
-  C:\kp\lerobot-venv\Scripts\python.exe fpga\kernels\norm_residual\policy_check.py [--frames 0,1,2]
-W1120 22:31:48.272000 35428 Lib\site-packages\torch\distributed\elastic\multiprocessing\redirects.py:29] NOTE: Redirects are currently not supported in Windows or MacOs.
+W1121 16:49:07.727000 32708 Lib\site-packages\torch\distributed\elastic\multiprocessing\redirects.py:29] NOTE: Redirects are currently not supported in Windows or MacOs.
 WARNING:root:No accelerated backend detected. Using default cpu, this will be slow.
 WARNING:lerobot.configs.policies:Device 'cuda' is not available. Switching to 'cpu'.
 Loading  HuggingFaceTB/SmolVLM2-500M-Video-Instruct weights ...
 `torch_dtype` is deprecated! Use `dtype` instead!
-Loading weights:   0%|          | 0/489 [00:00<?, ?it/s]Loading weights:  36%|###5      | 176/489 [00:00<00:00, 1752.86it/s]Loading weights:  87%|########7 | 426/489 [00:00<00:00, 2168.32it/s]Loading weights: 100%|##########| 489/489 [00:00<00:00, 2240.36it/s]
 Reducing the number of VLM layers to 16 ...
-Loading weights from local directory
-loaded in 7.5 s
+loaded in 16.8 s
 config: {"vision": {"layers": 12, "hidden": 768, "ln_eps": 1e-06, "image_size": 512, "patch": 16}, "text": {"layers": 16, "hidden": 960, "heads": 15, "kv_heads": 5, "rms_eps": 1e-05}, "expert": {"layers": 16, "hidden": 720, "heads": 15, "kv_heads": 5, "rms_eps": 1e-05, "intermediate": 2048}, "num_steps": 10, "chunk": 50}
 patched 91 norm modules of 91 in the policy
-frame 0 stats     max|chunk-ref| 4.709e-06 mean 2.370e-07 (2.3 s)
-frame 0 torch     max|chunk-ref| 4.709e-06 mean 2.370e-07 (0.8 s)
-frame 0 zf32      max|chunk-ref| 4.232e-06 mean 1.869e-07 (2.0 s)
-frame 0 kernel    max|chunk-ref| 4.024e-04 mean 3.928e-05 (2.0 s)
-frame 0 torchq16  max|chunk-ref| 7.939e-04 mean 4.652e-05 (0.9 s)
-frame 0: kernel vs torchq16 0.00039392709732055664, zf32 vs torch 8.940696716308594e-06
-frame 3563 stats     max|chunk-ref| 3.576e-07 mean 1.043e-07 (2.2 s)
-frame 3563 torch     max|chunk-ref| 3.576e-07 mean 1.043e-07 (0.8 s)
-frame 3563 zf32      max|chunk-ref| 3.576e-07 mean 1.108e-07 (2.1 s)
-frame 3563 kernel    max|chunk-ref| 1.342e-04 mean 4.592e-05 (2.1 s)
-frame 3563 torchq16  max|chunk-ref| 1.305e-04 mean 4.392e-05 (1.0 s)
-frame 3563: kernel vs torchq16 4.941225051879883e-05, zf32 vs torch 1.7881393432617188e-07
-frame 7489 stats     max|chunk-ref| 2.980e-07 mean 8.295e-08 (2.3 s)
-frame 7489 torch     max|chunk-ref| 2.980e-07 mean 8.295e-08 (0.9 s)
-frame 7489 zf32      max|chunk-ref| 4.768e-07 mean 1.232e-07 (2.1 s)
-frame 7489 kernel    max|chunk-ref| 1.020e-04 mean 2.899e-05 (2.1 s)
-frame 7489 torchq16  max|chunk-ref| 1.569e-04 mean 3.914e-05 (0.9 s)
-frame 7489: kernel vs torchq16 6.663799285888672e-05, zf32 vs torch 2.980232238769531e-07
+frame 0 stats     max|chunk-ref| 5.126e-06 mean 2.454e-07 (12.5 s)
+frame 0 torch     max|chunk-ref| 5.126e-06 mean 2.454e-07 (2.0 s)
+frame 0 zf32      max|chunk-ref| 5.722e-06 mean 2.579e-07 (9.1 s)
+frame 0 kernel    max|chunk-ref| 1.343e-03 mean 7.450e-05 (9.3 s)
+frame 0 torchq16  max|chunk-ref| 7.789e-04 mean 4.519e-05 (1.9 s)
+frame 0 kfold     max|chunk-ref| 7.831e-04 mean 4.069e-05 (8.7 s)
+frame 0: kernel vs torchq16 0.002121448516845703, zf32 vs torch 5.960464477539062e-07
+frame 3563 stats     max|chunk-ref| 4.619e-07 mean 1.197e-07 (11.0 s)
+frame 3563 torch     max|chunk-ref| 4.619e-07 mean 1.197e-07 (1.8 s)
+frame 3563 zf32      max|chunk-ref| 2.384e-07 mean 7.997e-08 (8.6 s)
+frame 3563 kernel    max|chunk-ref| 1.428e-04 mean 5.315e-05 (7.7 s)
+frame 3563 torchq16  max|chunk-ref| 1.298e-04 mean 4.333e-05 (1.7 s)
+frame 3563 kfold     max|chunk-ref| 1.608e-04 mean 6.659e-05 (7.5 s)
+frame 3563: kernel vs torchq16 6.794929504394531e-05, zf32 vs torch 3.2782554626464844e-07
+frame 7489 stats     max|chunk-ref| 4.768e-07 mean 1.048e-07 (7.5 s)
+frame 7489 torch     max|chunk-ref| 4.768e-07 mean 1.048e-07 (1.9 s)
+frame 7489 zf32      max|chunk-ref| 2.980e-07 mean 7.908e-08 (11.0 s)
+frame 7489 kernel    max|chunk-ref| 1.515e-04 mean 3.792e-05 (10.6 s)
+frame 7489 torchq16  max|chunk-ref| 1.523e-04 mean 3.698e-05 (2.5 s)
+frame 7489 kfold     max|chunk-ref| 1.665e-04 mean 6.620e-05 (10.5 s)
+frame 7489: kernel vs torchq16 4.088878631591797e-05, zf32 vs torch 2.980232238769531e-07
 counts per chunk:
    {'group': 'expert', 'kind': 'RMS', 'D': 720, 'out': 'q16', 'calls': 320, 'rows': 16000, 'elements': 11520000}
    {'group': 'expert_final', 'kind': 'RMS', 'D': 720, 'out': 'q16', 'calls': 10, 'rows': 500, 'elements': 360000}
@@ -51,75 +50,75 @@ row stats (frames run): {
  },
  "lm": {
   "n": 7776,
-  "mean_over_std": 0.1061386215380528,
-  "max_over_std": 27.621073549669383,
+  "mean_over_std": 0.10613862126264102,
+  "max_over_std": 27.6210741854748,
   "minstd": 0.23269473152580766
  },
  "lm_final": {
   "n": 243,
-  "mean_over_std": 0.10539911118048169,
-  "max_over_std": 27.703076644906826,
-  "minstd": 4.070081810581812
+  "mean_over_std": 0.10539911108991938,
+  "max_over_std": 27.70307964560442,
+  "minstd": 4.07008083886588
  },
  "expert": {
   "n": 48000,
-  "mean_over_std": 0.10709585143896633,
-  "max_over_std": 6.749200282030097,
-  "minstd": 0.5388538470996816
+  "mean_over_std": 0.10709585193875688,
+  "max_over_std": 6.749200085813158,
+  "minstd": 0.5388538524756868
  },
  "expert_final": {
   "n": 1500,
-  "mean_over_std": 0.0896048135480218,
-  "max_over_std": 6.077808249435897,
-  "minstd": 1.8953061997700773
+  "mean_over_std": 0.08960480498279572,
+  "max_over_std": 6.077808402235586,
+  "minstd": 1.8953061896542547
  }
 }
 kernel vs torch per norm call (all calls of the frames run): {
  "vision/LN": {
   "n": 36864,
-  "z_rel": 4.2005493128272064e-07,
-  "deq_rel": 1.546359453641344e-05,
-  "q_mismatch": 3441,
+  "z_rel": 3.698655746120494e-07,
+  "deq_rel": 1.5415258530993015e-05,
+  "q_mismatch": 2732,
   "q_total": 28311552,
   "qdiff_max": 1
  },
  "vision_post/LN": {
   "n": 1536,
-  "z_rel": 3.6247314483262016e-07,
+  "z_rel": 3.518023277138127e-07,
   "deq_rel": 1.5423973309225403e-05,
-  "q_mismatch": 174,
+  "q_mismatch": 143,
   "q_total": 1179648,
   "qdiff_max": 1
  },
  "lm/RMS": {
   "n": 7776,
-  "z_rel": 3.393025451714493e-07,
-  "deq_rel": 1.5465202523046173e-05,
-  "q_mismatch": 393,
+  "z_rel": 2.851535043646436e-07,
+  "deq_rel": 1.5418710972880945e-05,
+  "q_mismatch": 430,
   "q_total": 7464960,
   "qdiff_max": 1
  },
  "lm_final/RMS": {
   "n": 243,
-  "z_rel": 2.560236112003622e-07,
-  "deq_rel": 1.5291359886759892e-05,
+  "z_rel": 2.3677412741562875e-07,
+  "deq_rel": 1.5292767784558237e-05,
   "q_mismatch": 8,
   "q_total": 233280,
   "qdiff_max": 1
  },
  "expert/RMS": {
   "n": 48000,
-  "z_rel": 3.1980019343791355e-07,
-  "deq_rel": 1.546671956020873e-05,
-  "q_mismatch": 3521,
+  "z_rel": 3.011340083958203e-07,
+  "deq_rel": 1.545582381368149e-05,
+  "q_mismatch": 2692,
   "q_total": 34560000,
   "qdiff_max": 1
  },
  "expert_final/RMS": {
   "n": 1500,
-  "z_rel": 2.5651695523265516e-07,
-  "deq_rel": 1.5350227840826847e-05,
-  "q_mismatch": 64,
+  "z_rel": 2.0345815698874503e-07,
+  "deq_rel": 1.5378127500298433e-05,
+  "q_mismatch": 57,
   "q_total": 1080000,
   "qdiff_max": 1
  }

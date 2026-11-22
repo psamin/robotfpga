@@ -1,16 +1,19 @@
 """Contract command lists for tb_attn.cpp from real SmolVLA -12392 attention calls (check_policy.py --dump).
 
 For every site (vision layer 0, LM prefix layer 0, the expert's self- and cross-attention of step 0; prefix
-compacted to its 45 valid tokens) this writes vectors/<site>/:
+compacted to its 45 valid tokens), plus an adversarial call on the cross-attention geometry (vectors/edge:
+tiny, denormal, +-0 and huge rows, giving -0.0 scores), this writes vectors/<site>/:
 
-  mem.bin, meta.txt  a DDR image at a 40-bit base (0x8_0000_0000, 0xFF_0000_0000, 0x4000_0000, 0xFF_8000_0000) holding
-                     the FP32 Q / K / V rows as the projections leave them, the rank vectors and a list of contract
-                     records (CONTRACT.md 5): QUANT_X Q (p4 = -3, head-major) -> QUANT_W K (KW blob) -> QUANT_WT V
-                     (VW blob; expert self: prefix and suffix parts) -> GEMM Q.K^T -> SOFTMAX -> GEMM P.V (C row
-                     groups R = TqP, P1 = 256 B; expert self: the suffix part with F_ACC) -> QUANT_X O (o_proj input)
-                     -> END. Every record passes contract.validate.
-  script.txt         check lines (expected bytes after a record) and load lines (the SOFTMAX record's P and scales,
-                     computed by the softmax unit's golden executor smx_emu.run_cmd on the expected scores)
+  mem.bin, meta.txt  a DDR image at a 40-bit base (0x8_0000_0000, 0xFF_0000_0000, 0x4000_0000,
+                     0xFF_8000_0000, 0xFF_C000_0000) holding the FP32 Q / K / V rows as the projections leave
+                     them, the rank vectors and a list of contract records (CONTRACT.md 5): QUANT_X Q
+                     (p4 = -3, head-major) -> QUANT_W K (KW blob) -> QUANT_WT V (VW blob; expert self: prefix
+                     and suffix parts) -> GEMM Q.K^T -> SOFTMAX -> GEMM P.V (C row groups R = TqP,
+                     P1 = 256 B; expert self: the suffix part with F_ACC) -> QUANT_X O (o_proj input) -> END.
+                     Every record passes contract.validate.
+  script.txt         check lines (expected bytes after a record; the SOFTMAX record's P and scales come from
+                     the softmax unit's golden executor smx_emu.run_cmd on the expected scores) and emu lines
+                     (the same P and scales, loaded instead of running the unit by the -DATTN_MODELS build)
   exp_*.bin          the expected bytes, from contract.py's reference arithmetic (numpy: quant_rows, pack_w,
                      gemm_out) independently of attn_int16; asserted equal, bit for bit, to
                      attn_int16.attention_contract (the function the full-policy check runs).
@@ -41,7 +44,42 @@ BASES = {
     "prefix": 0xFF_0000_0000,
     "expert_self": 0x4000_0000,
     "expert_cross": 0xFF_8000_0000,
+    "edge": 0xFF_C000_0000,
 }
+
+
+def edge_call(seed: int = 12392) -> dict:
+    """An adversarial call on the expert cross-attention geometry (15 query heads, 5 KV heads, 50 queries,
+    45 keys, every key visible): rows of 1e-32 (below the 1e-30 scale floor), denormal, +0 and -0 rows, a 1e15
+    row, single outliers, ties; V channels of zeros, constants, 1e30, denormals and 1e-32. Tiny Q rows against
+    tiny K rows give products below the normal range, so the GEMM's flush-to-zero produces -0.0 scores (review
+    defect 15)."""
+    g = torch.Generator().manual_seed(seed)
+    q = torch.randn(1, 15, 50, D, generator=g)
+    k = torch.randn(1, 5, 45, D, generator=g)
+    v = torch.randn(1, 5, 45, D, generator=g)
+    for h in range(15):
+        q[0, h, 0] *= 1e-32
+        q[0, h, 1] = torch.randn(D, generator=g) * 1e-39  # denormal
+        q[0, h, 2] = 0.0
+        q[0, h, 3] = -0.0
+        q[0, h, 4] *= 1e15
+        q[0, h, 5, 7] = 3e4  # one outlier
+        q[0, h, 6] = torch.round(torch.randn(D, generator=g) * 8) + 0.5  # ties
+        q[0, h, 7 + h] *= 1e-32
+    for h in range(5):
+        k[0, h, :12] *= 1e-32  # tiny keys: tiny Q rows x tiny keys underflow -> -0.0 / +0.0 scores
+        k[0, h, 12] = 0.0
+        k[0, h, 13] = -0.0
+        k[0, h, 14] *= 1e-39
+        k[0, h, 15] *= 1e10
+        v[0, h, :, 0] = 0.0
+        v[0, h, :, 1] = 0.75
+        v[0, h, :, 2] *= 1e30
+        v[0, h, :, 3] *= 1e-39
+        v[0, h, :, 4] *= 1e-32
+        v[0, h, 5, 5] = -2e4  # a single large value in a channel
+    return dict(q=q, k=k, v=v, scale=0.125, mask=torch.ones(1, 50, 45, dtype=torch.bool))
 
 
 class Img:
@@ -66,16 +104,19 @@ class Img:
         return np.frombuffer(bytes(self.data), np.uint8).copy()
 
 
-def build(site: str, rec: dict, out: Path) -> dict:
+def build(site: str, rec: dict, out: Path, geom: str | None = None) -> dict:
+    """One site's case directory. geom: the site whose mask geometry (rank table) the case uses (default:
+    site)."""
+    geom = geom or site
     out.mkdir(parents=True, exist_ok=True)
     for f in out.glob("*"):
         f.unlink()
     q, k, v = rec["q"].float(), rec["k"].float(), rec["v"].float()
     mask = rec["mask"]
     assert q.shape[0] == 1 and float(rec["scale"]) == 0.125
-    n_suf = q.shape[2] if site == "expert_self" else 0
+    n_suf = q.shape[2] if geom == "expert_self" else 0
     trec: dict = {}
-    t_out = A.attention_contract(q, k, v, mask, site, n_suf, record=trec)  # the policy-check emulation
+    t_out = A.attention_contract(q, k, v, mask, geom, n_suf, record=trec)  # the policy-check emulation
     if mask is None:
         qc, kc, vc = q[0], k[0], v[0]
     else:
@@ -88,14 +129,14 @@ def build(site: str, rec: dict, out: Path) -> dict:
     G = H // hkv
     tqp = CT.pad4(tq)
     NQ = G * tqp
-    parts, mk = A.site_geometry(site, tk, n_suf)
+    parts, mk = A.site_geometry(geom, tk, n_suf)
     img = Img(BASES[site])
     lst = img.alloc(256 * 16, 4096)
     # ---------------- inputs: FP32 rows as the projections leave them
     rowq = (
         H * D + 2 * hkv * D
     )  # fused q | k | v row (prefix, vision); expert: q rows, and k | v rows per part
-    if site in ("vision", "prefix"):
+    if geom in ("vision", "prefix"):
         qkv = np.concatenate(
             [
                 qc.transpose(1, 0, 2).reshape(tq, H * D),
@@ -137,10 +178,10 @@ def build(site: str, rec: dict, out: Path) -> dict:
         VW.append((img.alloc(4 * hkv * vitem, 4096), img.alloc(4 * hkv * D), vitem, hkv * vitem, npv))
     S = img.alloc(4 * hkv * NQ * mk)
     Pm, sP = img.alloc(2 * hkv * NQ * mk), img.alloc(4 * hkv * NQ)
-    O = img.alloc(4 * tqp * H * D)
+    Oa = img.alloc(4 * tqp * H * D)
     Xo, sXo = img.alloc(2 * tq * H * D), img.alloc(4 * CT.pad4(tq))
     rq = rk = None
-    if site != "vision":
+    if geom != "vision":
         Dq, Ek = trec["ranks"]
         rq, rk = img.alloc(4 * NQ), img.alloc(4 * mk)
         img.put(rq, np.tile(Dq.numpy().astype(np.int32), G))
@@ -168,7 +209,7 @@ def build(site: str, rec: dict, out: Path) -> dict:
             "q",
         )
     )
-    for (k0, nk, r0), (ka, va, pitch) in zip(parts, kv_src):
+    for (_k0, nk, r0), (ka, _va, pitch) in zip(parts, kv_src, strict=True):
         cmds.append(
             CT.Cmd(
                 C.OP_QUANT_W,
@@ -183,7 +224,7 @@ def build(site: str, rec: dict, out: Path) -> dict:
                 f"k{r0}",
             )
         )
-    for (k0, nk, r0), (ka, va, pitch), (vw, vs, vitem, vport, npv) in zip(parts, kv_src, VW):
+    for (_k0, nk, r0), (_ka, va, pitch), (vw, vs, _vitem, vport, npv) in zip(parts, kv_src, VW, strict=True):
         cmds.append(
             CT.Cmd(
                 C.OP_QUANT_WT,
@@ -226,7 +267,7 @@ def build(site: str, rec: dict, out: Path) -> dict:
         fl |= C.F_MASK
         s_smx["D"], s_smx["E"] = Sl(rq), Sl(rk)
     cmds.append(CT.Cmd(C.OP_SOFTMAX, fl, 0, 0, mk, NQ, hkv, s_smx, {C.P_EPS: CT.f32bits(1.0)}, "softmax"))
-    for pi, ((k0, nk, r0), (vw, vs, vitem, vport, npv)) in enumerate(zip(parts, VW)):
+    for pi, ((_k0, _nk, r0), (vw, vs, vitem, vport, npv)) in enumerate(zip(parts, VW, strict=True)):
         cmds.append(
             CT.Cmd(
                 C.OP_GEMM,
@@ -239,7 +280,7 @@ def build(site: str, rec: dict, out: Path) -> dict:
                 {
                     "A": Sl(Pm + 2 * r0, 2 * mk, NQ * 2 * mk),
                     "B": Sl(vw, vport, vitem),
-                    "C": Sl(O, 4 * H * D, G * 4 * D),
+                    "C": Sl(Oa, 4 * H * D, G * 4 * D),
                     "E": Sl(vs, 0, 4 * D),
                     "F": Sl(sP, 0, 4 * NQ),
                 },
@@ -257,7 +298,7 @@ def build(site: str, rec: dict, out: Path) -> dict:
             H * D,
             tq,
             1,
-            {"A": Sl(O, 4 * H * D), "C": Sl(Xo, 2 * H * D), "F": Sl(sXo)},
+            {"A": Sl(Oa, 4 * H * D), "C": Sl(Xo, 2 * H * D), "F": Sl(sXo)},
             {},
             "o.in",
         )
@@ -297,7 +338,7 @@ def build(site: str, rec: dict, out: Path) -> dict:
     expect(i_kw, "KWs.f32", KWs, sk.astype(np.float32))
     # V: VW blobs per part
     vparts = []
-    for pi, ((k0, nk, r0), (vw, vs, vitem, vport, npv)) in enumerate(zip(parts, VW)):
+    for pi, ((k0, nk, _r0), (vw, vs, vitem, _vport, npv)) in enumerate(zip(parts, VW, strict=True)):
         vt = vc[:, k0 : k0 + nk].transpose(0, 2, 1)  # (hkv, 64, nk)
         vq, sv = CT.quant_rows(vt)
         vqp = np.zeros((hkv, D, npv), np.int16)
@@ -313,22 +354,24 @@ def build(site: str, rec: dict, out: Path) -> dict:
     sx = sq.reshape(hkv, NQ)
     scores = np.stack([CT.gemm_out(xq[j] @ kq[j].astype(np.int64).T, sk[j], sx[j]) for j in range(hkv)])
     expect(i_qk, "scores.f32", S, scores)
-    # SOFTMAX: the softmax unit's golden executor on the expected scores
+    # SOFTMAX: the softmax unit's golden executor (smx_emu.run_cmd) on the expected scores; tb_attn runs
+    # smx::softmax_mode (the HLS source) and checks its P and scales against these bytes ("emu" lines: the
+    # -DATTN_MODELS build loads them instead)
     mem = img.array()
     o = S - img.base
     mem[o : o + scores.nbytes] = np.frombuffer(scores.astype(np.float32).tobytes(), np.uint8)
     smx_emu.run_cmd(cmds[i_smx], mem, img.base)
     pbytes = mem[Pm - img.base : Pm - img.base + 2 * hkv * NQ * mk].copy()
     spbytes = mem[sP - img.base : sP - img.base + 4 * hkv * NQ].copy()
-    (out / "smx_P.bin").write_bytes(pbytes.tobytes())
-    (out / "smx_sP.bin").write_bytes(spbytes.tobytes())
-    script.append(f"load {i_smx} {Pm:x} smx_P.bin")
-    script.append(f"load {i_smx} {sP:x} smx_sP.bin")
+    expect(i_smx, "P", Pm, pbytes)
+    expect(i_smx, "sP.f32", sP, spbytes)
+    script.append(f"emu {i_smx} {Pm:x} exp_P.bin")
+    script.append(f"emu {i_smx} {sP:x} exp_sP.f32.bin")
     P = pbytes.view(np.int16).reshape(hkv, NQ, mk).astype(np.int64)
     sp = spbytes.view(np.float32).reshape(hkv, NQ)
     # P.V (suffix part: F_ACC)
     y = None
-    for pi, ((k0, nk, r0), (vqp, sv)) in enumerate(zip(parts, vparts)):
+    for (_k0, _nk, r0), (vqp, sv) in zip(parts, vparts, strict=True):
         npv = vqp.shape[2]
         yp = np.stack(
             [
@@ -345,7 +388,7 @@ def build(site: str, rec: dict, out: Path) -> dict:
     Oexp = (
         y.reshape(hkv, G, tqp, D).transpose(2, 0, 1, 3).reshape(tqp, H * D)
     )  # row i, column (G j + g) 64 + c
-    expect(i_pv, "O.f32", O, Oexp)
+    expect(i_pv, "O.f32", Oa, Oexp)
     xo, so = CT.quant_rows(Oexp[:tq])
     sop = np.ones(CT.pad4(tq), np.float32)
     sop[:tq] = so
@@ -399,6 +442,7 @@ def main():
         build(site, calls[site], HERE / "vectors" / site)
         for site in ("vision", "prefix", "expert_self", "expert_cross")
     ]
+    infos.append(build("edge", edge_call(), HERE / "vectors" / "edge", geom="expert_cross"))
     (HERE / "vectors" / "cases.json").write_text(json.dumps(infos, indent=1))
 
 

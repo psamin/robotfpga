@@ -1,4 +1,4 @@
-// gelu_silu: the GELU / SILU_MUL modes of float_top (fpga/kernels/CONTRACT.md 1.0: 2.2, 3.3, 4.1).
+// gelu_silu: the GELU / SILU_MUL modes of float_top (fpga/kernels/CONTRACT.md 1.0: 1.1, 2.1, 2.2, 3.3, 4.1).
 //
 //   OP_GELU              y = tanh-GELU(x)            SigLIP fc1 -> fc2
 //   OP_SILU_MUL          y = silu(gate) * up         LM / expert gate|up -> down_proj
@@ -7,46 +7,62 @@
 //   to y; else FP32 rows of y to C.
 //
 // Mode function (one call site in the sequencer's dispatch switch; INLINE off, so one hardware instance):
-//   case ctr::OP_GELU: case ctr::OP_SILU_MUL: return gs::act_mode(c, xmem, ymem);
-// c is a decoded record that passed ctr::validate_hw (the sequencer checks before every dispatch); xmem / ymem are
-// float_top's io bundle (read / write). In list mode the pointers are 0, so word index = byte address >> 4.
-// Activations are read only on io (CONTRACT.md 3.3); the hp ports are not used.
+//   case ctr::OP_GELU: case ctr::OP_SILU_MUL: return gs::act_mode(c, io_rd, io_wr);
+// or, with the sequencer's unit signature (seq_core.h "Units"), gs::act_unit(c, hp0, hp1, hp2, hp3, io_rd, io_wr).
+// c is a decoded record that passed ctr::validate_hw (the sequencer checks before every dispatch); io_rd / io_wr
+// are float_top's io bundle (xmem read, ymem write). In list mode the pointers are 0, so word index = byte address
+// >> 4. Activations are read only on io (CONTRACT.md 3.3); the hp ports are not used. The mode returns after its
+// last write (HLS waits for every write response of a burst before the loop that issued it ends: R-ORD).
 //
 // Slots (CONTRACT.md 3.3), all addresses 64-bit, < 2^40, 16-byte aligned (validate_hw):
 //   A  x (SILU_MUL: gate) FP32 rows: item b row n at A + b A.stride + n A.pitch, K values
 //   B  SILU_MUL up rows (same form; absent with F_NOMUL and for GELU)
-//   C  output rows: K int16 (F_QOUT) or K FP32
+//   C  output rows: K int16 (F_QOUT) or K FP32, row n of item b at C + b C.stride + n C.pitch
 //   F  F_QOUT: the scale vector of item b at F + b F.stride, 4 n bytes for row n; pad4(NP) floats, rows [N, NP) and
 //      the pad lanes hold 1.0
 //   p4 stored scale = s 2^p4 (an all-zero row stores 1.0); p5 = NP rows written (0 = N), rows [N, NP) all zero
 //
-// Layout of the unit (one DATAFLOW region per command; 4 lanes = 4 FP32 a clock, the io port's width):
-//   gs_rd   io reader: one burst stream per item when the rows are contiguous (GELU: A.pitch = 4K; SILU_MUL:
-//           B = A + 4K, pitches 8K: the fused gate|up GEMM output), else one burst per row (A row, then B row)
-//   gs_fe   the front end (this kernel's own logic): 4 lanes of h(x) from a table, one FP32 multiply per lane;
-//           SILU_MUL buffers silu(gate) of the row (gbuf) and multiplies it by up with the same multiplier.
-//           Emits y and the row's absmax.
-//   gs_sc   absmax -> s, R (quant_int16.h scale_bits + recip_sig, 1 bit a clock), stored scale with p4
+// Processes (one DATAFLOW region per command; 4 lanes = 4 FP32 a clock, the io port's width):
+//   gs_rd   io reader. Dense (the -12392 list: every GELU / SILU_MUL command): one burst stream per item covering
+//           rows [0, N), the pitch gaps read and dropped (A.pitch - row <= GAPW words; SILU_MUL needs the fused
+//           gate|up rows: B = A + 4K, B.pitch = A.pitch). Else one burst per row (A row, then B row).
+//   gs_fe   THE FRONT END (this kernel's own logic, what the integrated row unit takes): 4 lanes of h(x) from a
+//           table and one FP32 multiply per lane. SILU_MUL buffers silu(gate) of the row (gbuf) and multiplies it
+//           by up with the same multiplier. Emits y in natural column order.
+//   gs_am   per-row absmax of y; y into the row buffer (ys)
+//   gs_sc   absmax -> s, R (quant_int16.h, 1 recip bit a clock), stored scale (quant_int16.h stored_scale, p4)
 //   gs_qt   4 lanes of quant_int16.h quant_elem (or y passed through for FP32 output)
-//   gs_wr   io writer: one burst per row, zero rows [N, NP), one scale word per 4 rows
-// In the integrated row unit (CONTRACT.md 4.1) gs_rd, gs_sc, gs_qt and gs_wr are the unit's shared reader,
-// quantizer and writer; gs_fe is the GELU/SiLU front end that plugs between the reader and the row buffer (ys).
+//   gs_wr   io writer. Dense (C.pitch = the row): one burst per chunk of up to WCH rows, then that chunk's scale
+//           words; else one burst per row. Zero rows [N, NP), pad lanes 1.0
+//   gs_am .. gs_wr and gs_rd are the row unit's shared backbone (CONTRACT.md 4.1: reader, row buffer + absmax,
+//   quantizer, writer); here a private copy, so that the mode runs and synthesises standalone.
+//
+// Front-end interface (what a shared row unit plugs in, gs_fe): GsCmd fields mode, k4 = K / 4, up0, rowits, n, nb;
+// input stream: per row k4 words of x (GELU, SILU), or k4 words of gate then k4 words of up (SILU_MUL), rows in
+// order; output stream: per row k4 words of y. Throughput 1 word a clock (SILU_MUL: 1 output word per 2 input
+// words, the reader's pace). gbuf holds one row of silu(gate): K <= ACT_K_MAX.
 //
 // Front-end arithmetic (gs_emu.py is the bit-exact torch model; tb_gelu_silu.cpp checks it bit for bit):
 //   h = Phi_tanh (GELU, range R = 8) or sigmoid (SiLU, R = 16); the table holds g(t) = 1 - h(t), t = |x|
 //   T = floor(t 2^(TB - rb)) (TB = NSB + 12, rb = 3 | 4): idx = T >> 12, f = T & 4095, T = 0 for |x| < 2^-126
 //   g21 = max(0, (V[idx] << 12) + 2048 - D[idx] f) >> 12      Q0.21, 0 for t >= R; ROM word V << 15 | D
 //   H = x < 0 ? g21 : 2^21 - g21, h = H 2^-21 (exact FP32)
-//   y = fmul(x, h); SILU_MUL: y = fmul(y, up). fmul = the FP32 core: RNE, denormals in and out flushed to 0 with
-//   the sign kept (contract.ftz); the C model applies the flushes explicitly, the core does them in RTL.
-// Limits: |x| below 2^-21 relative resolution of g in the tails: SiLU gives -0 for x <= -15.25 (true value
-// > -4e-6), GELU -0 for x <= -8 (true value > -1e-14). NaN / Inf inputs are undefined (finite garbage or Inf in y,
-// never a hang or a write outside the extents).
+//   y = fmul(x, h); SILU_MUL: y = fmul(up, y_gate). fmul = the FP32 core: RNE, denormals in and out flushed to 0
+//   with the sign kept (contract.ftz); the C model applies the flushes explicitly, the core does them in RTL.
+// Limits: g has an absolute resolution of 2^-21, so the negative tails lose relative precision: SiLU gives -0 for
+// x <= -15.25 (true value > -4e-6; relative error 4.9e-4 at x = -8), GELU -0 for x <= -8 (true value > -1e-14).
+// A SILU_MUL row dominated by a gate below -15.25 times a large up therefore quantizes to the wrong absmax (on the
+// -12392 activations: at most 0.037 step, no policy effect; CONTRACT.md 9 #23). NaN / Inf inputs: q is undefined
+// (finite garbage) but the row's stored scale is non-finite (stored_scale), so the divergence reaches the next
+// GEMM; never a hang or a write outside the declared extents.
 #pragma once
 #include <ap_int.h>
 #include <hls_stream.h>
 #include <stdint.h>
 #include <string.h>
+#ifdef GS_DFSIM
+#include <thread>
+#endif
 
 #include "../contract.h"
 #include "../quantize/quant_int16.h"
@@ -67,6 +83,29 @@
 #error "CONTRACT.md 2.1: QZ_RECIP_BITS = 1 everywhere"
 #endif
 
+// stream depths (named: the threaded deadlock model in tb_gelu_silu.cpp uses the same numbers)
+#ifndef GS_D_XIN
+#define GS_D_XIN 4  // rd -> fe (shallow: the io adapter buffers the bursts)
+#endif
+#ifndef GS_D_YF
+#define GS_D_YF 4  // fe -> am
+#endif
+#ifndef GS_D_YS
+#define GS_D_YS (ctr::ACT_K_MAX / 4 + 128)  // am -> qt, the row buffer: one row + the scale latency
+#endif
+#ifndef GS_D_AM
+#define GS_D_AM 4  // am -> sc
+#endif
+#ifndef GS_D_RSF
+#define GS_D_RSF 4  // sc -> qt
+#endif
+#ifndef GS_D_SST
+#define GS_D_SST 8  // sc -> wr stored scales
+#endif
+#ifndef GS_D_OW
+#define GS_D_OW 8  // qt -> wr (covers the writer's per-run gap)
+#endif
+
 namespace gs {
 
 typedef ap_uint<128> Word;
@@ -80,12 +119,19 @@ constexpr int VB = 21, DB = 15;
 constexpr int LANES = 4;
 constexpr int KMAX = ctr::ACT_K_MAX;  // 3072 values per row
 constexpr int K4MAX = KMAX / LANES;   // 768 words per row
-// Row buffer between the front end and the quantizer: one whole row plus what the front end writes of the next
-// row while the scale is computed (~30 clocks). It must exceed K4MAX or a row could never complete (deadlock).
-constexpr int YDEPTH = K4MAX + 128;
-// SILU_MUL: iterations between the write of gbuf[w] (gate word w, at the end of the pipeline) and its read (up word
-// w, near the start). Rows with K / 4 < GAP get GAP - K / 4 idle iterations (K < 128 only; none in SmolVLA).
+// The row buffer must hold one whole row or a row could never complete (deadlock): K > KMAX is rejected.
+#ifndef GS_DFSIM_NEGATIVE  // the deadlock model's negative test builds a too-small row buffer on purpose
+static_assert(GS_D_YS > K4MAX, "the row buffer must exceed one row");
+#endif
+// SILU_MUL: iterations between the write of gbuf[w] (gate word w, at the end of the gs_fe pipeline) and its read (up
+// word w, near the start). Must exceed the pipeline depth (csynth: 21). Rows with K / 4 < GAP get GAP - K / 4 idle
+// iterations (K < 128 only; none in SmolVLA).
 constexpr int GAP = 32;
+// Dense read: pitch gaps up to GAPW words (1 KB) per row are read and dropped (-12392's action-time SiLU input has
+// a 4-word gap: pitch 4 pad32(720)).
+constexpr int GAPW = 64;
+// Writer chunk: rows per data burst; the chunk's scale words follow it (the scale buffer holds WCH scales).
+constexpr int WCH = 64;
 constexpr uint32_t ONE_BITS = 0x3F800000u;
 
 enum { MODE_GELU = 0, MODE_SILU_MUL = 1, MODE_SILU = 2 };
@@ -123,11 +169,15 @@ static inline void from_word(W& d, const Word& w) {
 struct GsCmd {
   ap_uint<2> mode;
   bool qout;
-  bool contig;          // gs_rd: one run per item
+  bool rdense;          // gs_rd: one run per item (rlen words, keep rw of every rper)
+  bool wdense;          // gs_wr: one data burst per chunk (C.pitch = orw)
   ap_uint<10> k4;       // words of x per row (K / 4), 2..768
+  ap_uint<11> rw;       // input words per row: k4, or 2 k4 (SILU_MUL: gate | up)
+  ap_uint<11> rper;     // rdense: words between row starts (A.pitch; rw for N = 1)
+  ap_uint<28> rlen;     // rdense: words per item, (N - 1) rper + rw
   ap_uint<11> rowits;   // gs_fe iterations per row: k4, or 2 k4 + gap (SILU_MUL)
   ap_uint<11> up0;      // SILU_MUL: first up iteration of a row (k4 + gap)
-  ap_uint<27> run_len;  // contig: words per item (N k4, or 2 N k4)
+  ap_uint<10> orw;      // output words per row: k4 / 2 (int16) or k4 (FP32)
   ap_uint<16> n, np, nb;  // rows per item, rows written, items
   ap_int<5> shift;      // p4
   waddr_t a, b, c, f;   // item 0 row 0
@@ -242,26 +292,32 @@ static inline ap_uint<32> fmul_bits(ap_uint<32> a, ap_uint<32> b) {
 }
 
 // ------------------------------------------------------------------ gs_rd: io reader
-// Runs: contig -> one run of run_len words per item; else per row a run of k4 words of A (+ one of B for SILU_MUL).
+// Dense: one run of rlen words per item, keeping the first rw words of every rper. Sparse: per row a run of k4
+// words of A (+ one of B for SILU_MUL).
 template <class RM>
 static void gs_rd(const GsCmd& c, RM xmem, hls::stream<Word>& xin) {
   const bool mul = c.mode == MODE_SILU_MUL;
   waddr_t ia = c.a, ib = c.b, ra = c.a, rb = c.b;
   ap_uint<16> n = 0, bi = 0;
-  bool second = false;  // the B run of the current row is next
+  bool second = false;  // sparse SILU_MUL: the B run of the current row is next
 runs:
   for (;;) {
-#pragma HLS LOOP_TRIPCOUNT min = 1 max = 1024 avg = 64
+#pragma HLS LOOP_TRIPCOUNT min = 1 max = 1024 avg = 1
     const waddr_t base = second ? rb : ra;
-    const ap_uint<27> len = c.contig ? c.run_len : (ap_uint<27>)c.k4;
+    const ap_uint<28> len = c.rdense ? c.rlen : (ap_uint<28>)c.k4;
+    const ap_uint<11> per = c.rdense ? c.rper : (ap_uint<11>)c.k4;
+    const ap_uint<11> keep = c.rdense ? c.rw : (ap_uint<11>)c.k4;
+    ap_uint<11> col = 0;
   data:
-    for (ap_uint<27> i = 0; i < len; i++) {
+    for (ap_uint<28> i = 0; i < len; i++) {
 #pragma HLS PIPELINE II = 1
-#pragma HLS LOOP_TRIPCOUNT min = 2 max = 786432 avg = 768
-      xin.write(to_word(xmem[base + i]));
+#pragma HLS LOOP_TRIPCOUNT min = 2 max = 786432 avg = 196608
+      const Word w = to_word(xmem[base + i]);
+      if (col < keep) xin.write(w);
+      col = col == per - 1 ? (ap_uint<11>)0 : (ap_uint<11>)(col + 1);
     }
     bool item_end;
-    if (c.contig) {
+    if (c.rdense) {
       item_end = true;
     } else if (mul && !second) {
       second = true;
@@ -285,19 +341,20 @@ runs:
 }
 
 // ------------------------------------------------------------------ gs_fe: the GELU / SiLU front end
-static void gs_fe(const GsCmd& c, hls::stream<Word>& xin, hls::stream<Word>& ys, hls::stream<qz::abits_t>& am) {
+// One multiplier per lane: y = fmul(x, B) with B = h(x) (GELU, SILU, the gate words of SILU_MUL) or B = the
+// buffered silu(gate) (the up words of SILU_MUL: y = up * silu(gate), the same product as silu(gate) * up).
+static void gs_fe(const GsCmd& c, hls::stream<Word>& xin, hls::stream<Word>& yf) {
   Word gbuf[K4MAX];  // SILU_MUL: silu(gate) of the current row
-#ifdef GS_GBUF_BRAM
-#pragma HLS BIND_STORAGE variable = gbuf type = ram_s2p impl = bram
-#else
+#ifdef GS_GBUF_URAM
 #pragma HLS BIND_STORAGE variable = gbuf type = ram_s2p impl = uram
+#else
+#pragma HLS BIND_STORAGE variable = gbuf type = ram_s2p impl = bram
 #endif
 #pragma HLS DEPENDENCE variable = gbuf type = inter dependent = false
   const bool tsilu = c.mode != MODE_GELU;
   const bool mul = c.mode == MODE_SILU_MUL;
   ap_uint<11> it = 0;
   ap_uint<16> n = 0, bi = 0;
-  qz::abits_t m = 0;
 words:
   for (;;) {
 #pragma HLS PIPELINE II = 1
@@ -310,25 +367,16 @@ words:
     if (gate || out) xw = xin.read();
     const Word gw = gbuf[wi];
     Word yw;
-    qz::abits_t wm[LANES];
-#pragma HLS ARRAY_PARTITION variable = wm complete
     for (int l = 0; l < LANES; l++) {
 #pragma HLS UNROLL
       const ap_uint<32> xb = xw(32 * l + 31, 32 * l);
       const ap_uint<32> hb = l < 2 ? h_bits<0>(xb, tsilu) : h_bits<1>(xb, tsilu);
-      const ap_uint<32> opa = up ? (ap_uint<32>)gw(32 * l + 31, 32 * l) : xb;  // up: silu(gate) * up
-      const ap_uint<32> opb = up ? xb : hb;                                     // else: x * h(x)
-      const ap_uint<32> yb = fmul_bits(opa, opb);
-      yw(32 * l + 31, 32 * l) = yb;
-      wm[l] = yb(30, 0);
+      const ap_uint<32> ob = up ? (ap_uint<32>)gw(32 * l + 31, 32 * l) : hb;
+      yw(32 * l + 31, 32 * l) = fmul_bits(xb, ob);
     }
     if (gate) gbuf[wi] = yw;
-    const qz::abits_t mw = qz::amax2(qz::amax2(wm[0], wm[1]), qz::amax2(wm[2], wm[3]));
-    const qz::abits_t mr = qz::amax2(m, mw);  // the last iteration of a row is always an output word
-    if (out) ys.write(yw);
+    if (out) yf.write(yw);
     if (it == c.rowits - 1) {
-      am.write(mr);
-      m = 0;
       it = 0;
       if (n == c.n - 1) {
         n = 0;
@@ -338,20 +386,42 @@ words:
         n++;
       }
     } else {
-      if (out) m = mr;
       it++;
     }
   }
 }
 
-// ------------------------------------------------------------------ gs_sc: row scales (quant_int16.h)
-static inline ap_uint<32> shifted_scale(qz::abits_t a, ap_uint<32> s, ap_int<5> shift) {
-#pragma HLS INLINE
-  // s is normal with 12 <= exponent <= 240 (quant_int16.h), so |shift| <= 8 stays normal: an exact 2^shift
-  const ap_uint<8> e = (ap_uint<8>)((ap_int<10>)s(30, 23) + (ap_int<10>)shift);
-  const ap_uint<32> r = ((ap_uint<32>)e << 23) | (ap_uint<32>)s(22, 0);
-  return a == 0 ? ap_uint<32>(ONE_BITS) : r;
+// ------------------------------------------------------------------ gs_am: row absmax + the row buffer
+static void gs_am(const GsCmd& c, hls::stream<Word>& yf, hls::stream<Word>& ys, hls::stream<qz::abits_t>& am) {
+  ap_uint<10> w = 0;
+  ap_uint<16> n = 0, bi = 0;
+  qz::abits_t m = 0;
+words:
+  for (;;) {
+#pragma HLS PIPELINE II = 1
+#pragma HLS LOOP_TRIPCOUNT min = 2 max = 786432 avg = 196608
+    const Word y = yf.read();
+    ys.write(y);
+    const qz::abits_t mr = qz::amax2(m, qz::word_amax(y));
+    if (w == c.k4 - 1) {
+      am.write(mr);
+      m = 0;
+      w = 0;
+      if (n == c.n - 1) {
+        n = 0;
+        if (bi == c.nb - 1) break;
+        bi++;
+      } else {
+        n++;
+      }
+    } else {
+      m = mr;
+      w++;
+    }
+  }
 }
+
+// ------------------------------------------------------------------ gs_sc: row scales (quant_int16.h)
 static void gs_sc(const GsCmd& c, hls::stream<qz::abits_t>& am, hls::stream<qz::RowScale>& rsf,
                   hls::stream<ap_uint<32> >& sst) {
   ap_uint<16> n = 0, bi = 0;
@@ -363,7 +433,7 @@ rows:
     qz::RowScale rs = qz::row_scale_from_s(s);
     rs.R = qz::recip_sig(rs.S);
     rsf.write(rs);
-    sst.write(shifted_scale(a, s, c.shift));
+    sst.write(qz::stored_scale(a, s, c.shift));
     if (n == c.n - 1) {
       n = 0;
       if (bi == c.nb - 1) break;
@@ -413,51 +483,76 @@ words:
 }
 
 // ------------------------------------------------------------------ gs_wr: io writer
+// Per item, chunks of up to WCH rows: the chunk's rows (one burst if dense, else one burst per row; zero rows
+// [N, NP) written as 0), then its ceil(rows / 4) scale words (F_QOUT; lanes past NP 1.0). The scale of every real
+// row is taken from sst at the row's last word, also without F_QOUT (gs_sc writes one per row either way).
 template <class WM>
 static void gs_wr(const GsCmd& c, WM ymem, hls::stream<Word>& ow, hls::stream<ap_uint<32> >& sst) {
-  const ap_uint<10> rw = c.qout ? (ap_uint<10>)(c.k4 >> 1) : c.k4;  // words per output row
-  waddr_t ic = c.c, rc = c.c, rf = c.f, jf = c.f;
-  ap_uint<32> s0 = ONE_BITS, s1 = ONE_BITS, s2 = ONE_BITS;
-  ap_uint<16> n = 0, bi = 0;
-rows:
+  ap_uint<32> sb[WCH];
+#pragma HLS ARRAY_PARTITION variable = sb cyclic factor = 4
+  waddr_t ic = c.c, jf = c.f;
+  ap_uint<16> bi = 0;
+items:
   for (;;) {
-#pragma HLS LOOP_TRIPCOUNT min = 1 max = 1024 avg = 256
-    const bool real = n < c.n;  // rows [N, NP) are zero rows with scale 1.0
-  data:
-    for (ap_uint<10> i = 0; i < rw; i++) {
+#pragma HLS LOOP_TRIPCOUNT min = 1 max = 1 avg = 1
+    waddr_t rc = ic, fc = jf;
+    ap_uint<17> r0 = 0;
+  chunks:
+    for (;;) {
+#pragma HLS LOOP_TRIPCOUNT min = 1 max = 16 avg = 4
+      const ap_uint<17> left = (ap_uint<17>)c.np - r0;
+      const ap_uint<7> nr = left > WCH ? (ap_uint<7>)WCH : (ap_uint<7>)left;
+      const ap_uint<17> rleft = c.n > r0 ? (ap_uint<17>)((ap_uint<17>)c.n - r0) : (ap_uint<17>)0;
+      const ap_uint<7> nreal = rleft > nr ? nr : (ap_uint<7>)rleft;
+      ap_uint<7> rr = 0;
+      ap_uint<10> col = 0;
+    runs:
+      for (;;) {
+#pragma HLS LOOP_TRIPCOUNT min = 1 max = 64 avg = 1
+        const ap_uint<17> len = c.wdense ? (ap_uint<17>)(nr * c.orw) : (ap_uint<17>)c.orw;
+      data:
+        for (ap_uint<17> i = 0; i < len; i++) {
 #pragma HLS PIPELINE II = 1
-#pragma HLS LOOP_TRIPCOUNT min = 1 max = 768 avg = 384
-      Word o = 0;
-      if (real) o = ow.read();
-      from_word(ymem[rc + i], o);
+#pragma HLS LOOP_TRIPCOUNT min = 1 max = 49152 avg = 12288
+          const bool real = rr < nreal;
+          Word o = 0;
+          if (real) o = ow.read();
+          from_word(ymem[rc + i], o);
+          if (col == c.orw - 1) {
+            const ap_uint<32> s = real ? sst.read() : ap_uint<32>(ONE_BITS);
+            sb[rr(5, 0)] = s;
+            rr++;
+            col = 0;
+          } else {
+            col++;
+          }
+        }
+        rc += c.wdense ? (waddr_t)len : (waddr_t)c.pc;
+        if (rr == nr) break;
+      }
+      if (c.qout) {
+        const ap_uint<5> nw = (ap_uint<5>)((nr + 3) >> 2);
+      scales:
+        for (ap_uint<5> j = 0; j < nw; j++) {
+#pragma HLS PIPELINE II = 1
+#pragma HLS LOOP_TRIPCOUNT min = 1 max = 16 avg = 16
+          Word sw;
+          for (int l = 0; l < 4; l++) {
+#pragma HLS UNROLL
+            const ap_uint<7> r = (ap_uint<7>)(j * 4 + l);
+            sw(32 * l + 31, 32 * l) = r < nr ? sb[r(5, 0)] : ap_uint<32>(ONE_BITS);
+          }
+          from_word(ymem[fc + j], sw);
+        }
+        fc += nw;
+      }
+      r0 += nr;
+      if (r0 == c.np) break;
     }
-    rc += c.pc;
-    const ap_uint<32> s = real ? sst.read() : ap_uint<32>(ONE_BITS);
-    const ap_uint<2> j = n(1, 0);
-    const bool last = n == c.np - 1;
-    if (c.qout && (j == 3 || last)) {  // lanes past the last row: 1.0
-      Word sw;
-      sw(31, 0) = j == 0 ? s : s0;
-      sw(63, 32) = j == 1 ? s : (j > 1 ? s1 : ap_uint<32>(ONE_BITS));
-      sw(95, 64) = j == 2 ? s : (j > 2 ? s2 : ap_uint<32>(ONE_BITS));
-      sw(127, 96) = j == 3 ? s : ap_uint<32>(ONE_BITS);
-      from_word(ymem[jf], sw);
-      jf++;
-    }
-    if (j == 0) s0 = s;
-    if (j == 1) s1 = s;
-    if (j == 2) s2 = s;
-    if (last) {
-      n = 0;
-      if (bi == c.nb - 1) break;
-      bi++;
-      ic += c.sc;
-      rc = ic;
-      rf += c.sf;
-      jf = rf;
-    } else {
-      n++;
-    }
+    if (bi == c.nb - 1) break;
+    bi++;
+    ic += c.sc;
+    jf += c.sf;
   }
 }
 
@@ -465,51 +560,66 @@ template <class RM, class WM>
 static void gs_df(const GsCmd& c, RM xmem, WM ymem) {
 #pragma HLS DATAFLOW
 #pragma HLS STABLE variable = c
-  hls::stream<Word> xin("gs_xin");  // shallow: the io adapter buffers the bursts
-#pragma HLS STREAM variable = xin depth = 4
+  hls::stream<Word> xin("gs_xin");
+#pragma HLS STREAM variable = xin depth = GS_D_XIN
+  hls::stream<Word> yf("gs_yf");
+#pragma HLS STREAM variable = yf depth = GS_D_YF
   hls::stream<Word> ys("gs_ys");  // the row buffer: the quantizer starts a row once its absmax is known
-#pragma HLS STREAM variable = ys depth = YDEPTH
+#pragma HLS STREAM variable = ys depth = GS_D_YS
 #ifdef GS_YS_URAM
 #pragma HLS BIND_STORAGE variable = ys type = fifo impl = uram
 #else
 #pragma HLS BIND_STORAGE variable = ys type = fifo impl = bram
 #endif
   hls::stream<qz::abits_t> am("gs_am");
-#pragma HLS STREAM variable = am depth = 4
+#pragma HLS STREAM variable = am depth = GS_D_AM
   hls::stream<qz::RowScale> rsf("gs_rsf");
-#pragma HLS STREAM variable = rsf depth = 4
+#pragma HLS STREAM variable = rsf depth = GS_D_RSF
   hls::stream<ap_uint<32> > sst("gs_sst");  // stored scales: the writer takes them after each row's data
-#pragma HLS STREAM variable = sst depth = 8
-  hls::stream<Word> ow("gs_ow");  // covers the writer's per-row gap
-#pragma HLS STREAM variable = ow depth = 8
+#pragma HLS STREAM variable = sst depth = GS_D_SST
+  hls::stream<Word> ow("gs_ow");
+#pragma HLS STREAM variable = ow depth = GS_D_OW
+#ifdef GS_DFSIM  // host deadlock model: every process its own thread, every stream bounded (dfsim/hls_stream.h)
+  std::thread t0([&] { gs_rd(c, xmem, xin); });
+  std::thread t1([&] { gs_fe(c, xin, yf); });
+  std::thread t2([&] { gs_am(c, yf, ys, am); });
+  std::thread t3([&] { gs_sc(c, am, rsf, sst); });
+  std::thread t4([&] { gs_qt(c, ys, rsf, ow); });
+  std::thread t5([&] { gs_wr(c, ymem, ow, sst); });
+  t0.join();
+  t1.join();
+  t2.join();
+  t3.join();
+  t4.join();
+  t5.join();
+  const hls::stream<Word>* ws[] = {&xin, &yf, &ys, &ow};
+  for (auto* s : ws)
+    if (!s->empty()) {
+      fprintf(stdout, "DFSIM: stream %s holds %zu words after the command\n", s->name().c_str(), s->size());
+      _Exit(8);
+    }
+  if (!am.empty() || !rsf.empty() || !sst.empty()) {
+    fprintf(stdout, "DFSIM: scale streams not empty after the command\n");
+    _Exit(8);
+  }
+#else
   gs_rd(c, xmem, xin);
-  gs_fe(c, xin, ys, am);
+  gs_fe(c, xin, yf);
+  gs_am(c, yf, ys, am);
   gs_sc(c, am, rsf, sst);
   gs_qt(c, ys, rsf, ow);
   gs_wr(c, ymem, ow, sst);
+#endif
 }
 
-// ------------------------------------------------------------------ the mode function
-// Returns ctr::ME_OK, or (nothing read or written) ME_FLAGS / ME_DIMS / ME_PARAM for a command the dataflow region
-// cannot run safely (K > ACT_K_MAX would deadlock the row buffer). That guard (GS_GUARD, default 1) duplicates
-// validate_hw, which the sequencer runs before every dispatch and which also checks the slots, alignment and pitches
-// that this function trusts: a float_top build may set GS_GUARD=0 (about -0.4k LUT).
-template <class RM, class WM>
-static uint32_t act_mode(const ctr::Cmd& cmd, RM xmem, WM ymem) {
-#pragma HLS INLINE off
+// ------------------------------------------------------------------ command -> GsCmd
+// (word units from here on: validate_hw guarantees addresses < 2^40 and 16-byte alignment)
+static inline GsCmd gs_plan(const ctr::Cmd& cmd) {
+#pragma HLS INLINE
   const bool gelu = cmd.op == ctr::OP_GELU;
   const bool nomul = (cmd.flags & ctr::F_NOMUL) != 0;
   const bool qout = (cmd.flags & ctr::F_QOUT) != 0;
   const uint32_t np = cmd.p[ctr::P_NP] ? cmd.p[ctr::P_NP] : cmd.N;
-  const uint32_t sh = cmd.p[ctr::P_SHIFT];
-#if GS_GUARD
-  // one unsigned compare per range: x in [lo, hi] <=> x - lo <= hi - lo
-  if ((!gelu && cmd.op != ctr::OP_SILU_MUL) || (gelu && nomul)) return ctr::ME_FLAGS;
-  if (cmd.K - 8u > (uint32_t)KMAX - 8u || (cmd.K & 7) != 0 || cmd.N - 1u >= ctr::N_MAX || cmd.B - 1u >= ctr::B_MAX)
-    return ctr::ME_DIMS;
-  if (np < cmd.N || np > ctr::N_MAX || sh + ctr::SHIFT_MAX > 2 * ctr::SHIFT_MAX || (!qout && (np != cmd.N || sh)))
-    return ctr::ME_PARAM;
-#endif
   GsCmd c;
   c.mode = gelu ? MODE_GELU : (nomul ? MODE_SILU : MODE_SILU_MUL);
   const bool mul = c.mode == MODE_SILU_MUL;
@@ -521,27 +631,69 @@ static uint32_t act_mode(const ctr::Cmd& cmd, RM xmem, WM ymem) {
   c.n = cmd.N;
   c.np = np;
   c.nb = cmd.B;
-  c.shift = (ap_int<5>)(int32_t)sh;
+  c.shift = (ap_int<5>)(int32_t)cmd.p[ctr::P_SHIFT];
   const ctr::Slot &A = cmd.s[ctr::SLOT_A], &B = cmd.s[ctr::SLOT_B], &C = cmd.s[ctr::SLOT_C], &F = cmd.s[ctr::SLOT_F];
-  // word units from here on (validate_hw: addresses < 2^40, everything 16-byte aligned)
-  const ap_uint<11> rw = mul ? (ap_uint<11>)((ap_uint<11>)c.k4 << 1) : (ap_uint<11>)c.k4;  // input words per row
   c.a = (waddr_t)(A.addr >> 4);
   c.pa = A.pitch >> 4;
   c.sa = A.stride >> 4;
   c.b = mul ? (waddr_t)(B.addr >> 4) : (waddr_t)0;
   c.pb = mul ? (wpitch_t)(B.pitch >> 4) : (wpitch_t)0;
   c.sb = mul ? (wpitch_t)(B.stride >> 4) : (wpitch_t)0;
-  // one run per item: GELU / SILU rows back to back; SILU_MUL rows [gate | up] back to back (the fused gate|up GEMM)
-  c.contig = (cmd.N == 1 || c.pa == rw) &&
-             (!mul || (c.b == c.a + c.k4 && (cmd.N == 1 || c.pb == rw) && (cmd.B == 1 || c.sb == c.sa)));
-  c.run_len = (ap_uint<16>)cmd.N * rw;
+  c.rw = mul ? (ap_uint<11>)((ap_uint<11>)c.k4 << 1) : (ap_uint<11>)c.k4;
+  // dense read: rows (SILU_MUL: fused gate | up rows, B = A + 4K) at a pitch with at most GAPW words of gap
+  const bool one = cmd.N == 1;
+  const bool gap_ok = c.pa >= c.rw && c.pa - c.rw <= GAPW;
+  const bool fused = !mul || ((ap_uint<37>)c.a + c.k4 == c.b && (one || c.pb == c.pa) && (cmd.B == 1 || c.sb == c.sa));
+  c.rdense = (one || gap_ok) && fused;
+  c.rper = one ? c.rw : (ap_uint<11>)c.pa;
+  const ap_uint<27> body = (ap_uint<16>)(cmd.N - 1) * c.rper;
+#pragma HLS BIND_OP variable = body op = mul impl = dsp
+  c.rlen = (ap_uint<28>)body + c.rw;
   c.c = (waddr_t)(C.addr >> 4);
   c.pc = C.pitch >> 4;
   c.sc = C.stride >> 4;
+  c.orw = qout ? (ap_uint<10>)(c.k4 >> 1) : c.k4;
+  c.wdense = np == 1 || c.pc == c.orw;
   c.f = qout ? (waddr_t)(F.addr >> 4) : (waddr_t)0;
   c.sf = qout ? (wpitch_t)(F.stride >> 4) : (wpitch_t)0;
+  return c;
+}
+
+// ------------------------------------------------------------------ the mode function
+// Returns ctr::ME_OK, or (nothing read or written) ME_FLAGS / ME_DIMS / ME_PARAM for a command the dataflow region
+// cannot run safely (K > ACT_K_MAX would deadlock the row buffer). That guard (GS_GUARD, default 1) duplicates
+// validate_hw, which the sequencer runs before every dispatch and which also checks the slots, alignment and pitches
+// that this function trusts: a float_top build may set GS_GUARD=0.
+template <class RM, class WM>
+static uint32_t act_mode(const ctr::Cmd& cmd, RM xmem, WM ymem) {
+#pragma HLS INLINE off
+#if GS_GUARD
+  {
+    const bool gelu = cmd.op == ctr::OP_GELU;
+    const bool nomul = (cmd.flags & ctr::F_NOMUL) != 0;
+    const bool qout = (cmd.flags & ctr::F_QOUT) != 0;
+    const uint32_t np = cmd.p[ctr::P_NP] ? cmd.p[ctr::P_NP] : cmd.N;
+    const uint32_t sh = cmd.p[ctr::P_SHIFT];
+    // one unsigned compare per range: x in [lo, hi] <=> x - lo <= hi - lo
+    if ((!gelu && cmd.op != ctr::OP_SILU_MUL) || (gelu && nomul)) return ctr::ME_FLAGS;
+    if (cmd.K - 8u > (uint32_t)KMAX - 8u || (cmd.K & 7) != 0 || cmd.N - 1u >= ctr::N_MAX || cmd.B - 1u >= ctr::B_MAX)
+      return ctr::ME_DIMS;
+    if (np < cmd.N || np > ctr::N_MAX || sh + ctr::SHIFT_MAX > 2 * ctr::SHIFT_MAX || (!qout && (np != cmd.N || sh)))
+      return ctr::ME_PARAM;
+  }
+#endif
+  const GsCmd c = gs_plan(cmd);
   gs_df(c, xmem, ymem);
   return ctr::ME_OK;
+}
+
+// The sequencer's unit signature (fpga/kernels/sequencer/seq_core.h "Units"): the hp ports are not used.
+template <class WP, class W>
+static uint32_t act_unit(const ctr::Cmd& c, const WP* hp0, const WP* hp1, const WP* hp2, const WP* hp3, const W* io_rd,
+                         W* io_wr) {
+#pragma HLS INLINE
+  (void)hp0, (void)hp1, (void)hp2, (void)hp3;
+  return act_mode(c, io_rd, io_wr);
 }
 
 }  // namespace gs

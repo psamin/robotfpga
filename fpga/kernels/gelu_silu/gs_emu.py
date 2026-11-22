@@ -6,8 +6,8 @@
     (q, s) = contract quantizer of y (fpga/kernels/contract.py quant_rows = quantize/quant_int16.h)
 
 h(x) comes from a table (gs_tables.py) as an exact FP32 value of 21 fraction bits; the products are FP32
-multiplies with the Xilinx cores' rule (round to nearest even, denormal inputs and results flushed to zero, sign
-kept: contract.ftz). The C++ testbench checks the HLS code against this file bit for bit (y, q, s).
+multiplies with the Xilinx cores' rule (round to nearest even, denormal inputs and results flushed to zero,
+sign kept: contract.ftz). The C++ testbench checks the HLS code against this file bit for bit (y, q, s).
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ def b2f(b: torch.Tensor) -> torch.Tensor:
 
 
 def msb(v: torch.Tensor) -> torch.Tensor:
-    """Index of the leading one of non-negative int64 values < 2^53 (exact through float64 frexp); -1 for 0."""
+    """Index of the leading one of non-negative int64 values < 2^53 (exact via float64 frexp); -1 for 0."""
     _, e = torch.frexp(v.to(torch.float64))
     return torch.where(v > 0, e.to(torch.int64) - 1, torch.full_like(v, -1))
 
@@ -59,7 +59,7 @@ def ftz_bits(b: torch.Tensor) -> torch.Tensor:
 
 
 def fmul_bits(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """One Xilinx FP32 multiply: ftz(ftz(a) * ftz(b)), round to nearest even (torch's CPU float32 multiply)."""
+    """One Xilinx FP32 multiply: ftz(ftz(a) * ftz(b)), round to nearest even (torch's CPU FP32 multiply)."""
     p = b2f(ftz_bits(a)) * b2f(ftz_bits(b))
     return ftz_bits(f2b(p))
 
@@ -108,7 +108,7 @@ def act(x: torch.Tensor, u: torch.Tensor | None, mode: int, nsb: int = 9) -> tor
 
 
 def quant_rows(y: torch.Tensor, shift: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
-    """The contract quantizer over the last axis (contract.quant_rows): q int16, stored scale FP32 (..., 1)."""
+    """The contract quantizer over the last axis (contract.quant_rows): q int16, stored scale (..., 1)."""
     import contract
 
     q, s = contract.quant_rows(y.detach().to(torch.float32).cpu().numpy(), shift)

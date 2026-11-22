@@ -62,7 +62,7 @@ constexpr int BLK = 256;                    // rows per block: one D chunk, one 
 #define SMX_XS_DEPTH W_MAX  // one row of 256 keys (LUTRAM): >= W_MAX is the deadlock bound
 #endif
 #ifndef SMX_RQ_DEPTH
-#define SMX_RQ_DEPTH (BLK + 32)  // >= BLK: the writer reads a block's scales after its rows (deadlock bound)
+#define SMX_RQ_DEPTH (BLK / 4 + 8)  // > BLK / 4: the writer reads a block's scale words after its rows (deadlock bound)
 #endif
 constexpr int XS_DEPTH = SMX_XS_DEPTH;
 constexpr int MX_DEPTH = 4;
@@ -76,7 +76,7 @@ typedef hls::stream<XW, XS_DEPTH> XStream;
 typedef hls::stream<ap_uint<32>, MX_DEPTH> MStream;
 typedef hls::stream<Word, EQ_DEPTH> QStream;
 typedef hls::stream<ap_uint<23>, SQ_DEPTH> SStream;
-typedef hls::stream<ap_uint<32>, RQ_DEPTH> RStream;
+typedef hls::stream<Word, RQ_DEPTH> RStream;  // scale words: 4 rows each
 
 struct Params {
   ap_uint<17> B, N, NP, NP4;  // items, rows, rows written, pad4(NP) scales (each <= 65536)
@@ -156,11 +156,20 @@ static inline ap_uint<32> lane32(const ap_uint<128>& w, int l) {
   return w.range(32 * l + 31, 32 * l);
 }
 
-// FP32 total-order integer key (monotonic in the value; its own inverse on the bit pattern); KMIN if not valid.
-static inline ap_int<32> okey(ap_uint<32> b, bool valid) {
+// 33-bit unsigned max key: [32] = visible, [31:0] = the FP32 total-order key b ^ (b[31] ? 0xFFFFFFFF : 0x80000000)
+// (monotonic in the value). A visible key beats every masked one without a select; when no key of a row is
+// visible every q is 0 and the max is not used.
+typedef ap_uint<33> Key;
+static inline Key okey(ap_uint<32> b, bool valid) {
 #pragma HLS INLINE
-  const ap_uint<32> k = b[31] ? (ap_uint<32>)(b ^ 0x7FFFFFFFu) : b;
-  return valid ? (ap_int<32>)k : (ap_int<32>)(ap_uint<32>)0x80000000u;
+  const ap_uint<32> mask = ((ap_uint<32>)(ap_int<32>)(ap_int<1>)b[31]) | (ap_uint<32>)0x80000000u;
+  return ((Key)(valid ? 1 : 0) << 32) | (Key)(b ^ mask);
+}
+// the FP32 bits of a key
+static inline ap_uint<32> key_bits(Key k) {
+#pragma HLS INLINE
+  const ap_uint<32> u = k.range(31, 0);
+  return u[31] ? (ap_uint<32>)(u ^ 0x80000000u) : (ap_uint<32>)~u;
 }
 
 // ~G(x) on 48 bits for the FP32 bits b, where G(x) = fix(x) + 2^47 for x >= 0 and fix(x) + 2^47 - 1 for x < 0,
@@ -187,12 +196,16 @@ static inline ap_uint<48> neg_g(ap_uint<32> b, ap_int<11> kc) {
 
 // q of two lanes from their distances u (Q.21) to the row max: one 1024 x 36-bit table (one BRAM36, two read
 // ports) per pair of lanes. q = (h + 257) >> 9 with h = 2 e23 >> I, I = integer part of u Mc (0 when I >= 17).
+// keep = the key is visible, the row is real and d < 2^26. Otherwise q = 0: for d >= 2^26 the saturated u =
+// 2^26 - 1 of the definition gives I >= 31 (Mc >= 2^16), i.e. q = 0, so the saturation needs no select.
 template <int PAIR>
-static inline void q_pair(ap_uint<26> u0, ap_uint<26> u1, ap_uint<17> mc, ap_uint<15>& q0, ap_uint<15>& q1) {
+static inline void q_pair(ap_uint<26> u0, ap_uint<26> u1, bool k0, bool k1, ap_uint<17> mc, ap_uint<15>& q0,
+                          ap_uint<15>& q1) {
 #pragma HLS INLINE
   static const ap_uint<36> TAB[1024] = SMX_TAB_INIT;
 #pragma HLS BIND_STORAGE variable = TAB type = rom_2p impl = bram
   ap_uint<26> u[2] = {u0, u1};
+  const bool keep[2] = {k0, k1};
   ap_uint<15> q[2];
   for (int l = 0; l < 2; l++) {
 #pragma HLS UNROLL
@@ -202,14 +215,16 @@ static inline void q_pair(ap_uint<26> u0, ap_uint<26> u1, ap_uint<17> mc, ap_uin
     const ap_uint<10> ix = t.range(36, 27);
     const ap_uint<13> flo = t.range(26, 14);
     const ap_uint<36> te = TAB[ix];
-    const ap_uint<23> T = te.range(35, 13);
     const ap_uint<13> S = te.range(12, 0);
-    ap_uint<26> corr = S * flo;
-#pragma HLS BIND_OP variable = corr op = mul impl = dsp
-    const ap_uint<23> e23 = T - (ap_uint<23>)corr.range(25, 13);
+    // e23 = T - floor(S flo / 2^13) = floor((T 2^13 + 8191 - S flo) / 2^13): one DSP (multiply + post-subtract);
+    // T 2^13 + 8191 is te with its low 13 bits (S) replaced by ones. The difference is > 2^35 - 2^26 > 0.
+    const ap_uint<36> tc = te | (ap_uint<36>)0x1FFF;
+    ap_uint<36> pc = tc - S * flo;
+#pragma HLS BIND_OP variable = pc op = mul impl = dsp
+    const ap_uint<23> e23 = pc.range(35, 13);
     const ap_uint<24> h = ((ap_uint<24>)e23 << 1) >> (unsigned)I.range(4, 0);
     const ap_uint<24> r = h + (ap_uint<24>)257;
-    q[l] = I >= 17 ? (ap_uint<15>)0 : (ap_uint<15>)r.range(23, 9);
+    q[l] = (keep[l] && I < 17) ? (ap_uint<15>)r.range(23, 9) : (ap_uint<15>)0;
   }
   q0 = q[0];
   q1 = q[1];
@@ -226,7 +241,7 @@ static void read_burst(const Word* xm, WAddr base, ap_uint<15> nw, ap_uint<2> ki
                        MStream& mx) {
 #pragma HLS INLINE
   ap_uint<7> w = 0;
-  ap_int<32> pm1 = 0, pm2 = 0;  // partial max of the previous word's parity / of this word's parity
+  Key pm1 = 0, pm2 = 0;  // partial max of the previous word's parity / of this word's parity
 words_r:
   for (ap_uint<15> i = 0; i < nw; i++) {
 #pragma HLS PIPELINE II = 1
@@ -241,23 +256,22 @@ words_r:
     const ap_uint<2> nl = n.range(1, 0);
     const ap_uint<32> dv = nl == 0 ? lane32(dw, 0) : nl == 1 ? lane32(dw, 1) : nl == 2 ? lane32(dw, 2) : lane32(dw, 3);
     ap_uint<4> vis;
-    ap_int<32> k[4];
+    Key k[4];
     for (int l = 0; l < 4; l++) {
 #pragma HLS UNROLL
       // 0 <= E <= D in int32: D >= 0 and E <= D as unsigned (a negative E is >= 2^31 unsigned)
       vis[l] = !mask || (!dv[31] && lane32(ev, l) <= dv);
       k[l] = okey(lane32(v, l), vis[l]);
     }
-    const ap_int<32> k01 = k[1] > k[0] ? k[1] : k[0], k23 = k[3] > k[2] ? k[3] : k[2];
-    const ap_int<32> k4 = k23 > k01 ? k23 : k01;
-    const ap_int<32> prev = w < 2 ? (ap_int<32>)(ap_uint<32>)0x80000000u : pm2;
-    const ap_int<32> nm = k4 > prev ? k4 : prev;
+    const Key k01 = k[1] > k[0] ? k[1] : k[0], k23 = k[3] > k[2] ? k[3] : k[2];
+    const Key k4 = k23 > k01 ? k23 : k01;
+    const Key prev = w < 2 ? (Key)0 : pm2;
+    const Key nm = k4 > prev ? k4 : prev;
     if (kind == KIND_X) {
       xs.write(((XW)vis << 128) | (XW)v);
       if (w == W - 1) {
-        const ap_int<32> fm = nm > pm1 ? nm : pm1;  // W is even: pm1 holds the other parity's max
-        const ap_uint<32> fb = fm;
-        mx.write(fb[31] ? (ap_uint<32>)(fb ^ 0x7FFFFFFFu) : fb);  // the key's own bit pattern
+        const Key fm = nm > pm1 ? nm : pm1;  // W is even: pm1 holds the other parity's max
+        mx.write(key_bits(fm));
       }
     }
     if (w == W - 1) {
@@ -281,7 +295,7 @@ items_r:
   for (ap_uint<17> b = 0; b < p.B; b++) {
 #pragma HLS LOOP_TRIPCOUNT max = 24
     const bool load_e = p.mask && (b == 0 || p.es != 0);
-    WAddr ra = ia, rd = id;
+    WAddr ra = ia;
   blocks_r:
     for (ap_uint<17> r0 = 0; r0 < p.N; r0 += BLK) {
 #pragma HLS LOOP_TRIPCOUNT max = 1
@@ -304,7 +318,7 @@ items_r:
         if (j < pre) {
           const bool is_e = e_here && j == 0;
           kind = is_e ? KIND_E : KIND_D;
-          base = is_e ? ie : rd;
+          base = is_e ? ie : (WAddr)(id + (r0 >> 2));
           len = is_e ? (ap_uint<15>)p.W : (ap_uint<15>)((rows + 3) >> 2);
         }
         ap_uint<9> nn = kind == KIND_X ? n : (ap_uint<9>)0;
@@ -314,7 +328,6 @@ items_r:
           ra += step;
         }
       }
-      rd += BLK / 4;
     }
     ia += p.as;
     ie += p.es;
@@ -356,24 +369,25 @@ items_c:
         ng[l] = neg_g(lane32(x, l), p.kc);
       }
       ap_uint<26> u[4];
+      bool keep[4];
       for (int l = 0; l < 4; l++) {
 #pragma HLS UNROLL
         const bool sx = x[32 * l + 31];
         // G(m) + ~G(x) + carry as one 49-bit adder: (2 G(m) + 1) + (2 ~G(x) + carry), then >> 1
         const ap_uint<49> d2 = (((ap_uint<49>)gm << 1) | 1) + (((ap_uint<49>)ng[l] << 1) | (ap_uint<49>)(sm || !sx));
         const ap_uint<48> d = d2.range(48, 1);
-        u[l] = d.range(47, 26) != 0 ? (ap_uint<26>)0x3FFFFFF : (ap_uint<26>)d.range(25, 0);
+        u[l] = d.range(25, 0);
+        keep[l] = real && x[128 + l] && d.range(47, 26) == 0;
       }
       ap_uint<15> q[4];
-      q_pair<0>(u[0], u[1], p.mc, q[0], q[1]);
-      q_pair<1>(u[2], u[3], p.mc, q[2], q[3]);
+      q_pair<0>(u[0], u[1], keep[0], keep[1], p.mc, q[0], q[1]);
+      q_pair<1>(u[2], u[3], keep[2], keep[3], p.mc, q[2], q[3]);
       ap_uint<64> q4 = 0;
       ap_uint<17> s4 = 0;
       for (int l = 0; l < 4; l++) {
 #pragma HLS UNROLL
-        const ap_uint<15> ql = (real && x[128 + l]) ? q[l] : (ap_uint<15>)0;
-        q4.range(16 * l + 15, 16 * l) = ql;
-        s4 += ql;
+        q4.range(16 * l + 15, 16 * l) = q[l];
+        s4 += q[l];
       }
       const ap_uint<23> ns = sum + s4;
       if (setup) {
@@ -407,9 +421,10 @@ items_c:
 
 // ------------------------------------------------------------------ divider: RN(1 / S) as FP32 bits (1.0 for S == 0)
 // S < 2^23 normalised to d = S << (22 - p) (p = msb S); q = floor(2^47 / d) in (2^24, 2^25] by restoring division,
-// two quotient bits per clock (radix 4: 2r against d, 2d, 3d, i.e. two radix-2 steps); round to nearest even
-// with the remainder as sticky bit. One unit, 14 clocks per row (load + 13 steps); each row's scale is written
-// before the next sum is read, so the unit never waits on a later row (no lookahead, no deadlock).
+// two quotient bits per clock (radix 4: 4 rem against d, 2d, 3d); round to nearest even with the remainder as
+// sticky bit. One unit, 14 clocks per row (load + 13 double steps) over the B * NP4 sums of the command; each row's
+// scale is written before the next sum is read, so the unit never waits on a later row (no lookahead, no
+// deadlock).
 static inline ap_uint<32> div_finish(ap_uint<26> q, bool sticky, ap_uint<5> pe, bool zero) {
 #pragma HLS INLINE
   ap_uint<32> bits;
@@ -425,65 +440,71 @@ static inline ap_uint<32> div_finish(ap_uint<26> q, bool sticky, ap_uint<5> pe, 
   }
   return bits;
 }
-constexpr int DSTEPS = 13;  // radix-4 steps per row
+constexpr int DSTEPS = 13;  // double steps per row
 static void divider(SStream& sq, RStream& rq, const Params p) {
-items_d:
-  for (ap_uint<17> b = 0; b < p.B; b++) {
-#pragma HLS LOOP_TRIPCOUNT max = 24
-    const ap_uint<21> tot = ((ap_uint<21>)p.NP4 << 4) - ((ap_uint<21>)p.NP4 << 1);  // NP4 * (DSTEPS + 1)
-    ap_uint<4> k = 0;
-    ap_uint<24> r = 0;  // partial remainder, < 2 d
-    ap_uint<23> d = 0;
-    ap_uint<25> d3 = 0;
-    ap_uint<26> q = 0;
-    ap_uint<5> pe = 0;
-    bool zero = false;
-  divide:
-    for (ap_uint<21> i = 0; i < tot; i++) {
+  ap_uint<4> k = 0;
+  ap_uint<17> n = 0, b = 0;  // row of the item (< NP4), item
+  ap_uint<23> rem = 0, d = 0;  // rem < d
+  ap_uint<25> d3 = 0;
+  ap_uint<26> q = 0;
+  ap_uint<5> pe = 0;
+  ap_uint<128> pk = 0;  // the scale word being filled (lane n % 4)
+  bool zero = false, done = false;
+divide:
+  while (!done) {
 #pragma HLS PIPELINE II = 1
-#pragma HLS LOOP_TRIPCOUNT max = 3584
-      if (k == 0) {
-        const ap_uint<23> v = sq.read();
-        ap_uint<5> msb = 0;
-        for (int j = 0; j < 23; j++) {
+#pragma HLS LOOP_TRIPCOUNT max = 86016
+    if (k == 0) {
+      const ap_uint<23> v = sq.read();
+      ap_uint<5> msb = 0;
+      for (int j = 0; j < 23; j++) {
 #pragma HLS UNROLL
-          if (v[j]) msb = j;
-        }
-        d = v << (22 - msb);
-        d3 = (ap_uint<25>)d + ((ap_uint<25>)d << 1);
-        r = (ap_uint<24>)1 << 22;
-        q = 0;
-        pe = msb;
-        zero = v == 0;
-      } else {
-        const ap_uint<25> R = (ap_uint<25>)r << 1;  // < 4 d
-        const ap_int<26> t1 = (ap_int<26>)R - (ap_int<26>)d, t2 = (ap_int<26>)R - ((ap_int<26>)d << 1),
-                         t3 = (ap_int<26>)R - (ap_int<26>)d3;
-        ap_uint<2> dig;
-        ap_uint<24> rem;
-        if (t3 >= 0) {
-          dig = 3;
-          rem = t3;
-        } else if (t2 >= 0) {
-          dig = 2;
-          rem = t2;
-        } else if (t1 >= 0) {
-          dig = 1;
-          rem = t1;
-        } else {
-          dig = 0;
-          rem = R;
-        }
-        r = rem << 1;
-        q = (q << 2) | (ap_uint<26>)dig;
-        if (k == DSTEPS) rq.write(div_finish(q, r != 0, pe, zero));
+        if (v[j]) msb = j;
       }
-      k = k == DSTEPS ? (ap_uint<4>)0 : (ap_uint<4>)(k + 1);
+      d = v << (22 - msb);
+      d3 = (ap_uint<25>)d + ((ap_uint<25>)d << 1);
+      rem = (ap_uint<23>)1 << 21;
+      q = 0;
+      pe = msb;
+      zero = v == 0;
+    } else {  // radix 4: R = 4 rem against d, 2d, 3d in parallel
+      const ap_uint<25> R = (ap_uint<25>)rem << 2;
+      const ap_int<26> t1 = (ap_int<26>)R - (ap_int<26>)d, t2 = (ap_int<26>)R - ((ap_int<26>)d << 1),
+                       t3 = (ap_int<26>)R - (ap_int<26>)d3;
+      ap_uint<2> dig;
+      if (t3 >= 0) {
+        dig = 3;
+        rem = t3;
+      } else if (t2 >= 0) {
+        dig = 2;
+        rem = t2;
+      } else if (t1 >= 0) {
+        dig = 1;
+        rem = t1;
+      } else {
+        dig = 0;
+        rem = R;
+      }
+      q = (q << 2) | (ap_uint<26>)dig;
+      if (k == DSTEPS) {
+        pk = (pk >> 32) | ((ap_uint<128>)div_finish(q, rem != 0, pe, zero) << 96);
+        if (n.range(1, 0) == 3) rq.write(pk);
+      }
+    }
+    const bool row_end = k == DSTEPS, item_end = n == p.NP4 - 1;
+    done = row_end && item_end && b == p.B - 1;
+    k = row_end ? (ap_uint<4>)0 : (ap_uint<4>)(k + 1);
+    if (row_end) {
+      n = item_end ? (ap_uint<17>)0 : (ap_uint<17>)(n + 1);
+      if (item_end) b++;
     }
   }
 }
 
 // ------------------------------------------------------------------ writer (ymem)
+// Per block of <= 256 rows: the P rows (one burst if the C pitch is 2 L, else one per row; the pitch's pad words
+// are never written; rows [N, NP) are compute's zero rows), then the block's scale words (pad lanes 1.0) as one
+// burst. One write site for both (one m_axi write path).
 static void writer(QStream& eq, RStream& rq, Word* ym, const Params p) {
   WAddr ic = p.c, iff = p.f;
 items_w:
@@ -496,29 +517,23 @@ items_w:
       const ap_uint<17> left = p.NP - r0, left4 = p.NP4 - r0;
       const ap_uint<9> rows = left > BLK ? (ap_uint<9>)BLK : (ap_uint<9>)left;
       const ap_uint<7> nsw = left4 > BLK ? (ap_uint<7>)(BLK / 4) : (ap_uint<7>)(left4 >> 2);
-      // contiguous rows (C pitch = 2 L): the block is one burst; otherwise one burst per row (pad words of
-      // the pitch are never written)
-      const ap_uint<9> nb = p.c_contig ? (ap_uint<9>)1 : rows;
+      const ap_uint<9> nb = p.c_contig ? (ap_uint<9>)1 : rows;  // data bursts; burst nb = the scales
       const ap_uint<14> nw = p.c_contig ? (ap_uint<14>)(rows * p.W2) : (ap_uint<14>)p.W2;
       const ap_uint<28> step = p.c_contig ? (ap_uint<28>)((ap_uint<28>)p.W2 << 8) : p.cp;
     bursts_w:
-      for (ap_uint<9> j = 0; j < nb; j++) {
-#pragma HLS LOOP_TRIPCOUNT max = 1
-      data_w:
-        for (ap_uint<14> i = 0; i < nw; i++) {
+      for (ap_uint<9> j = 0; j <= nb; j++) {
+#pragma HLS LOOP_TRIPCOUNT max = 2
+        const bool sc = j == nb;
+        const WAddr base = sc ? rf : rc;
+        const ap_uint<14> len = sc ? (ap_uint<14>)nsw : nw;
+      words_w:
+        for (ap_uint<14> i = 0; i < len; i++) {
 #pragma HLS PIPELINE II = 1
+#pragma HLS LOOP_FLATTEN off
 #pragma HLS LOOP_TRIPCOUNT max = 8192
-          ym[rc + i] = eq.read();
+          ym[base + i] = sc ? rq.read() : eq.read();
         }
-        rc += step;
-      }
-    scales_w:
-      for (ap_uint<7> k = 0; k < nsw; k++) {
-#pragma HLS PIPELINE II = 4
-#pragma HLS LOOP_TRIPCOUNT max = 64
-        Word o;
-        for (int l = 0; l < 4; l++) o.range(32 * l + 31, 32 * l) = rq.read();
-        ym[rf + k] = o;
+        if (!sc) rc += step;
       }
       rf += BLK / 4;
     }
@@ -543,7 +558,7 @@ static void softmax_df(const Word* xm, Word* ym, const Params p) {
 #pragma HLS BIND_STORAGE variable = eq type = fifo impl = srl
 #pragma HLS STREAM variable = sq depth = SQ_DEPTH
 #pragma HLS STREAM variable = rq depth = RQ_DEPTH
-#pragma HLS BIND_STORAGE variable = rq type = fifo impl = bram
+#pragma HLS BIND_STORAGE variable = rq type = fifo impl = lutram
 #if defined(SMX_DFSIM) && !defined(__SYNTHESIS__)
   std::thread t0([&] { reader(xm, xs, mx, p); });
   std::thread t1([&] { compute(xs, mx, eq, sq, p); });
@@ -561,16 +576,11 @@ static void softmax_df(const Word* xm, Word* ym, const Params p) {
 #endif
 }
 
-// The mode function (one call site in the dispatch switch). Returns ME_OK, or ME_DIMS without touching memory.
+// The mode function: one call site in the sequencer's dispatch switch, after ctr::decode and ctr::validate_hw
+// returned ME_OK (the precondition: K in {8, 16, .., 256}, 1 <= N, B <= 65535, N <= NP <= 65535, F_QOUT; every
+// counter of the unit is sized from these limits, CONTRACT.md 3.4). Returns ME_OK.
 static uint32_t softmax_mode(const ctr::Cmd& c, const Word* xmem, Word* ymem) {
 #pragma HLS INLINE off
-  // validate_hw has checked all of this; the guard only keeps a call that bypassed it from hanging the unit:
-  // K in {8, 16, .., 256}, 1 <= N <= 65535, B <= 65535 (decode makes B >= 1), N <= NP <= 65535
-  const ap_uint<32> K = c.K, N = c.N, B = c.B, P5 = c.p[ctr::P_NP];
-  const bool k_bad = K.range(2, 0) != 0 || K.range(31, 9) != 0 || K.range(8, 3) == 0 || (K[8] && K.range(7, 3) != 0);
-  const bool n_bad = N.range(31, 16) != 0 || N.range(15, 0) == 0 || B.range(31, 16) != 0 || B.range(15, 0) == 0;
-  const bool np_bad = P5 != 0 && (P5.range(31, 16) != 0 || P5.range(15, 0) < N.range(15, 0));
-  if (k_bad || n_bad || np_bad) return ctr::ME_DIMS;
   Params p;
   make_params(c, p);
   softmax_df(xmem, ymem, p);

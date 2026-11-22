@@ -4,7 +4,8 @@ Real cases are captured from -12392's frame 0 (apply_rope inputs: prefix layer 0
 expert step 0 layer 0 self-attention Q and K at positions 45..94, expert step 0 layer 1 cross-attention Q
 at 0..49). Synthetic cases stress the edges: wide exponent spread inside a group, zeros, -0, denormals,
 all-zero and tiny segments, large positions, T not a multiple of 4 or 8, H = 64, all-equal rows, results
-at the 2^-126 flush boundary (random and crafted), FP32 overflow.
+at the 2^-126 flush boundary (random and crafted), scales that are exact powers of two (the divider's clamp
+path), FP32 overflow.
 Per case directory (natural order, one row = H heads of 64 values):
   meta.txt  "T H F32ONLY"     F32ONLY = 1: infinite results, so only the FP32 output is defined
   x.bin     T*H*64 float32 [t][h*64]      tab.bin  T*64 int32 (table rows NC | NS, rope_emu.table_rows)
@@ -15,7 +16,7 @@ The testbench places these in every layout of the contract (FP32 rows, int16 seg
 tiling) and derives the expected bytes with contract.h's own helpers and ctr::ref::quant_row (it re-checks
 q.bin / s.bin against that).
 
-    C:\kp\lerobot-venv\Scripts\python.exe fpga\kernels\rope\gen_vectors.py [out_dir]
+    C:\\kp\\lerobot-venv\\Scripts\\python.exe fpga\\kernels\\rope\\gen_vectors.py [out_dir]
 """
 
 from __future__ import annotations
@@ -163,6 +164,24 @@ def crafted_boundary():
     return x.view(torch.float32).clone(), pos
 
 
+def pow2_scale(seed: int, T: int, H: int):
+    """Position 0 everywhere: the table is NC = -2^17, NS = 0, so each group's largest value passes the
+    rotation exactly (smaller lanes lose the bits below the group alignment). Each segment's absmax is
+    32767 * 2^k (k = -20..20), so s = fl32(absmax / 32767) = 2^k: the divider's
+    S = 2^23 clamp path (R = 2^26 - 1, quant_int16.h recip_result). Other values are random below the
+    absmax."""
+    g = torch.Generator().manual_seed(seed)
+    x = (torch.rand(T, H, 64, generator=g) * 2 - 1) * 32000.0
+    k = torch.randint(-20, 21, (T, H), generator=g).double()
+    x = (x.double() * torch.pow(2.0, k)[..., None]).float()
+    idx = torch.randint(0, 64, (T, H), generator=g)
+    sgn = torch.where(torch.rand(T, H, generator=g) < 0.5, -1.0, 1.0)
+    for t in range(T):
+        for h in range(H):
+            x[t, h, idx[t, h]] = float(sgn[t, h] * 32767.0 * 2.0 ** float(k[t, h]))
+    return x, torch.zeros(T, dtype=torch.int64)
+
+
 def huge(seed: int, T: int, H: int):
     g = torch.Generator().manual_seed(seed)
     x = (torch.rand(T, H, 64, generator=g) * 0.4 + 0.8) * 3.0e38
@@ -185,6 +204,7 @@ def main():
         "equal_9x3": all_equal(9, 3),
         "boundary_64x2": boundary(7, 64, 2),
         "boundary_crafted_40x2": crafted_boundary(),
+        "pow2_scale_12x3": pow2_scale(10, 12, 3),
         "huge_5x2": huge(8, 5, 2),
     }.items():
         write_case(out / name, x, pos)

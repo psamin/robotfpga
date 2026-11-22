@@ -4,7 +4,7 @@
 //   cd fpga/kernels/sequencer && vitis_hls -f run_seq_hls.tcl        (SEQ_VARIANT, SEQ_PERIOD: see the tcl)
 // SEQ_VARIANT:
 //   default: walk + cycle counter (DATAFLOW region) + 3 null units; -DSEQ_NO_UNITS: no units (the sequencer alone)
-//   (variants: run_seq_hls.tcl flags SEQ_UNITS, SEQ_CYCLES, SEQ_UNROLLED, SEQ_CHECK_INLINE)
+//   (variants: run_seq_hls.tcl flags SEQ_UNITS, SEQ_CYCLES, SEQ_UNROLLED)
 // A null unit reads one word from each port its real unit reads, XORs every field its real unit consumes and
 // writes one io word: enough that HLS keeps every decoded field and the port muxing, and cheap enough to subtract
 // (its instance is reported on its own in csynth.rpt).
@@ -13,7 +13,8 @@
 #ifndef __SYNTHESIS__
 namespace seq {
 uint64_t g_host_cycles = 0;
-}
+uint64_t g_decode_checked = 0, g_decode_mismatch = 0;
+}  // namespace seq
 #endif
 
 #ifdef __VITIS_HLS__

@@ -5,8 +5,9 @@
 # Two builds of the same HLS source (softmax_top.cpp + softmax_core.h):
 #   tb_softmax.exe        DATAFLOW processes one after the other on unbounded FIFOs (the HLS csim semantics)
 #   tb_softmax_dfsim.exe  the processes as threads on FIFOs bounded at the pragma depths (deadlock model)
-# plus the prologue's integer c = fl32(p0 * log2 e) against the host FPU (--cparams) and the divider on every
-# possible row sum against the host's 1.0f / S (--divider).
+# plus the prologue's integer c = fl32(p0 * log2 e) against the host FPU (--cparams), the divider on every
+# possible row sum against the host's 1.0f / S (--divider), and a negative control of the deadlock model: with
+# the row FIFO cut to 8 words (below one row of L = 256) it must report the deadlock (exit code 7).
 set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PY="${PY:-/c/kp/lerobot-venv/Scripts/python.exe}"
@@ -28,3 +29,9 @@ $CXX -DSMX_DFSIM -I"$HERE/tb_dfsim" -I"$INC" -o "$B/tb_softmax_dfsim.exe" "$HERE
 "$B/tb_softmax.exe" --divider
 "$B/tb_softmax.exe" "$B"/cases/*
 "$B/tb_softmax_dfsim.exe" "$B"/cases/*
+$CXX -DSMX_DFSIM -DSMX_XS_DEPTH=8 -DSMX_DFSIM_TIMEOUT=5 -I"$HERE/tb_dfsim" -I"$INC" -o "$B/tb_softmax_neg_xs.exe" "$HERE/tb_softmax.cpp" -pthread
+set +e
+"$B/tb_softmax_neg_xs.exe" "$B/cases/real_vision"
+rc=$?
+set -e
+if [ $rc -eq 7 ]; then echo "negative control (row FIFO 8 words, L = 256): deadlock detected as required: PASS"; else echo "negative control: expected deadlock exit 7, got $rc: FAIL"; exit 1; fi

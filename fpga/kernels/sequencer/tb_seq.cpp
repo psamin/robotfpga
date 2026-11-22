@@ -1,8 +1,8 @@
 // Host testbench of the float_top sequencer, contract 1.0 (seq_core.h + seq_top.cpp's top with host units).
 //
 //   export PATH="/c/Xilinx/Vitis_HLS/2022.2/tps/win64/msys64/mingw64/bin:/c/Xilinx/Vitis_HLS/2022.2/tps/win64/msys64/usr/bin:/c/Windows/System32:/c/Windows"
-//   g++ -std=c++14 -O2 -ffp-contract=off -Wall -Wno-unknown-pragmas -static -o build/tb_seq.exe tb_seq.cpp
-//   build/tb_seq.exe [--twin DIR] [CHUNK.bin TRACE.txt BASE_HEX ...]
+//   g++ -std=c++14 -O2 -ffp-contract=off -D__USE_MINGW_ANSI_STDIO=1 -Wall -Wno-unknown-pragmas -Wno-unused-label //       -static -o build/tb_seq.exe tb_seq.cpp
+//   build/tb_seq.exe [--twin DIR] [CHUNK.bin TRACE.txt BASE_HEX ...]        (all of it: sh run_tests.sh)
 //
 // 1. Walk, every path, at memory base 0 and at 0x8_0000_0000 (64-bit word indices; status and list above 4 GB):
 //    END, YIELD + resume, STEP, LIMIT (index 0x7FFFFF), NO_LEGACY (nothing read or written), BAD_MAGIC (incl. a
@@ -12,12 +12,19 @@
 // 2. Dispatch: one record of every opcode goes to its unit exactly once, in list order, with every decoded field.
 // 3. Data: QUANT_X -> GEMM (row groups, items, bias, D, ACC) -> COPY through host units written from the contract
 //    (ctr::ref::quant_row, ctr::ref::gemm_out), compared with a direct computation, at both bases.
-// 4. The -12392 chunk lists (CHUNK.bin from contract_plan.py, TRACE.txt = the Python decode of the same bytes):
+// 4. The -12392 chunk lists (CHUNK.bin from make_chunk.py, TRACE.txt = the Python decode of the same bytes):
 //    one start (dry units) must reach END at the last index with every command dispatched, and every dispatched
 //    command must print the line of TRACE.txt; then the same list in step mode (one start per command) and with
 //    F_YIELD set on every 97th record (resealed) must dispatch the identical sequence.
+// 5. decode_hw (the sequencer's hardware decode) against ctr::decode on 400,000 records: valid records of every
+//    opcode with random fields, then 1-3 random bit flips in random fields, resealed or not, plus unknown and retired
+//    opcodes and stale versions. Every record that any walk above fetches is also checked against ctr::decode
+//    inside seq_core.h (g_decode_checked / g_decode_mismatch).
 // --twin DIR writes every start of 1 and 3 (memory written before it, registers, result, dispatch trace, output
 // bytes) for check_twin.py, which replays them through exec_ref.py's walk and units.
+#if defined(__MINGW32__) && !defined(__USE_MINGW_ANSI_STDIO)
+#define __USE_MINGW_ANSI_STDIO 1  // %llu / %llx in printf (MinGW's default msvcrt printf does not know them)
+#endif
 #include "seq_top.cpp"
 
 #include <cmath>
@@ -756,6 +763,61 @@ static void test_chunk(const std::string& bin, const std::string& trace, uint64_
          g_fail == f0 ? "ok" : "FAILED");
 }
 
+// ---------------------------------------------------------------- 5. decode_hw == ctr::decode
+static void test_decode(std::mt19937& rng) {
+  const int f0 = g_fail;
+  const uint32_t ops[] = {OP_NOP, OP_END, OP_GEMM, OP_QUANT_X, OP_QUANT_W, OP_QUANT_WT, OP_NORM, OP_SOFTMAX,
+                          OP_GELU, OP_SILU_MUL, OP_ROPE, OP_COPY, 0x71, 0x80, 0x02, 0xFF};
+  std::uniform_int_distribution<uint32_t> u32;
+  std::map<uint32_t, uint64_t> by_status;
+  uint64_t bad = 0;
+  const uint64_t n0 = seq::g_decode_mismatch;
+  for (int it = 0; it < 400000; it++) {
+    Cmd c;
+    memset(&c, 0, sizeof c);
+    c.op = ops[u32(rng) % 16];
+    c.flags = u32(rng) & 0xFFFF;
+    c.tag = u32(rng);
+    c.M = u32(rng) >> (u32(rng) % 32);
+    c.K = u32(rng) >> (u32(rng) % 32);
+    c.N = u32(rng) >> (u32(rng) % 32);
+    c.B = (it % 7 == 0) ? 0 : u32(rng) >> (u32(rng) % 32);  // 0 decodes as 1
+    for (uint32_t s = 0; s < NSLOTS; s++)
+      c.s[s] = {((uint64_t)u32(rng) << 32 | u32(rng)) >> (u32(rng) % 64), u32(rng), u32(rng)};
+    for (uint32_t i = 0; i < NPARAMS; i++) c.p[i] = u32(rng) >> (u32(rng) % 32);
+    uint32_t f[REC_FIELDS];
+    encode(c, f);
+    const uint32_t kind = it % 4;  // 0: as encoded, 1: flips not resealed, 2: flips resealed, 3: version / magic
+    if (kind == 1 || kind == 2) {
+      const int nflip = 1 + (int)(u32(rng) % 3);
+      for (int k = 0; k < nflip; k++) f[u32(rng) % REC_FIELDS] ^= 1u << (u32(rng) % 32);
+      if (kind == 2) f[CHECK_FIELD] = rec_check(f);
+    } else if (kind == 3) {
+      if (u32(rng) & 1)
+        f[FLD_VERSION] = u32(rng) & 1 ? 0x00000900u : CONTRACT_VERSION + 1;
+      else
+        f[FLD_OP] = (f[FLD_OP] & 0xFFFF00FFu) | ((u32(rng) & 1 ? 0xC5u : u32(rng) & 0xFF) << 8);
+      f[CHECK_FIELD] = rec_check(f);
+    }
+    seq::Word rec[REC_WORDS];
+    uint32_t xsum = 0;
+    for (uint32_t w = 0; w < REC_WORDS; w++) {
+      for (int j = 0; j < 4; j++) seq::wset(rec[w], j, f[4 * w + j]);
+      xsum ^= f[4 * w] ^ f[4 * w + 1] ^ f[4 * w + 2] ^ f[4 * w + 3];
+    }
+    Cmd hw;
+    memset(&hw, 0xA5, sizeof hw);
+    const uint32_t st = seq::decode_hw(rec, xsum, hw);
+    by_status[st]++;
+    if (!seq::decode_matches(rec, st, hw) && bad++ < 3) printf("  decode mismatch at record %d\n", it);
+  }
+  CHECK(bad == 0, "decode_hw: %llu of 400000 records differ from ctr::decode", (unsigned long long)bad);
+  CHECK(seq::g_decode_mismatch == n0, "decode_hw mismatches inside the walks");
+  printf("decode: 400000 records, decode_hw == ctr::decode (status and every field):");
+  for (const auto& kv : by_status) printf(" st 0x%02x x %llu", kv.first, (unsigned long long)kv.second);
+  printf(" -> %s\n", g_fail == f0 ? "identical" : "FAILED");
+}
+
 int main(int argc, char** argv) {
   std::vector<std::string> chunks;  // triples: bin, trace, base
   std::string twin;
@@ -803,6 +865,11 @@ int main(int argc, char** argv) {
     std::fill(g_mem.begin(), g_mem.end(), seq::Word{{0, 0, 0, 0}});
     test_chunk(chunks[i], chunks[i + 1], base);
   }
+  test_decode(rng);
+  CHECK(seq::g_decode_mismatch == 0 && seq::g_decode_checked > 0, "decode_hw vs ctr::decode in the walks: %llu of %llu",
+        (unsigned long long)seq::g_decode_mismatch, (unsigned long long)seq::g_decode_checked);
+  printf("walks: %llu fetched records decoded by decode_hw and by ctr::decode, %llu differ\n",
+         (unsigned long long)seq::g_decode_checked, (unsigned long long)seq::g_decode_mismatch);
   printf("%s (%d checks, %d failures)\n", g_fail ? "FAILED" : "PASSED", g_checks, g_fail);
   return g_fail ? 1 : 0;
 }

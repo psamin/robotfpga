@@ -5,7 +5,7 @@
 here=$(cd "$(dirname "$0")" && pwd)
 export PATH="/c/Xilinx/Vitis_HLS/2022.2/tps/win64/msys64/mingw64/bin:/c/Xilinx/Vitis_HLS/2022.2/tps/win64/msys64/usr/bin:/c/Windows/System32:/c/Windows"
 cd "$here" || exit 1
-/c/kp/lerobot-venv/Scripts/python.exe "$here/hls_contract_unroll.py" "$here/build/contract_unrolled/contract.h" --inline-decode > /dev/null
+/c/kp/lerobot-venv/Scripts/python.exe "$here/hls_contract_unroll.py" "$here/build/contract_unrolled/contract.h" > /dev/null
 list=${1:-"1:1:0:4.0 0:1:0:4.0 1:0:0:4.0 1:1:1:4.0 0:1:1:4.0 1:1:0:3.333"}
 for v in $list; do
   u=${v%%:*}; r=${v#*:}; c=${r%%:*}; r=${r#*:}; n=${r%%:*}; p=${r#*:}

@@ -1,6 +1,7 @@
-"""The contract's -12392 chunk list (fpga/kernels/contract_plan.py build()) at a given CMA base, for tb_seq.cpp:
-<out>.bin (the records) and <out>.trace.txt (exec_ref.trace_line of every record a start dispatches, from
-contract.decode in Python). Also checks contract.validate on every record and prints the list's shape.
+"""The contract's -12392 chunk list (fpga/kernels/contract_plan.py build(), via build_smolvla.chunk_plan) at a
+given CMA base, for tb_seq.cpp: <out>.bin (the records) and <out>.trace.txt (exec_ref.trace_line of every
+record a start dispatches, from contract.decode in Python). Also checks contract.validate on every record and
+prints the list's shape.
 
     python make_chunk.py --base 0x800000000 --out build/chunk/chunk_hi
 """
@@ -14,7 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import contract as K  # noqa: E402
-import contract_plan  # noqa: E402
+from build_smolvla import chunk_plan  # noqa: E402
 from contract import C  # noqa: E402
 from exec_ref import U_NONE, trace_line, unit_of  # noqa: E402
 
@@ -23,8 +24,11 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", type=lambda s: int(s, 0), default=0x8_0000_0000)
     ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument(
+        "--no-plan-fix", action="store_true", help="contract_plan.build as is (build_smolvla.chunk_plan)"
+    )
     a = ap.parse_args()
-    P = contract_plan.build(a.base)
+    P = chunk_plan(a.base, not a.no_plan_fix)
     bad = K.validate_list(P.cmds)
     blob = K.encode_list(P.cmds)
     a.out.parent.mkdir(parents=True, exist_ok=True)

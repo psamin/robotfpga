@@ -29,8 +29,8 @@ using namespace qz;
 #ifdef QZ_DFSIM
 int qz_dfsim_depth(const std::string& n) {
   static const std::map<std::string, int> d = {
-      {"qz_xs", QZ_D_XS}, {"qz_am", QZ_D_AM}, {"qz_d", QZ_D_D},   {"qz_sf", QZ_D_SF}, {"qz_ow", QZ_D_OW},
-      {"qz_sq", QZ_D_SQ}, {"qz_sh", QZ_D_SH}, {"qz_sd", QZ_D_SD}, {"qz_hd", QZ_D_HD}, {"qz_dd", QZ_D_DD}};
+      {"qz_xs", QZ_D_XS}, {"qz_am", QZ_D_AM}, {"qz_d", QZ_D_D},   {"qz_ss", QZ_D_SS}, {"qz_sf", QZ_D_SF},
+      {"qz_ow", QZ_D_OW}, {"qz_sq", QZ_D_SQ}, {"qz_hd", QZ_D_HD}, {"qz_dd", QZ_D_DD}};
   auto it = d.find(n);
   if (it == d.end()) {
     printf("dfsim: stream %s has no depth\n", n.c_str());

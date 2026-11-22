@@ -3,7 +3,7 @@
 // natural lerobot order: x1 = values 0..31, x2 = 32..63 of a segment) and emits the rotated FP32 values, 4 per clock,
 // in natural order, plus each segment's absmax (as magnitude bits) for the shared contract quantizer.
 //
-//   rot_stage   xs (16 FP32 words per segment) + cs (16 table words per table row) -> rs (16 rotated groups)
+//   rot_stage   xs (16 FP32 words per segment) + cs (its 16-word table row) -> rs (16 rotated groups)
 //   emit_stage  rs -> fw (16 FP32 words per segment, natural order) + am (segment absmax, when quantizing)
 //
 // The FP32 values are, bit for bit, rope_emu.to_f32 (CONTRACT.md 2.2); everything after them (int16 + scales by
@@ -21,10 +21,10 @@
 //   NaN / Inf inputs are undefined (they give some finite or infinite value; control flow never depends on data).
 // Data movement: one 128-bit input word per cycle. A segment arrives as 16 words; it is held in a ping-pong
 // LUT-RAM (x1 half, x2 half) and rotated during the next segment's arrival, one group per cycle (group k needs
-// x1 word k/2 and x2 word 8 + k/2); a table row (16 words, same halves) is loaded with the first of every
-// `trep` segments and reused for them (trep = H: one table row per token; 1: one per segment). The rotated groups
-// go to a second ping-pong (even / odd groups) from which the natural output order is read: output word c =
-// (lanes of groups 2j, 2j+1), j = c % 8, lanes 0,1 (y1) for c < 8, lanes 2,3 (y2) for c >= 8. II = 1 everywhere.
+// x1 word k/2 and x2 word 8 + k/2); the segment's table row (16 words, same halves) is loaded with it. The
+// rotated groups go to a second ping-pong (even / odd groups) from which the natural output order is read:
+// output word c = (lanes of groups 2j, 2j+1), j = c % 8, lanes 0,1 (y1) for c < 8, lanes 2,3 (y2) for c >= 8.
+// II = 1 everywhere.
 //
 // Counters are sized from the contract limits (validate_hw): segments per command B * NP * H < 2^38.
 #pragma once
@@ -121,11 +121,11 @@ static inline ap_uint<32> to_f32(ap_uint<1> sg, ap_uint<26> n, ap_uint<10> mg) {
 }
 
 // ------------------------------------------------------------------------------------- stream processes
-// rows segments, in the order the readers send them. xs: 16 words per segment; cs: 16 words per table row
-// (int32 slots: NC[0..31] in words 0..7, NS[0..31] in words 8..15; only bits [17:0] are used), one table row with
-// the first of every trep segments (trep in 1..64); rs: 16 groups per segment.
-static void rot_stage(hls::stream<Word>& xs, hls::stream<Word>& cs, hls::stream<Rot>& rs, rcount_t rows,
-                      ap_uint<7> trep) {
+// rows segments, in the order the reader sends them. xs: 16 words per segment; cs: the segment's table row, 16
+// words (int32 slots: NC[0..31] in words 0..7, NS[0..31] in words 8..15; only bits [17:0] are used), sent with
+// every segment (the table read costs hp bandwidth only, and one table slot per x slot keeps the control trivial);
+// rs: 16 groups per segment.
+static void rot_stage(hls::stream<Word>& xs, hls::stream<Word>& cs, hls::stream<Rot>& rs, rcount_t rows) {
   Word x1b[2 * HALF], x2b[2 * HALF];
   Tab c1b[2 * HALF], c2b[2 * HALF];
 #pragma HLS BIND_STORAGE variable = x1b type = ram_s2p impl = lutram
@@ -137,35 +137,35 @@ static void rot_stage(hls::stream<Word>& xs, hls::stream<Word>& cs, hls::stream<
 #pragma HLS DEPENDENCE variable = c1b inter false
 #pragma HLS DEPENDENCE variable = c2b inter false
   ap_uint<4> w = 0;
-  ap_uint<1> xsl = 0;           // x slot being loaded (the other one is rotated)
-  ap_uint<1> tsl = 0, tpr = 0;  // table slot of the segment being loaded / rotated
-  ap_uint<7> h = 0;             // segment index within its table row's trep segments
-  rcount_t r = 0;               // segment being loaded; r - 1 is rotated
+  ap_uint<1> sl = 0;  // slot being loaded (the other one is rotated)
+  rcount_t r = 0;     // segment being loaded; r - 1 is rotated
   bool more = rows != 0;
 rot:
   for (;;) {
 #pragma HLS PIPELINE II = 1
 #pragma HLS LOOP_TRIPCOUNT min = 32 max = 20000
     const ap_uint<3> wl = w.range(2, 0);
-    if (more) {  // load word w of segment r (and of its table row when h == 0)
+    if (more) {  // load word w of segment r and of its table row
       const Word x = xs.read();
-      if (w[3]) x2b[xsl * HALF + wl] = x;
-      else x1b[xsl * HALF + wl] = x;
-      if (h == 0) {
-        const Word c = cs.read();
-        Tab t;
-        for (int j = 0; j < 4; j++) {
+      const Word c = cs.read();
+      Tab t;
+      for (int j = 0; j < 4; j++) {
 #pragma HLS UNROLL
-          t.range(18 * j + 17, 18 * j) = c.range(32 * j + 17, 32 * j);
-        }
-        if (w[3]) c2b[tsl * HALF + wl] = t;
-        else c1b[tsl * HALF + wl] = t;
+        t.range(18 * j + 17, 18 * j) = c.range(32 * j + 17, 32 * j);
+      }
+      if (w[3]) {
+        x2b[sl * HALF + wl] = x;
+        c2b[sl * HALF + wl] = t;
+      } else {
+        x1b[sl * HALF + wl] = x;
+        c1b[sl * HALF + wl] = t;
       }
     }
     if (r != 0) {  // rotate group k = w of segment r - 1
       const ap_uint<3> j = w.range(3, 1);
-      const Word X1 = x1b[(xsl ^ 1) * HALF + j], X2 = x2b[(xsl ^ 1) * HALF + j];
-      const Tab C1 = c1b[tpr * HALF + j], C2 = c2b[tpr * HALF + j];
+      const ap_uint<4> a = (ap_uint<4>)((sl ^ 1) * HALF) + j;
+      const Word X1 = x1b[a], X2 = x2b[a];
+      const Tab C1 = c1b[a], C2 = c2b[a];
       const bool hi = w[0];
       ap_uint<32> xg[4];
       xg[0] = hi ? lane(X1, 2) : lane(X1, 0);
@@ -178,14 +178,7 @@ rot:
     }
     if (w == WORDS - 1) {
       if (!more) break;  // the last segment has been rotated
-      xsl = ~xsl;
-      tpr = tsl;
-      if (h == trep - 1) {
-        h = 0;
-        tsl = ~tsl;
-      } else {
-        h++;
-      }
+      sl = ~sl;
       r++;
       more = r != rows;
     }

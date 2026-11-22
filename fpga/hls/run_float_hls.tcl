@@ -7,6 +7,8 @@
 #   FSTREAM_TAG=v4 ...                              # project name suffix (keeps older exports)
 #   FSTREAM_IP_MUL=maxdsp|fulldsp|meddsp ...        # FP32 multiplier core implementation (default maxdsp)
 #   FSTREAM_BF16_MUL=1 ...                          # one-DSP exact multiplier instead of the core
+#   FSTREAM_ARITH=16 FSTREAM_NBX=2 ...              # the int16 engine (int16_linear.h), NBX token blocks per tile
+#                                                   (project float_hls_i16_nbx<NBX>[_TAG]; FSTREAM_TP is unused)
 # Target 300 MHz; the four weight bundles go to S_AXI_HP0..HP3_FPD in the block design.
 set here [file dirname [file normalize [info script]]]
 set case [file normalize "$here/../../build/stream/float/case_2560x960x50"]
@@ -15,6 +17,13 @@ set proj float_hls
 if {[info exists ::env(FSTREAM_TP)]} {
     append cflags " -DFSTREAM_TP=$::env(FSTREAM_TP)"
     set proj float_hls_tp$::env(FSTREAM_TP)
+}
+if {[info exists ::env(FSTREAM_ARITH)] && $::env(FSTREAM_ARITH) eq "16"} {
+    set nbx 2
+    if {[info exists ::env(FSTREAM_NBX)]} { set nbx $::env(FSTREAM_NBX) }
+    append cflags " -DFSTREAM_ARITH=16 -DFSTREAM_NBX=$nbx"
+    set proj float_hls_i16_nbx$nbx
+    set case [file normalize "$here/../../build/stream/int16/case_2560x960x50"]
 }
 if {[info exists ::env(FSTREAM_TAG)]} {
     append proj "_$::env(FSTREAM_TAG)"  ;# e.g. FSTREAM_TAG=v4: project build/float_hls_tp8_v4
@@ -38,6 +47,7 @@ set_top float_top
 add_files "$here/float_top.cpp" -cflags $cflags
 add_files -tb "$here/tb_float.cpp" -cflags $cflags
 add_files -tb "$here/float_shim.cpp" -cflags $cflags
+if {[string match "*FSTREAM_ARITH=16*" $cflags]} { add_files -tb "$here/tb_int16_units.cpp" -cflags $cflags }
 
 open_solution -reset sol1 -flow_target vivado
 set_part xck26-sfvc784-2LV-c

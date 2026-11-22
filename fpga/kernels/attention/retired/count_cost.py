@@ -49,8 +49,9 @@ def engine_head(M, K, N):
     w = nt * g * K
     x0 = min(nb, 2) * K * 4 + 16
     model = max(g * nb * max(K, 64), y, x, w) + x0 + HEAD_OVH
-    return dict(mac_cycles=mac, model_cycles=model, y_words=y, x_words=x, w_words=4 * w,
-                padded_macs=g * nb * K * MACS)
+    return dict(
+        mac_cycles=mac, model_cycles=model, y_words=y, x_words=x, w_words=4 * w, padded_macs=g * nb * K * MACS
+    )
 
 
 def attention_instance(H, Hkv, Tq, Tk, images=1):
@@ -63,7 +64,9 @@ def attention_instance(H, Hkv, Tq, Tk, images=1):
     r["useful_macs"] = 2 * images * H * Tq * Tk * 64
     r["head_iters"] = 2 * iters
     r["softmax_elems"] = images * H * Tq * Tk
-    r["shapes"] = dict(qk=dict(M=pad(Tk, 32), K=64, N=G * Tq, H=iters), pv=dict(M=64, K=Tk, N=G * Tq, H=iters))
+    r["shapes"] = dict(
+        qk=dict(M=pad(Tk, 32), K=64, N=G * Tq, H=iters), pv=dict(M=64, K=Tk, N=G * Tq, H=iters)
+    )
     return r
 
 
@@ -76,7 +79,9 @@ def pack_cycles(H, Hkv, Tq, Tk, images=1, kv=True, q_and_o=True):
         c += images * (2 * pad(Tq, 32) * H * 16 + pad(Tq, 32) + 64 + DESC_OVH)  # OX
     if kv:
         c += images * (Hkv * (pad(Tk, 32) * 16 * 520 // 512 + 64) + DESC_OVH)  # KW
-        c += images * (Hkv * (2 * Tk * 16 + 64 * 14 + 64) + DESC_OVH)  # VW: the 64 channel scales first, 14 clk each
+        c += images * (
+            Hkv * (2 * Tk * 16 + 64 * 14 + 64) + DESC_OVH
+        )  # VW: the 64 channel scales first, 14 clk each
     return c
 
 
@@ -87,8 +92,12 @@ def sites(shapes, compact: bool):
     return {
         "vision": dict(n=LAYERS_V, H=v["H"], Hkv=v["Hkv"], Tq=v["Tq"], Tk=v["Tk"], images=IMAGES),
         "prefix": dict(n=LAYERS_LM, H=p["H"], Hkv=p["Hkv"], Tq=pre, Tk=pre, images=1),
-        "expert_self": dict(n=LAYERS_LM // 2 * STEPS, H=es["H"], Hkv=es["Hkv"], Tq=suf, Tk=pre + suf, images=1),
-        "expert_cross": dict(n=LAYERS_LM // 2 * STEPS, H=ec["H"], Hkv=ec["Hkv"], Tq=ec["Tq"], Tk=pre, images=1),
+        "expert_self": dict(
+            n=LAYERS_LM // 2 * STEPS, H=es["H"], Hkv=es["Hkv"], Tq=suf, Tk=pre + suf, images=1
+        ),
+        "expert_cross": dict(
+            n=LAYERS_LM // 2 * STEPS, H=ec["H"], Hkv=ec["Hkv"], Tq=ec["Tq"], Tk=pre, images=1
+        ),
     }
 
 
@@ -101,15 +110,23 @@ def evaluate(st):
         r["engine_calls"] = 2 * n
         r["softmax_calls"] = n
         if name == "expert_cross":  # K / V depend on the prefix only: packed once per chunk per layer
-            r["pack_cycles"] = n * pack_cycles(s["H"], s["Hkv"], s["Tq"], s["Tk"], kv=False) + \
-                (LAYERS_LM // 2) * pack_cycles(s["H"], s["Hkv"], s["Tq"], s["Tk"], q_and_o=False)
+            r["pack_cycles"] = n * pack_cycles(s["H"], s["Hkv"], s["Tq"], s["Tk"], kv=False) + (
+                LAYERS_LM // 2
+            ) * pack_cycles(s["H"], s["Hkv"], s["Tq"], s["Tk"], q_and_o=False)
             r["pack_calls"] = 2 * n + LAYERS_LM // 2
         else:
             r["pack_cycles"] = n * pack_cycles(s["H"], s["Hkv"], s["Tq"], s["Tk"], s["images"])
             r["pack_calls"] = 2 * n
         r["repeats"] = n
-        r["shape"] = dict(H=s["H"], Hkv=s["Hkv"], G=s["H"] // s["Hkv"], Tq=s["Tq"], Tk=s["Tk"], images=s["images"],
-                          **a["shapes"])
+        r["shape"] = dict(
+            H=s["H"],
+            Hkv=s["Hkv"],
+            G=s["H"] // s["Hkv"],
+            Tq=s["Tq"],
+            Tk=s["Tk"],
+            images=s["images"],
+            **a["shapes"],
+        )
         r["ms_mac"] = r["mac_cycles"] / F * 1e3
         r["ms_model"] = r["model_cycles"] / F * 1e3
         r["ms_pack"] = r["pack_cycles"] / F * 1e3
@@ -129,24 +146,32 @@ def evaluate(st):
 def main():
     res = json.loads((HERE / "results" / "policy_check.json").read_text())
     s0 = res["variants"]["int16"]["frames"][0]["sites"]
-    shapes = {k: dict(**v["shape"], **{kk: v[kk] for kk in ("valid_keys", "valid_queries") if kk in v})
-              for k, v in s0.items()}
+    shapes = {
+        k: dict(**v["shape"], **{kk: v[kk] for kk in ("valid_keys", "valid_queries") if kk in v})
+        for k, v in s0.items()
+    }
     out = {}
     for compact in (False, True):
         rows, tot = evaluate(sites(shapes, compact))
         key = "compacted_prefix" if compact else "as_run"
         out[key] = dict(sites=rows, total=tot)
         print(f"\n== {key} (prefix {'45 valid tokens' if compact else 'all 81 tokens incl. padding'})")
-        print(f"{'site':13s} {'eng':>4s} {'iters':>6s} {'GMAC':>6s} {'ideal':>6s} {'mac ms':>7s} {'model':>7s} "
-              f"{'Y Mw':>6s} {'pack ms':>7s}")
+        print(
+            f"{'site':13s} {'eng':>4s} {'iters':>6s} {'GMAC':>6s} {'ideal':>6s} {'mac ms':>7s} {'model':>7s} "
+            f"{'Y Mw':>6s} {'pack ms':>7s}"
+        )
         for n, r in list(rows.items()) + [("total", tot)]:
-            print(f"{n:13s} {r['engine_calls']:4d} {r['head_iters']:6d} {r['useful_macs'] / 1e9:6.3f} "
-                  f"{r['ms_ideal']:6.2f} {r['ms_mac']:7.2f} {r['ms_model']:7.2f} {r['y_words'] / 1e6:6.2f} "
-                  f"{r['ms_pack']:7.2f}")
-        print(f"calls per chunk: {tot['engine_calls']} engine + {tot['softmax_calls']} softmax + {tot['pack_calls']} "
-              f"pack = {tot['calls']}: {tot['ms_calls_driver_0.1ms']:.1f} ms at 0.1 ms/call, "
-              f"{tot['ms_calls_sequencer_0.02ms']:.1f} ms at 0.02 ms/call; softmax elements "
-              f"{tot['softmax_elems'] / 1e6:.2f} M ({tot['ms_softmax_1word_per_clk']:.1f} ms at 4 per clock)")
+            print(
+                f"{n:13s} {r['engine_calls']:4d} {r['head_iters']:6d} {r['useful_macs'] / 1e9:6.3f} "
+                f"{r['ms_ideal']:6.2f} {r['ms_mac']:7.2f} {r['ms_model']:7.2f} {r['y_words'] / 1e6:6.2f} "
+                f"{r['ms_pack']:7.2f}"
+            )
+        print(
+            f"calls per chunk: {tot['engine_calls']} engine + {tot['softmax_calls']} softmax + {tot['pack_calls']} "
+            f"pack = {tot['calls']}: {tot['ms_calls_driver_0.1ms']:.1f} ms at 0.1 ms/call, "
+            f"{tot['ms_calls_sequencer_0.02ms']:.1f} ms at 0.02 ms/call; softmax elements "
+            f"{tot['softmax_elems'] / 1e6:.2f} M ({tot['ms_softmax_1word_per_clk']:.1f} ms at 4 per clock)"
+        )
     (HERE / "results" / "cost.json").write_text(json.dumps(out, indent=1))
     print(f"\nwrote {HERE / 'results' / 'cost.json'}")
 

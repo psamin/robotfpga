@@ -1,44 +1,269 @@
 {
- "mhz": 250.0,
- "records": {
-  "QUANT_W": 27,
-  "QUANT_WT": 115
+ "ddr_GBps": 14.0,
+ "pre_contract_ms_250": {
+  "engine": 57.2,
+  "engine_review": 61.8,
+  "packer": 72.4,
+  "softmax": 27.8
  },
- "plan_rule_ms": {
-  "QUANT_W": 5.1494729999999995,
-  "QUANT_WT": 13.340879999999999,
-  "total": 18.490353
- },
- "mode_ms": {
-  "L=0": {
-   "QUANT_W": 5.675136,
-   "QUANT_WT": 17.608536,
-   "total": 23.283672000000003
+ "runs": {
+  "250MHz": {
+   "mhz": 250.0,
+   "roles": {
+    "GEMM Q.K^T": {
+     "records": 187,
+     "items": 1163,
+     "ms": 38.33
+    },
+    "SOFTMAX": {
+     "records": 187,
+     "items": 1163,
+     "ms": 34.2
+    },
+    "GEMM P.V": {
+     "records": 279,
+     "items": 1563,
+     "ms": 32.92
+    },
+    "Q (QUANT_X / ROPE, p4 = -3)": {
+     "records": 187,
+     "items": 187,
+     "ms": 13.87
+    },
+    "o_proj input (QUANT_X)": {
+     "records": 187,
+     "items": 187,
+     "ms": 13.69
+    },
+    "V^T blob (QUANT_WT)": {
+     "records": 115,
+     "items": 127,
+     "ms": 13.34
+    },
+    "K blob (QUANT_W / ROPE F_KW)": {
+     "records": 115,
+     "items": 115,
+     "ms": 7.02
+    }
+   },
+   "attention_ms": 153.4,
+   "chunk_F_ms": 724.3,
+   "attention_share": 0.212
   },
-  "L=32": {
-   "QUANT_W": 8.280192,
-   "QUANT_WT": 31.613272,
-   "total": 39.893463999999994
+  "250MHz_E7": {
+   "mhz": 250.0,
+   "roles": {
+    "GEMM Q.K^T": {
+     "records": 187,
+     "items": 1163,
+     "ms": 35.79
+    },
+    "SOFTMAX": {
+     "records": 187,
+     "items": 1163,
+     "ms": 34.2
+    },
+    "GEMM P.V": {
+     "records": 279,
+     "items": 1563,
+     "ms": 29.58
+    },
+    "Q (QUANT_X / ROPE, p4 = -3)": {
+     "records": 187,
+     "items": 187,
+     "ms": 13.87
+    },
+    "o_proj input (QUANT_X)": {
+     "records": 187,
+     "items": 187,
+     "ms": 13.69
+    },
+    "V^T blob (QUANT_WT)": {
+     "records": 115,
+     "items": 127,
+     "ms": 13.34
+    },
+    "K blob (QUANT_W / ROPE F_KW)": {
+     "records": 115,
+     "items": 115,
+     "ms": 7.02
+    }
+   },
+   "attention_ms": 147.5,
+   "chunk_F_ms": 718.5,
+   "attention_share": 0.205
   },
-  "L=64": {
-   "QUANT_W": 10.885247999999999,
-   "QUANT_WT": 45.618007999999996,
-   "total": 56.50325599999999
+  "222MHz": {
+   "mhz": 222.0,
+   "roles": {
+    "GEMM Q.K^T": {
+     "records": 187,
+     "items": 1163,
+     "ms": 43.16
+    },
+    "SOFTMAX": {
+     "records": 187,
+     "items": 1163,
+     "ms": 38.52
+    },
+    "GEMM P.V": {
+     "records": 279,
+     "items": 1563,
+     "ms": 37.07
+    },
+    "Q (QUANT_X / ROPE, p4 = -3)": {
+     "records": 187,
+     "items": 187,
+     "ms": 15.62
+    },
+    "o_proj input (QUANT_X)": {
+     "records": 187,
+     "items": 187,
+     "ms": 15.42
+    },
+    "V^T blob (QUANT_WT)": {
+     "records": 115,
+     "items": 127,
+     "ms": 15.02
+    },
+    "K blob (QUANT_W / ROPE F_KW)": {
+     "records": 115,
+     "items": 115,
+     "ms": 7.9
+    }
+   },
+   "attention_ms": 172.7,
+   "chunk_F_ms": 815.5,
+   "attention_share": 0.212
   },
-  "L=100": {
-   "QUANT_W": 13.815935999999999,
-   "QUANT_WT": 61.373335999999995,
-   "total": 75.18927199999999
-  }
- },
- "bursts": {
-  "QUANT_W": {
-   "read": 20352,
-   "write": 19632
+  "222MHz_E7": {
+   "mhz": 222.0,
+   "roles": {
+    "GEMM Q.K^T": {
+     "records": 187,
+     "items": 1163,
+     "ms": 40.3
+    },
+    "SOFTMAX": {
+     "records": 187,
+     "items": 1163,
+     "ms": 38.52
+    },
+    "GEMM P.V": {
+     "records": 279,
+     "items": 1563,
+     "ms": 33.31
+    },
+    "Q (QUANT_X / ROPE, p4 = -3)": {
+     "records": 187,
+     "items": 187,
+     "ms": 15.62
+    },
+    "o_proj input (QUANT_X)": {
+     "records": 187,
+     "items": 187,
+     "ms": 15.42
+    },
+    "V^T blob (QUANT_WT)": {
+     "records": 115,
+     "items": 127,
+     "ms": 15.02
+    },
+    "K blob (QUANT_W / ROPE F_KW)": {
+     "records": 115,
+     "items": 115,
+     "ms": 7.9
+    }
+   },
+   "attention_ms": 166.1,
+   "chunk_F_ms": 808.9,
+   "attention_share": 0.205
   },
-  "QUANT_WT": {
-   "read": 108609,
-   "write": 54147
+  "200MHz": {
+   "mhz": 200.0,
+   "roles": {
+    "GEMM Q.K^T": {
+     "records": 187,
+     "items": 1163,
+     "ms": 47.91
+    },
+    "SOFTMAX": {
+     "records": 187,
+     "items": 1163,
+     "ms": 42.75
+    },
+    "GEMM P.V": {
+     "records": 279,
+     "items": 1563,
+     "ms": 41.15
+    },
+    "Q (QUANT_X / ROPE, p4 = -3)": {
+     "records": 187,
+     "items": 187,
+     "ms": 17.34
+    },
+    "o_proj input (QUANT_X)": {
+     "records": 187,
+     "items": 187,
+     "ms": 17.11
+    },
+    "V^T blob (QUANT_WT)": {
+     "records": 115,
+     "items": 127,
+     "ms": 16.68
+    },
+    "K blob (QUANT_W / ROPE F_KW)": {
+     "records": 115,
+     "items": 115,
+     "ms": 8.77
+    }
+   },
+   "attention_ms": 191.7,
+   "chunk_F_ms": 905.1,
+   "attention_share": 0.212
+  },
+  "200MHz_E7": {
+   "mhz": 200.0,
+   "roles": {
+    "GEMM Q.K^T": {
+     "records": 187,
+     "items": 1163,
+     "ms": 44.74
+    },
+    "SOFTMAX": {
+     "records": 187,
+     "items": 1163,
+     "ms": 42.75
+    },
+    "GEMM P.V": {
+     "records": 279,
+     "items": 1563,
+     "ms": 36.97
+    },
+    "Q (QUANT_X / ROPE, p4 = -3)": {
+     "records": 187,
+     "items": 187,
+     "ms": 17.34
+    },
+    "o_proj input (QUANT_X)": {
+     "records": 187,
+     "items": 187,
+     "ms": 17.11
+    },
+    "V^T blob (QUANT_WT)": {
+     "records": 115,
+     "items": 127,
+     "ms": 16.68
+    },
+    "K blob (QUANT_W / ROPE F_KW)": {
+     "records": 115,
+     "items": 115,
+     "ms": 8.77
+    }
+   },
+   "attention_ms": 184.4,
+   "chunk_F_ms": 897.8,
+   "attention_share": 0.205
   }
  }
 }

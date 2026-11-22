@@ -14,7 +14,7 @@
      "frame": 0,
      "max_abs_err": 4.708766937255859e-06,
      "mean_abs_err": 2.3702780538314983e-07,
-     "seconds": 1.8,
+     "seconds": 1.2,
      "finite": true,
      "max_abs_err_vs_laptop_orig": 0.0
     },
@@ -22,7 +22,7 @@
      "frame": 3563,
      "max_abs_err": 3.5762786865234375e-07,
      "mean_abs_err": 1.0428329488831878e-07,
-     "seconds": 1.8,
+     "seconds": 1.2,
      "finite": true,
      "max_abs_err_vs_laptop_orig": 0.0
     },
@@ -30,7 +30,7 @@
      "frame": 7489,
      "max_abs_err": 2.980232238769531e-07,
      "mean_abs_err": 8.29497963650283e-08,
-     "seconds": 1.7,
+     "seconds": 1.2,
      "finite": true,
      "max_abs_err_vs_laptop_orig": 0.0
     }
@@ -47,7 +47,7 @@
      "frame": 0,
      "max_abs_err": 3.5762786865234375e-06,
      "mean_abs_err": 2.455214769270242e-07,
-     "seconds": 1.7,
+     "seconds": 1.3,
      "finite": true,
      "max_abs_err_vs_laptop_orig": 1.1324882507324219e-06,
      "sites": {
@@ -107,7 +107,7 @@
      "frame": 3563,
      "max_abs_err": 3.5762786865234375e-07,
      "mean_abs_err": 1.0373691594622869e-07,
-     "seconds": 1.4,
+     "seconds": 1.2,
      "finite": true,
      "max_abs_err_vs_laptop_orig": 1.7881393432617188e-07,
      "sites": {
@@ -167,7 +167,7 @@
      "frame": 7489,
      "max_abs_err": 4.172325134277344e-07,
      "mean_abs_err": 8.965532316551617e-08,
-     "seconds": 1.2,
+     "seconds": 1.1,
      "finite": true,
      "max_abs_err_vs_laptop_orig": 1.7881393432617188e-07,
      "sites": {
@@ -235,7 +235,7 @@
      "frame": 0,
      "max_abs_err": 4.8100948333740234e-05,
      "mean_abs_err": 6.545831638504751e-06,
-     "seconds": 2.9,
+     "seconds": 2.4,
      "finite": true,
      "max_abs_err_vs_laptop_orig": 4.744529724121094e-05,
      "sites": {
@@ -379,7 +379,7 @@
      "frame": 7489,
      "max_abs_err": 4.38690185546875e-05,
      "mean_abs_err": 8.677343430463225e-06,
-     "seconds": 2.5,
+     "seconds": 2.6,
      "finite": true,
      "max_abs_err_vs_laptop_orig": 4.374980926513672e-05,
      "sites": {
@@ -462,7 +462,7 @@
      "frame": 0,
      "max_abs_err": 0.00012940168380737305,
      "mean_abs_err": 8.025442184589338e-06,
-     "seconds": 1.6,
+     "seconds": 1.4,
      "finite": true,
      "max_abs_err_vs_laptop_orig": 0.0001246929168701172,
      "sites": {
@@ -525,7 +525,7 @@
      "frame": 3563,
      "max_abs_err": 1.609325408935547e-05,
      "mean_abs_err": 5.8708092183223926e-06,
-     "seconds": 1.5,
+     "seconds": 1.4,
      "finite": true,
      "max_abs_err_vs_laptop_orig": 1.621246337890625e-05,
      "sites": {
@@ -588,7 +588,7 @@
      "frame": 7489,
      "max_abs_err": 1.8358230590820312e-05,
      "mean_abs_err": 5.231797786109382e-06,
-     "seconds": 1.5,
+     "seconds": 1.4,
      "finite": true,
      "max_abs_err_vs_laptop_orig": 1.8417835235595703e-05,
      "sites": {
@@ -662,7 +662,7 @@
      "frame": 0,
      "max_abs_err": 0.00011354684829711914,
      "mean_abs_err": 9.112681254919153e-06,
-     "seconds": 1.2,
+     "seconds": 1.0,
      "finite": true,
      "max_abs_err_vs_laptop_orig": 0.00010883808135986328,
      "sites": {
@@ -788,7 +788,7 @@
      "frame": 7489,
      "max_abs_err": 1.239776611328125e-05,
      "mean_abs_err": 4.060119408677565e-06,
-     "seconds": 1.2,
+     "seconds": 1.1,
      "finite": true,
      "max_abs_err_vs_laptop_orig": 1.2695789337158203e-05,
      "sites": {
@@ -863,7 +863,7 @@
      "frame": 0,
      "max_abs_err": 7.517635822296143e-05,
      "mean_abs_err": 9.769499229150824e-06,
-     "seconds": 2.1,
+     "seconds": 2.0,
      "finite": true,
      "max_abs_err_vs_laptop_orig": 7.155537605285645e-05,
      "sites": {
@@ -929,7 +929,7 @@
      "frame": 3563,
      "max_abs_err": 2.2709369659423828e-05,
      "mean_abs_err": 5.780831088486593e-06,
-     "seconds": 2.0,
+     "seconds": 1.8,
      "finite": true,
      "max_abs_err_vs_laptop_orig": 2.282857894897461e-05,
      "sites": {
@@ -995,7 +995,7 @@
      "frame": 7489,
      "max_abs_err": 4.011392593383789e-05,
      "mean_abs_err": 5.880445314687677e-06,
-     "seconds": 2.1,
+     "seconds": 1.8,
      "finite": true,
      "max_abs_err_vs_laptop_orig": 3.999471664428711e-05,
      "sites": {
@@ -1070,7 +1070,7 @@
      "frame": 0,
      "max_abs_err": 0.0003184080123901367,
      "mean_abs_err": 1.8975610146299005e-05,
-     "seconds": 1.6,
+     "seconds": 1.5,
      "finite": true,
      "max_abs_err_vs_laptop_orig": 0.00031369924545288086,
      "sites": {
@@ -1142,7 +1142,7 @@
      "frame": 3563,
      "max_abs_err": 3.369152545928955e-05,
      "mean_abs_err": 9.48886099649826e-06,
-     "seconds": 1.5,
+     "seconds": 1.4,
      "finite": true,
      "max_abs_err_vs_laptop_orig": 3.357231616973877e-05,
      "sites": {
@@ -1214,7 +1214,7 @@
      "frame": 7489,
      "max_abs_err": 3.331899642944336e-05,
      "mean_abs_err": 1.0124991604243405e-05,
-     "seconds": 1.5,
+     "seconds": 1.6,
      "finite": true,
      "max_abs_err_vs_laptop_orig": 3.343820571899414e-05,
      "sites": {
@@ -1296,7 +1296,7 @@
      "frame": 0,
      "max_abs_err": 5.894899368286133e-05,
      "mean_abs_err": 7.172847745096078e-06,
-     "seconds": 2.2,
+     "seconds": 2.4,
      "finite": true,
      "max_abs_err_vs_laptop_orig": 5.424022674560547e-05,
      "sites": {
@@ -1368,7 +1368,7 @@
      "frame": 3563,
      "max_abs_err": 2.6881694793701172e-05,
      "mean_abs_err": 7.79603942646645e-06,
-     "seconds": 2.0,
+     "seconds": 2.8,
      "finite": true,
      "max_abs_err_vs_laptop_orig": 2.7000904083251953e-05,
      "sites": {
@@ -1440,7 +1440,7 @@
      "frame": 7489,
      "max_abs_err": 4.571676254272461e-05,
      "mean_abs_err": 8.456856448901817e-06,
-     "seconds": 1.9,
+     "seconds": 2.6,
      "finite": true,
      "max_abs_err_vs_laptop_orig": 4.559755325317383e-05,
      "sites": {
@@ -1521,7 +1521,7 @@
      "frame": 0,
      "max_abs_err": 0.001963794231414795,
      "mean_abs_err": 0.00030460976995527744,
-     "seconds": 0.9,
+     "seconds": 1.3,
      "finite": true,
      "max_abs_err_vs_laptop_orig": 0.0019606351852416992,
      "sites": {
@@ -1593,7 +1593,7 @@
      "frame": 3563,
      "max_abs_err": 0.0005309581756591797,
      "mean_abs_err": 0.00015289339353330433,
-     "seconds": 0.9,
+     "seconds": 1.4,
      "finite": true,
      "max_abs_err_vs_laptop_orig": 0.0005309581756591797,
      "sites": {
@@ -1665,7 +1665,7 @@
      "frame": 7489,
      "max_abs_err": 0.0008959174156188965,
      "mean_abs_err": 0.0003970150137320161,
-     "seconds": 0.9,
+     "seconds": 1.3,
      "finite": true,
      "max_abs_err_vs_laptop_orig": 0.0008960366249084473,
      "sites": {

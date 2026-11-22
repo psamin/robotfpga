@@ -1,6 +1,8 @@
-"""Writes a copy of ../contract.h with `#pragma HLS UNROLL` in the 8 loops of decode() and validate_t() and, with
---inline-decode, `#pragma HLS INLINE` in decode() (synthesis experiment for the change proposed to the contract
-owner; README "Synthesis"). Prints the diff.
+"""Writes a copy of ../contract.h with `#pragma HLS UNROLL` in the loops of decode() and validate_t() and,
+with
+--inline-decode, `#pragma HLS INLINE` in decode() (a synthesis experiment for a change proposed to the
+contract owner: the sequencer itself decodes with seq::decode_hw, so only validate_t's loops matter to it;
+README "Synthesis"). Prints the diff.
 
     python hls_contract_unroll.py build/contract_unrolled/contract.h [--inline-decode]
 """
@@ -30,7 +32,9 @@ def patch(text: str) -> str:
                 out += [ln, "#pragma HLS INLINE"]
                 i += 1
                 continue
-        elif re.match(r"^(static|template|}\s*$)", ln) and not ln.startswith("static inline uint32_t validate_t"):
+        elif re.match(r"^(static|template|}\s*$)", ln) and not ln.startswith(
+            "static inline uint32_t validate_t"
+        ):
             if ln.startswith("static") or ln.startswith("template"):
                 fn = ""
         f = re.match(r"^(\s*)for \(uint32_t \w+ = [^;]+; \w+ < \w+; \w+\+\+\)(.*)$", ln)
@@ -54,12 +58,16 @@ def patch(text: str) -> str:
 
 
 def main() -> int:
-    dst = Path([a for a in sys.argv[1:] if not a.startswith('--')][0])
+    dst = Path([a for a in sys.argv[1:] if not a.startswith("--")][0])
     src = SRC.read_text()
     new = patch(src)
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst.write_text(new)
-    d = list(difflib.unified_diff(src.split("\n"), new.split("\n"), "contract.h", "contract_unrolled.h", lineterm=""))
+    d = list(
+        difflib.unified_diff(
+            src.split("\n"), new.split("\n"), "contract.h", "contract_unrolled.h", lineterm=""
+        )
+    )
     print("\n".join(d))
     print(f"{sum(1 for x in d if x.startswith('+#pragma'))} loops unrolled -> {dst}")
     return 0
