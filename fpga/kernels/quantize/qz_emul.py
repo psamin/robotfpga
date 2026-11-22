@@ -11,6 +11,7 @@ Runtime helpers (numpy): pack_rows / unpack_q / unpack_scales for the DDR word l
 
     python qz_emul.py --selftest      # kernel == reference on random and adversarial rows
 """
+
 from __future__ import annotations
 
 import argparse
@@ -34,7 +35,7 @@ def quant_ref(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def quant_ref_engine(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """quant_ref with pack_float's scale 1.0 for all-zero rows (the kernel's and the int16 engine's convention)."""
+    """quant_ref with pack_float's scale 1.0 for all-zero rows (the contract's convention)."""
     q, s = quant_ref(x)
     return q, torch.where(x.abs().amax(1) == 0, torch.ones_like(s), s)
 
@@ -93,7 +94,9 @@ def row_scale(a: torch.Tensor):
     sb = scale_bits(a)
     es = (sb >> 23)[:, None]
     big_s = ((sb & 0x7FFFFF) | (1 << 23))[:, None]
-    r = torch.clamp_max((1 << 49) // big_s, (1 << 26) - 1)  # recip_sig (proved equal exhaustively in tb_quant)
+    r = torch.clamp_max(
+        (1 << 49) // big_s, (1 << 26) - 1
+    )  # recip_sig (proved equal exhaustively in tb_quant)
     return sb, big_s, r, (1 << 25) - big_s, es + 23
 
 
@@ -149,11 +152,13 @@ def pack_rows(x: np.ndarray, in_stride_words: int | None = None) -> np.ndarray:
 def unpack_q(buf: np.ndarray, rows: int, cols: int, out_stride_words: int | None = None) -> np.ndarray:
     """int16 output buffer (bytes or int16) -> (rows, cols) int16; row r at word r * out_stride (8 a word)."""
     st = out_stride_words or cols // 8
-    return np.frombuffer(np.ascontiguousarray(buf).tobytes(), np.int16)[: rows * st * 8].reshape(rows, st * 8)[:, :cols]
+    return np.frombuffer(np.ascontiguousarray(buf).tobytes(), np.int16)[: rows * st * 8].reshape(
+        rows, st * 8
+    )[:, :cols]
 
 
 def unpack_scales(buf: np.ndarray, rows: int) -> np.ndarray:
-    """Scale buffer (4 FP32 a word, the last word zero-padded) -> (rows,) float32."""
+    """Scale buffer (4 FP32 a word, the pad lanes of the last word 1.0) -> (rows,) float32."""
     return np.frombuffer(np.ascontiguousarray(buf).tobytes(), np.float32)[:rows]
 
 
@@ -163,7 +168,9 @@ def dequant_np(q: np.ndarray, s: np.ndarray) -> np.ndarray:
 
 # ------------------------------------------------------------------------------- self test
 def _adversarial(rows: int, cols: int, g: torch.Generator) -> torch.Tensor:
-    x = torch.randn(rows, cols, generator=g) * torch.exp2(torch.randint(-30, 30, (rows, 1), generator=g).float())
+    x = torch.randn(rows, cols, generator=g) * torch.exp2(
+        torch.randint(-30, 30, (rows, 1), generator=g).float()
+    )
     x[::7] = 0.0
     x[1::7] = torch.randn(len(x[1::7]), cols, generator=g) * 1e-38  # denormal rows (below the clamp)
     # values near half-integers of x / s
@@ -196,9 +203,12 @@ def selftest(n_rows: int = 20000, cols: int = 512) -> None:
     sbad = 0
     for e in (27, 127, 254):
         a = (e << 23) | m
-        want = f32_bits((bits_f32(a).clamp_min(TINY) / QMAX))
+        want = f32_bits(bits_f32(a).clamp_min(TINY) / QMAX)
         sbad += int((scale_bits(a) != want).sum())
-    print(f"qz_emul selftest: {tot} elements, {bad} mismatches kernel vs quant_sym; scale over 3 x 2^23 absmax: {sbad} mismatches")
+    print(
+        f"qz_emul selftest: {tot} elements, {bad} mismatches kernel vs quant_sym; "
+        f"scale over 3 x 2^23 absmax: {sbad} mismatches"
+    )
     assert bad == 0 and sbad == 0
 
 

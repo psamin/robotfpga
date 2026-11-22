@@ -2,10 +2,11 @@
 //
 // For every vector case of gen_vectors.py and every layout below it builds a real 256-byte record (ctr::encode ->
 // ctr::decode, which must give ST_END; ctr::validate and ctr::validate_hw must give ME_OK), fills a simulated DDR
-// with a sentinel, places the inputs, runs rope::rope_mode(cmd, hp, xmem, ymem) on it (all three ports see the same
-// memory, as on the board), and compares EVERY word of the memory with the expected image: the outputs where the
-// contract puts them (computed with contract.h's own address helpers and ctr::ref::quant_row, an independent path)
-// and the sentinel / the inputs everywhere else (nothing may be written outside the declared extents).
+// with a sentinel, places the inputs, runs it through seq::dispatch -> rope::rope_unit -> rope::rope_mode (all three
+// ports see the same memory, as on the board), and compares EVERY word of the memory with the expected image: the
+// outputs where the contract puts them (computed with contract.h's own address helpers and ctr::ref::quant_row, an
+// independent path) and the sentinel / the inputs everywhere else (nothing may be written outside the declared
+// extents). Every read unit must lie inside the declared inputs (rope_tb_read), and a rejected record reads nothing.
 //   f32        FP32 rows, separate output, contiguous heads
 //   f32_inpl   FP32 rows in place (C == A) inside a pitched row (the K part of a q|k|v buffer), table pitch 512
 //   f32_hm     FP32 head-major (segments not adjacent: one burst per segment)
@@ -30,15 +31,75 @@
 #include <string>
 #include <vector>
 
+#define ROPE_TB_RDCHK  // rd reports every read unit (rope_tb_read below)
 #include "rope_mode.h"
+#include "../sequencer/seq_core.h"
 
 using rope::Word;
+
+// ---------------------------------------------------------------- the sequencer's dispatch switch
+// Every layout run goes through seq::dispatch (the sequencer's single dispatch site) with a Units policy whose
+// row() sends OP_ROPE to rope::rope_unit, exactly as float_top's row unit will. Other units must not be reached.
+namespace seq {
+uint64_t g_host_cycles = 0;
+}
+static long g_wrong_unit = 0;
+struct RopeUnits {
+  template <class WP, class W>
+  static uint32_t gemm(const ctr::Cmd&, const WP*, const WP*, const WP*, const WP*, const W*, W*) {
+    g_wrong_unit++;
+    return ctr::ME_DIMS;
+  }
+  template <class WP, class W>
+  static uint32_t softmax(const ctr::Cmd&, const WP*, const WP*, const WP*, const WP*, const W*, W*) {
+    g_wrong_unit++;
+    return ctr::ME_DIMS;
+  }
+  template <class WP, class W>
+  static uint32_t row(const ctr::Cmd& c, const WP* hp0, const WP* hp1, const WP* hp2, const WP* hp3, const W* io_rd,
+                      W* io_wr) {
+    if (c.op != ctr::OP_ROPE) {
+      g_wrong_unit++;
+      return ctr::ME_DIMS;
+    }
+    return rope::rope_unit(c, hp0, hp1, hp2, hp3, io_rd, io_wr);
+  }
+};
+static uint32_t run_dispatch(const ctr::Cmd& c, Word* port) {
+  return seq::dispatch<RopeUnits>(c, (const Word*)port, (const Word*)nullptr, (const Word*)nullptr,
+                                  (const Word*)nullptr, (const Word*)port, port);
+}
+
+// ---------------------------------------------------------------- read-extent check
+// Every read unit of rd must lie inside the record's declared inputs: x unit = 16 words of head j of row n < N of
+// item b (A), table unit = 16 words of table row n < N (E). g_rd_x / g_rd_e flag the allowed words of the current
+// run (index = word - g_rd_base); with no run armed (the reject tests) any read is a failure.
+static std::vector<uint8_t> g_rd_x, g_rd_e;
+static uint64_t g_rd_base = 0;
+static long g_rd_bad = 0, g_rd_units = 0;
+// rd runs in one thread (also in ROPE_DFSIM), so no lock is needed
+void rope::rope_tb_read(uint64_t xw, uint64_t ew) {
+  g_rd_units++;
+  for (uint64_t k = 0; k < rope::WORDS; k++) {
+    const uint64_t xi = xw + k - g_rd_base, ei = ew + k - g_rd_base;
+    const bool okx = xw + k >= g_rd_base && xi < g_rd_x.size() && g_rd_x[xi];
+    const bool oke = ew + k >= g_rd_base && ei < g_rd_e.size() && g_rd_e[ei];
+    if (!okx || !oke) {
+      if (g_rd_bad < 4)
+        fprintf(stdout, "  read outside the declared inputs: x word %#llx%s, table word %#llx%s\n",
+                (unsigned long long)(xw + k), okx ? "" : " (bad)", (unsigned long long)(ew + k), oke ? "" : " (bad)");
+      g_rd_bad++;
+      return;
+    }
+  }
+}
 
 #ifdef ROPE_DFSIM
 int rope_dfsim_depth(const std::string& n) {
   if (n == "rope_xs") return ROPE_D_XS;
   if (n == "rope_cs") return ROPE_D_CS;
   if (n == "rope_rs") return ROPE_D_RS;
+  if (n == "rope_fe") return ROPE_D_FE;
   if (n == "rope_fw") return ROPE_D_FW;
   if (n == "rope_am") return ROPE_D_AM;
   if (n == "rope_sd") return ROPE_D_SD;
@@ -290,8 +351,22 @@ static void run_layout(const Case& cs, const Layout& L, uint64_t base) {
         for (int n = NP; n < (int)ctr::pad4(NP); n++) want.w32(ctr::scale_addr(Fs, b, j, segf, n)) = ctr::ONE_BITS;
   // run the mode on the image (hp, xmem and ymem are the same DDR)
   std::vector<Word> img = mem.words_out();
+  // arm the read-extent check: A rows [0, N) x K values of every item, table rows [0, N)
+  g_rd_base = base >> 4;
+  g_rd_x.assign(img.size(), 0);
+  g_rd_e.assign(img.size(), 0);
+  for (int b = 0; b < B; b++)
+    for (int n = 0; n < T; n++)
+      for (int k = 0; k < K; k += 4) g_rd_x[(ctr::row_addr(A, b, n) + 4ull * k) / 16 - g_rd_base] = 1;
+  for (int n = 0; n < T; n++)
+    for (int k = 0; k < 64; k += 4) g_rd_e[(E.addr + (uint64_t)n * E.pitch + 4ull * k) / 16 - g_rd_base] = 1;
+  const long rd_bad0 = g_rd_bad, rd_units0 = g_rd_units;
   Word* port = reinterpret_cast<Word*>(reinterpret_cast<uintptr_t>(img.data()) - (uintptr_t)(base >> 4) * sizeof(Word));
-  const uint32_t r = rope::rope_mode(d, port, port, port);
+  const uint32_t r = run_dispatch(d, port);
+  g_rd_x.clear();
+  g_rd_e.clear();
+  const long rd_bad = g_rd_bad - rd_bad0, rd_units = g_rd_units - rd_units0;
+  const long want_units = (long)B * NP * H;  // one x + one table unit per segment
   mem.words_in(img);
   long bad = 0, outside = 0;
   for (size_t i = 0; i < mem.u.size(); i++)
@@ -304,9 +379,10 @@ static void run_layout(const Case& cs, const Layout& L, uint64_t base) {
       outside += was_sentinel;
     }
   g_checked += (long)mem.u.size();
-  if (r != ctr::ME_OK || bad) {
-    printf("  %-16s %-8s @%#011llx  FAIL: return %u, %ld words differ (%ld outside the outputs)\n", cs.name.c_str(),
-           L.name, (unsigned long long)base, r, bad, outside);
+  if (r != ctr::ME_OK || bad || rd_bad || rd_units != want_units) {
+    printf("  %-16s %-8s @%#011llx  FAIL: return %u, %ld words differ (%ld outside the outputs), %ld of %ld read units"
+           " outside the inputs (want %ld units)\n",
+           cs.name.c_str(), L.name, (unsigned long long)base, r, bad, outside, rd_bad, rd_units, want_units);
     g_fail++;
   }
 }
@@ -347,12 +423,13 @@ static void run_rejects() {
     c.s[ctr::SLOT_C] = {0x8000, 2048, 0};
     c.s[ctr::SLOT_E] = {0x10000, 256, 0};
     if (t.flags) c.s[ctr::SLOT_F] = {0x18000, 0, 0};
-    const uint32_t r = rope::rope_mode(c, img.data(), img.data(), img.data());
+    const long units0 = g_rd_units;  // no run armed: any read is counted
+    const uint32_t r = run_dispatch(c, img.data());
     const uint32_t vh = ctr::validate_hw(c);
-    const bool same = img == ref;
-    const bool ok = r == t.want && vh != ctr::ME_OK && same;
-    printf("  reject %-14s rope_mode %u (want %u), validate_hw %u, memory %s -> %s\n", t.name, r, t.want, vh,
-           same ? "untouched" : "WRITTEN", ok ? "ok" : "FAIL");
+    const bool same = img == ref, noread = g_rd_units == units0;
+    const bool ok = r == t.want && vh != ctr::ME_OK && same && noread;
+    printf("  reject %-14s rope_mode %u (want %u), validate_hw %u, memory %s, %s -> %s\n", t.name, r, t.want, vh,
+           same ? "untouched" : "WRITTEN", noread ? "nothing read" : "READ", ok ? "ok" : "FAIL");
     if (!ok) g_fail++;
   }
 }
@@ -419,7 +496,12 @@ int main(int argc, char** argv) {
     printf("contract.py quant_rows == ctr::ref::quant_row on every segment of every case\n");
   }
   run_rejects();
-  printf("TOTAL %d cases, %d layout runs, %ld memory words compared, %ld failures -> %s\n", ncases, nruns, g_checked,
-         g_fail, g_fail ? "FAIL" : "PASS");
+  if (g_wrong_unit) {
+    printf("seq::dispatch reached a unit other than row() / OP_ROPE %ld times\n", g_wrong_unit);
+    g_fail++;
+  }
+  printf("TOTAL %d cases, %d layout runs, %ld memory words compared, %ld read units checked (%ld outside the inputs),"
+         " %ld failures -> %s\n",
+         ncases, nruns, g_checked, g_rd_units, g_rd_bad, g_fail, g_fail ? "FAIL" : "PASS");
   return g_fail ? 1 : 0;
 }

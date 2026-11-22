@@ -84,6 +84,7 @@ class Program:
         exact: bool = False,
         fe: str = "torch",
         plan_fix: bool = True,
+        nsb: int = 10,
     ):
         self.p, self.exact = policy, exact
         self.P = chunk_plan(base, plan_fix)
@@ -101,7 +102,7 @@ class Program:
         self.mem.add_region(self.list_addr, len(blob))
         self.mem.write(self.list_addr, blob)
         self.status = lay["status"]
-        self.ex = Executor(self.mem, exact=exact, fe=fe)
+        self.ex = Executor(self.mem, exact=exact, fe=fe, nsb=nsb)
         m = policy.model
         vwe = m.vlm_with_expert
         self.vlm = vwe.get_vlm_model()

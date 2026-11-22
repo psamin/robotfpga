@@ -65,7 +65,8 @@ def main() -> None:
                 print(f"  {c[2]:12s} BRAM18 {c[3]:>3s} DSP {c[4]:>3s} FF {c[5]:>6s} LUT {c[6]:>6s}")
     fifo = re.search(r"\|FIFO\s*\|\s*(\S+)\|\s*(\S+)\|\s*(\S+)\|\s*(\S+)\|\s*(\S+)\|", df)
     if fifo:
-        print(f"  FIFOs        BRAM18 {fifo.group(1)} FF {fifo.group(3)} LUT {fifo.group(4)} URAM {fifo.group(5)}")
+        g = fifo.groups()
+        print(f"  FIFOs        BRAM18 {g[0]} FF {g[2]} LUT {g[3]} URAM {g[4]}")
     print("loops (name, II, iteration latency):")
     for line in main_rpt.splitlines():
         if re.match(r"\s*\|\s+o ", line):
@@ -76,8 +77,10 @@ def main() -> None:
         print(f"top issue {sl.group(1)}, slack {sl.group(2)} ns")
     if est:
         t, e, u = (float(x) for x in est.groups())
-        print(f"clock target {t} ns, estimated {e} ns (budget {t - u:.2f} ns after {u} ns uncertainty), "
-              f"Fmax {1000 / e:.0f} MHz")
+        print(
+            f"clock target {t} ns, estimated {e} ns (budget {t - u:.2f} ns after {u} ns uncertainty), "
+            f"Fmax {1000 / e:.0f} MHz"
+        )
     print("largest expressions per process:")
     for f in sorted(d.glob("qz_*_csynth.rpt")):
         ex = expressions(f)

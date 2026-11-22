@@ -15,7 +15,8 @@ Front ends (the FP32 value that reaches the quantizer):
   fe="torch":   FP32 torch (LayerNorm / RMSNorm as the policy computes them, tanh-GELU, SiLU, softmax,
                 rotation with the table's Q1.17 cos / sin);
   fe="kernels": the kernels' bit-exact emulators, as conformed to contract 1.0: norm_residual/nr_emul.kernel
-                (statistics with correctly rounded mean / var + affine: its z), gelu_silu/gs_emu.act (NSB 9),
+                (statistics with correctly rounded mean / var + affine: its z), gelu_silu/gs_emu.act
+                (NSB 10 by default, the FPGA side's decision; nsb=9 for the old table),
                 softmax/smx_emu.kernel (q and 1/sum), rope/rope_emu.rope_rows (MODE_F32 rotation) - gate T-P1.
 exact=True: no quantization at all. Every int16 buffer has an FP32 shadow (one float per int16 element, same
 addresses); quantizers store x itself with scale 2^p4 (1.0 for zero rows), GEMM reads the shadows. With
@@ -178,12 +179,16 @@ class Executor:
         "smx",
     )  # the front ends fe="kernels" replaces (fe="kernels:norm+smx": a subset)
 
-    def __init__(self, mem: Memory, *, exact: bool = False, fe: str = "torch", dry: bool = False):
+    def __init__(
+        self, mem: Memory, *, exact: bool = False, fe: str = "torch", dry: bool = False, nsb: int = 10
+    ):
         kind, _, sub = fe.partition(":")
         assert kind in ("torch", "kernels") and (kind == "kernels" or not sub), fe
         self.kops = set() if kind == "torch" else set(sub.split("+")) if sub else set(self.KOPS)
         assert self.kops <= set(self.KOPS), fe
         self.mem, self.exact, self.fe, self.dry = mem, exact, kind, dry
+        assert nsb in (9, 10), nsb
+        self.nsb = nsb  # gelu_silu table size (segments per function = 2^nsb)
         self.starts = 0
         self.trace: list[str] | None = None  # set to a list to record every unit call
         self.fault = 0  # the next unit call returns this ME code (tb_seq twin replay)
@@ -470,7 +475,7 @@ class Executor:
             x = self.rows_f32(c.slot("A"), b, c.N, c.K).clone()
             u = self.rows_f32(c.slot("B"), b, c.N, c.K).clone() if mode == 1 else None
             if "act" in self.kops and not self.exact:
-                y = self.gs.act(x, u, mode, 9)  # gs_emu: the table front end, NSB 9, natural order
+                y = self.gs.act(x, u, mode, self.nsb)  # gs_emu: the table front end, natural order
             elif mode == 0:
                 y = F.gelu(x, approximate="tanh")
             elif mode == 1:

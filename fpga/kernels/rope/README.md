@@ -5,14 +5,16 @@ contract (`fpga/kernels/CONTRACT.md` 1.1, 2.1, 2.2, 3.3, 4.1). It applies lerobo
 (`smolvlm_with_expert.py`) to Q and K after the q/k projections and writes one of three outputs: FP32 rows (in place
 allowed), int16 rows + per-(row, head) scales through the contract quantizer, or the KW weight tiling of a key blob.
 
-Status (2026-11-21, conformed to contract 1.0):
+Status (2026-11-21 evening, conformed to contract 1.0; resumed after the 16:54 laptop crash, all runs repeated):
 
 - **C model bit-exact** with the torch emulation and with `contract.h`'s own reference: `tb_rope` 0 failures on
-  17 cases x 14 layouts, every word of the simulated DDR compared (13.9 M words). The threaded bounded-FIFO model
-  (deadlock check) passes the same. 10 mutations: 9 caught, 1 equivalent.
+  17 cases x 14 layouts, every word of the simulated DDR compared (13.9 M words), every read unit checked against
+  the record's declared inputs (140,390 units, 0 outside). Every run goes through the sequencer's own
+  `seq::dispatch` -> `rope::rope_unit`. The threaded bounded-FIFO model (deadlock check) passes the same.
+  Mutations: 4 of 4 caught in the final run (10 in the earlier session: 9 caught, 1 equivalent).
 - **Full policy** on -12392's 3 frames, contract deployment: max |err| 1.10e-4 / 1.41e-5 / 1.81e-5 (gate 0.05).
 - **csynth at 4.0 ns**: estimated 3.064 ns (326 MHz), every loop at its II (1, or 16 / 8 for the burst units).
-  rope_mode 18,262 LUT, 15,374 FF, 22 DSP, 0 BRAM. The rope-specific front end is 4,799 LUT and 8 DSP.
+  rope_mode 18,540 LUT, 15,532 FF, 22 DSP, 0 BRAM. The rope-specific front end is 4,460 LUT and 8 DSP.
 - No cosim, Vivado, board run or float_top integration (see "Not verified").
 
 ## What it computes
@@ -38,12 +40,12 @@ Status (2026-11-21, conformed to contract 1.0):
 
 | clause | here |
 |---|---|
-| mode function | `uint32_t rope::rope_mode(const ctr::Cmd& c, const Word* hp, const Word* xmem, Word* ymem)`, INLINE off, one call site: `case ctr::OP_ROPE: return rope::rope_mode(c, w0, xmem, ymem);`. No m_axi adapter, decode or register of its own |
+| mode function | `uint32_t rope::rope_mode(const ctr::Cmd& c, const Word* hp, const Word* xmem, Word* ymem)`, INLINE off, one call site: `case ctr::OP_ROPE: return rope::rope_mode(c, w0, xmem, ymem);`. With the sequencer's unit signature (`seq_core.h` "Units"): `rope::rope_unit(c, hp0, hp1, hp2, hp3, io_rd, io_wr)` (INLINE; hp1..hp3 unused). tb_rope runs every record through `seq::dispatch` with a Units policy whose `row()` calls `rope_unit`; rope_top synthesises through `rope_unit`. No m_axi adapter, decode or register of its own |
 | ports | x rows read on io (`xmem`), table rows on hp0 (`w0`, a host constant), every write on io (`ymem`). The standalone top has exactly float_top's `hp0` / `io` bundles, a 7-bit s_axi_control and an int return |
 | record | `ctr::Cmd` from `ctr::decode` of a 256-byte record. K = 64 H, N, B; slots A, C, E, F; p1 = SEG = 64, p2 = SEGC, p3 = SEGF, p4 = SHIFT, p5 = NP; flags F_QOUT / F_KW |
 | layouts (C1) | A: FP32 rows `A + b A.stride + n A.pitch + 256 j` (head j). E: table row n at `E + b E.stride + n E.pitch`. C int16 / FP32: segment j of row n at `C + b C.stride + n C.pitch + j p2`. F: `F + b F.stride + j p3 + 4n`, pad4(NP) floats per vector, pad lanes 1.0. KW: `C + b C.stride + j p2 + ((n%32)/8) C.pitch + ((n/32) 64 + d) 16`, lane n%8 |
 | quantizer (C2) | the FP32 rotation (`rope_emu.to_f32`) per (row, head) through `quantize/quant_int16.h`: `scale_bits`, `recip_step` (QZ_RECIP_BITS = 1), `quant_elem`, `stored_scale` (s 2^p4; an all-zero segment stores 1.0; a non-finite segment stores its absmax) |
-| rows [N, NP) | zero rows: q = 0 with scale 1.0. Q stacks heads, KW pads the blob to 32-key groups. They re-read row N - 1, so no read leaves the declared extents |
+| rows [N, NP) | zero rows: q = 0 with scale 1.0. Q stacks heads, KW pads the blob to 32-key groups. They re-read row N - 1, so no read leaves the declared extents (tb: every read unit is checked against the A and E extents) |
 | 64-bit addresses (C3) | each address is a 36-bit word index (byte address < 2^40 by validate_hw / validate). Running sums only, no `int`, no address multipliers in the movers (0 DSP in rd / pk / wr) |
 | checks | rope_mode re-checks the fields that size its loops and returns ME_DIMS / ME_FLAGS / ME_PARAM with nothing read or written: op, p1 = 64, H = 1..64, N and B 1..65535, NP in [N, 65535], NP % 32 for KW, NP == N for FP32, QOUT with KW, \|p4\| <= 8. tb: 11 malformed records, memory untouched |
 | ordering (R-ORD) | FP32 C == A in place is allowed: every segment is written after it was read. The mode returns after its writes (HLS waits for the B responses) |
@@ -64,7 +66,20 @@ The integration inputs list these defects for this kernel (rope review + CONTRAC
 | "core total" understated the marginal cost | resources below give the whole mode and separate the rope front end from the parts the shared row unit replaces |
 | 272 calls stated; the list has 271 | 271 records (layer 15 Q skipped); the torch hook still counts 272 |
 | per-token DDR latency on pitched rows | reads are fixed 16-word units (one (row, head) segment) at II = 16, and writes fixed 8-word units at II = 8. csynth infers 16-beat bursts on io and hp0 and 8-beat bursts on io, pipelined across units (no per-row latency in the schedule) |
-| the WIP (paused) version: 32,018 LUT, 29 DSP, rc_stage at -0.33 ns; its KW transposer alone 9,257 LUT | rebuilt back end (below): 18,262 LUT, 22 DSP, 3.064 ns |
+| the WIP (paused) version: 32,018 LUT, 29 DSP, rc_stage at -0.33 ns; its KW transposer alone 9,257 LUT | rebuilt back end (below): 18,540 LUT, 22 DSP, 3.064 ns |
+
+## Resumed after the 16:54 crash (2026-11-21)
+
+Nothing was lost in this directory: the working tree equalled WIP commit 6c325c6, and no file was truncated or
+zero-filled. Every test, the policy check, the cost model and csynth were re-run on the final sources (numbers
+above and below are from those runs). Changes in this session:
+
+- tb: a read-extent check (`ROPE_TB_RDCHK` hook in `rd`). The earlier tb could not see a read outside the inputs
+  whose data is then zeroed; such a mutant (rows >= N re-reading past row N - 1) now fails.
+- tb: every record runs through the sequencer's `seq::dispatch` with a Units policy; `rope::rope_unit` is the
+  adapter with `seq_core.h`'s unit signature, and rope_top synthesises through it.
+- The segment absmax left the front end (`emit_stage`) for a backbone stage (`am_stage`), matching the row unit's
+  `[front end] -> amx` order (quant_mode.h) and gelu_silu's `gs_fe`. Front end 4,799 -> 4,460 LUT.
 
 ## Arithmetic (bit-exact model: `rope_emu.py`)
 
@@ -95,7 +110,8 @@ consecutive, so its scales leave in units and its keys form KW blocks.
 |---|---|---|
 | `rd` | per segment one 16-word x unit (row min(n, N-1), head j; zeroed for n >= N) on io and one 16-word table unit on hp0 | 16 |
 | `rot_stage` (rope_core.h) | x / table ping-pong, 8 DSP rotation per group | 1 |
-| `emit_stage` (rope_core.h) | group normalization, FP32 in natural order, segment absmax | 1 |
+| `emit_stage` (rope_core.h) | group normalization, FP32 in natural order | 1 |
+| `am_stage` | segment absmax (quant_mode.h's `amx`); the words go on into the fw FIFO | 1 |
 | `sc_stage` | `scale_bits`, `stored_scale`, divider seed | 1 |
 | `rc_stage` | R = floor(2^49 / S): 2 iterative restoring dividers (`recip_step`, 1 bit a clock), round robin, one R per 13.5 clocks | 1 |
 | `qt_stage` | 4 lanes of `quant_elem` (12 DSP): 16 FP32 words -> 8 int16 words + the stored scale; FP32 passes | 1 |
@@ -103,41 +119,52 @@ consecutive, so its scales leave in units and its keys form KW blocks.
 | `pk_stage` | 8-word write units with addresses: data, then scale units (32 scales per unit; a vector that does not end on a unit gets a shift-back unit over its last 8 words; NP <= 28 Q vectors make the command single-word) | 1 |
 | `wr_stage` | one 8-beat burst per unit, or single words | 8 / 1 |
 
-The rope-specific part is `rot_stage` + `emit_stage` (the "front end" of CONTRACT.md 4.1). rd / sc / rc / qt / kw /
-pk / wr are the reader, quantizer and writer that the shared row unit (`quantize/quant_mode.h`, owned by the
-quantize agent) provides for every row op. Plugging the front end into it needs:
+The rope-specific part is `rot_stage` + `emit_stage` (the "front end" of CONTRACT.md 4.1). rd / am / sc / rc / qt /
+kw / pk / wr are the reader, absmax, quantizer and writer that the shared row unit (`quantize/quant_mode.h`, owned by
+the quantize agent) provides for every row op. Plugging the front end into its `[front end]` slot (ahead of `amx`)
+needs:
 
 - the 16-word segments in (b, j, n) order;
 - the matching table unit from hp0 with every segment;
-- FP32 words + one absmax per segment out.
+- 16 FP32 words per segment out, natural order (no absmax: that is the backbone's `amx`, as for gelu_silu's `gs_fe`).
 
-FIFO depths are the `ROPE_D_*` macros. The deadlock model found these minimums (every other FIFO at depth 1): fw >= 17
-(16 words of a segment + 1, before its absmax leaves) and ss >= 9 (KW: a block's 8 scales + 1). The pragmas use 64
-and 32.
+FIFO depths are the `ROPE_D_*` macros. The deadlock model found these minimums (every other FIFO at depth 1, full
+vector set): fw >= 16 (a segment's 16 words wait there for its scale; 15 deadlocks) and ss >= 8 (KW: a block's 8
+scales; 7 deadlocks). The pragmas use 64 and 32.
 
 ## Resources (Vitis HLS 2022.2 csynth, xck26-sfvc784-2LV-c, `build/rope_p40`)
 
-At 4.0 ns: estimated **3.064 ns** (326 MHz). The worst path is rc_stage's FIFO read, -0.14 ns against the 2.92 ns
-HLS budget and under the contract's 3.6 ns gate. Every loop reaches its II.
+Final sources (rope_core.h 234cfbd2, rope_mode.h 19674fcf, rope_top.cpp 10760345; shared quantize/quant_int16.h
+700be612, contract.h cedf10d5; sha1 prefixes). At 4.0 ns: estimated **3.064 ns** (326 MHz). The worst path is
+rc_stage's FIFO read, -0.14 ns against the 2.92 ns HLS budget and under the contract's 3.6 ns gate. Every loop
+reaches its II. Bursts inferred: 16-beat reads on io and hp0, 8-beat writes on io.
 
 | block | LUT | FF | DSP | BRAM | latency / note |
 |---|---|---|---|---|---|
 | rot_stage | 1,801 | 2,341 | 8 | 0 | rope front end |
-| emit_stage | 2,998 | 1,936 | 0 | 0 | rope front end |
-| **rope front end** | **4,799** | **4,277** | **8** | **0** | what ROPE adds to the shared row unit |
+| emit_stage | 2,659 | 1,570 | 0 | 0 | rope front end |
+| **rope front end** | **4,460** | **3,911** | **8** | **0** | what ROPE adds to the shared row unit |
 | rd | 1,369 | 860 | 0 | 0 | depth 25 |
-| sc + rc | 1,007 + 1,165 | 502 + 407 | 0 | 0 | |
+| am (segment absmax) | 574 | 418 | 0 | 0 | backbone (`amx`) |
+| sc + rc | 983 + 1,165 | 509 + 407 | 0 | 0 | |
 | qt (4-lane contract quantizer) | 3,709 | 2,856 | 12 | 0 | |
 | kw (KW transposer) | 1,663 | 2,447 | 0 | 0 | |
 | pk + wr | 1,752 + 707 | 1,175 + 473 | 0 | 0 | |
-| FIFOs (14, LUTRAM / SRL) | 1,100 | 1,386 | 0 | 0 | |
-| rope_df (dataflow region) | 17,334 | 14,388 | 20 | 0 | |
-| **rope_mode** | **18,262** | **15,374** | **22** | **0** | prologue: checks + segment count (2 DSP) |
-| rope_top (record fetch, decode, m_axi + s_axilite adapters) | 27,325 | 20,184 | 22 | 0 | the adapters are float_top's |
+| FIFOs (15, LUTRAM / SRL) | 1,167 | 1,485 | 0 | 0 | |
+| rope_df (dataflow region) | 17,612 | 14,546 | 20 | 0 | |
+| **rope_mode** | **18,540** | **15,532** | **22** | **0** | prologue: checks + segment count (2 DSP) |
+| rope_top (record fetch, decode, m_axi + s_axilite adapters) | 27,603 | 20,342 | 22 | 0 | the adapters are float_top's |
 
-- At 3.333 ns (`build/rope_p3333`) the worst estimated path is 2.86 ns (qt), -0.43 ns against the 2.43 ns HLS
-  budget: 300 MHz is a nominal miss in HLS terms; 250 MHz is the runtime clock (set_pl_clock).
-- The first rebuild (`build/rope_p40_v2`) was 21,442 LUT at 3.92 ns. Three changes took it to the numbers above:
+- Moving the absmax out of the front end (this session) took the front end from 4,799 to 4,460 LUT and the mode
+  from 18,262 to 18,540 LUT (+278: one more process and FIFO in the standalone build; in the row unit the absmax
+  is the shared `amx`, counted once). DSP, timing and II are unchanged.
+- The shared quantizer header changed twice while this session ran (its owner's work). An intermediate version
+  (DSP right shift in `rne_sat`, since made opt-in as QZ_SHIFT_DSP) gave qt 3,885 LUT / 16 DSP and the mode
+  18,414 LUT / 26 DSP (`build/rope_p40_unit`). The numbers above use the fabric default.
+- At 3.333 ns (`build/rope_p3333`, the sources before the absmax split, not re-run) the worst estimated path is
+  2.86 ns (qt), -0.43 ns against the 2.43 ns HLS budget: 300 MHz is a nominal miss in HLS terms; 250 MHz is the
+  runtime clock (set_pl_clock).
+- The first rebuild (`build/rope_p40_v2`) was 21,442 LUT at 3.92 ns. Three changes took it to 18.3k:
   - pk's boundary decisions registered one iteration ahead (pk 3.92 ns -> within 2.92 ns; 2.54 ns in the 3.333 ns
     run);
   - STABLE scalars, which removed about 30 propagation FIFOs (2.6k -> 1.1k FIFO LUT, 3k FF);
@@ -148,17 +175,18 @@ HLS budget and under the contract's 3.6 ns gate. Every loop reaches its II.
 **Against the budget (CONTRACT.md 4.2).** The row unit, which holds all 8 row ops, is capped at **15k HLS LUT,
 50 DSP and 10 BRAM36**.
 
-- ROPE's own part (rot + emit) is 4.8k LUT, 8 DSP and 0 BRAM: 32 % of the LUT cap, 16 % of the DSP cap.
-- This build's equivalents of the shared parts add up to 13.5k LUT and 14 DSP (qt 12, prologue 2): reader,
-  quantizer, writer, KW transposer, FIFOs and glue.
-- So backbone + rope front end is 18.3k LUT here, **3.3k over the whole row-unit cap before NORM, GELU/SiLU or
-  QUANT_WT are added**.
-- With the rope front end at 4.8k, the cap leaves 10.2k LUT for the shared backbone and every other front end
-  together. This build's backbone alone is 13.5k, so the cap needs a much smaller shared backbone than this one, or
-  the contract's fallbacks (section 4.2).
-- This is for the contract owner and the row-unit (quantize) agent to settle. I see no further large cut in the
-  front end without changing the bit-exact arithmetic. Merging rot and emit into one process would save an
-  estimated 0.3-0.5k LUT; it has not been tried.
+- ROPE's own part (rot + emit) is 4.46k LUT, 8 DSP and 0 BRAM: 30 % of the LUT cap, 16 % of the DSP cap, 0 % BRAM.
+- This build's equivalents of the shared parts add up to 14.1k LUT and 14 DSP (qt 12, prologue 2): reader,
+  absmax, quantizer, writer, KW transposer, FIFOs and glue.
+- So backbone + rope front end is 18.5k LUT here, **3.5k over the whole row-unit cap before NORM, GELU/SiLU or
+  QUANT_WT are added**. The standalone ROPE mode does not fit the cap on its own; only the front end is meant to
+  enter the row unit.
+- With the rope front end at 4.46k, the cap leaves 10.5k LUT for the shared backbone and every other front end
+  together (gelu_silu's front end is 3.9k). This build's backbone alone is 14.1k, and quantize's standalone builds
+  are larger, so the cap needs a much smaller shared backbone than any built so far, or the contract's fallbacks
+  (section 4.2).
+- This is for the contract owner and the row-unit (quantize) agent to settle. Cuts left in the front end without
+  changing the bit-exact arithmetic: merging rot and emit into one process (est. 0.3-0.5k LUT, not tried).
 
 ## Throughput and time
 
@@ -178,18 +206,22 @@ HLS budget and under the contract's 3.6 ns gate. Every loop reaches its II.
 | test | result (2026-11-21) |
 |---|---|
 | `rope_emu.py` selftest | FP32 max err / head amax 5.97e-6; contract-quantized 1.92e-5; 2^-126 boundary PASS |
-| `tb_rope.exe build/vectors` | **PASS**: 17 cases x 14 layouts (228 runs) at bases 0x4000_0000, 0x8_0000_0000 and 0xFF_0000_0000 (two layouts), 13,893,896 memory words compared, 0 failures, plus 11 rejected records with memory untouched |
-| `tb_rope_dfsim.exe` (every process a thread, FIFOs bounded at the pragma depths) | **PASS** (same counts). Negative control `-DROPE_D_FW=8`: DEADLOCK reported, as it must |
-| mutations (scratch copies, `--quick`) | 9 of 10 caught: tail unit, pad lanes, zero rows, KW lane select, KW group step, p4 shift, scale-vector step, scale ring index, FP32 rounding. A row-clamp mutant segfaulted on its out-of-memory read. The `recip_result` clamp mutant is equivalent (for S = 2^23 the restoring division already gives 2^26 - 1), though the new `pow2_scale_12x3` case exercises that path |
+| `tb_rope.exe build/vectors` | **PASS**: 17 cases x 14 layouts (228 runs) at bases 0x4000_0000, 0x8_0000_0000 and 0xFF_0000_0000 (two layouts), 13,893,896 memory words compared, 140,390 read units checked (0 outside the declared inputs), 0 failures, plus 11 rejected records with memory untouched and nothing read. Every run through `seq::dispatch` -> `rope_unit` |
+| `tb_rope_dfsim.exe` (every process a thread, FIFOs bounded at the pragma depths) | **PASS** (same counts). Negative controls: `-DROPE_D_FW=8` and, with every other FIFO at 1, fw = 15 or ss = 7: DEADLOCK reported, as it must; fw = 16 / ss = 8 pass |
+| mutations (scratch copies, `--quick`) | final sources: 4 of 4 caught: KW lane select, Q pad-lane scale, rows >= N re-read past row N - 1 (caught only by the new read check: its outputs were right), table row step. Earlier session, 9 of 10: tail unit, pad lanes, zero rows, KW lane select, KW group step, p4 shift, scale-vector step, scale ring index, FP32 rounding; the `recip_result` clamp mutant is equivalent (for S = 2^23 the restoring division already gives 2^26 - 1) |
 | `check_policy.py` | below |
 | `kernel_error.py 0` | below |
 | `rope_cost.py` | 271 ROPE records, 0 invalid; the table above |
 
 Each layout run builds a real 256-byte record (`ctr::encode` -> `ctr::decode`). It requires `ctr::validate` and
-`ctr::validate_hw` to pass, fills the DDR with a sentinel, and compares the whole memory with the expected image:
+`ctr::validate_hw` to pass, fills the DDR with a sentinel, runs the record through `seq::dispatch`, and compares the
+whole memory with the expected image:
 
 - the outputs where `contract.h`'s address helpers put them;
 - the sentinel or the inputs everywhere else, so a write outside the extents fails the test.
+
+It also requires every read unit of `rd` (reported through the `ROPE_TB_RDCHK` hook, which synthesis never sees) to
+lie inside the A rows [0, N) and E rows [0, N) of the record, and exactly one x and one table unit per segment.
 
 Layouts:
 
@@ -235,9 +267,9 @@ constants. Those belong to the other kernels and to the golden executor (T-P1, n
 | file | purpose |
 |---|---|
 | `rope_core.h` | the rope front end: `rotate_group`, `to_f32`, `rot_stage`, `emit_stage` |
-| `rope_mode.h` | the ROPE mode: `rope::rope_mode` and its reader / quantizer / packer / writer processes; `ROPE_DFSIM` threads |
-| `rope_top.cpp` | standalone csynth top: float_top's hp0 / io bundles, one record fetch at K (list base >> 4) + `ctr::decode` + `rope_mode` |
-| `tb_rope.cpp`, `dfsim/hls_stream.h` | host testbench; bounded blocking `hls::stream` for the deadlock model |
+| `rope_mode.h` | the ROPE mode: `rope::rope_mode`, `rope::rope_unit` (the sequencer's unit signature) and the reader / absmax / quantizer / packer / writer processes; `ROPE_DFSIM` threads; `ROPE_TB_RDCHK` read hook (tb only) |
+| `rope_top.cpp` | standalone csynth top: float_top's hp0 / io bundles, one record fetch at K (list base >> 4) + `ctr::decode` + `rope_unit` -> `rope_mode` |
+| `tb_rope.cpp`, `dfsim/hls_stream.h` | host testbench (includes `../sequencer/seq_core.h` for `seq::dispatch`); bounded blocking `hls::stream` for the deadlock model |
 | `rope_emu.py` | bit-exact torch model (`rope_rows`, `to_f32`, `table_rows`, `quant_segments` = `contract.quant_rows`) |
 | `gen_vectors.py` | test vectors (real + synthetic) into `build/vectors` |
 | `check_policy.py`, `kernel_error.py` | full-policy and element-error checks (logs: `check_policy.log`, `check_policy_results.jsonl`, `kernel_error.log`) |
@@ -267,8 +299,8 @@ ROPE_PERIOD=4.0 /c/Xilinx/Vitis_HLS/2022.2/bin/vitis_hls.bat -f run_rope_hls.tcl
   assumption. Burst efficiency of 16-beat reads and 8-beat writes on the KR260 is unmeasured (BT-2).
 - Not integrated into float_top or the shared row unit. The front end's hook into `quant_mode.h` is described above
   but not built (that file belongs to the quantize agent).
-- Reads outside the declared extents are prevented by design: rows >= N re-read row N - 1. The tb detects them only
-  when they leave the whole simulated DDR (a mutant crashed that way). Writes outside the extents are fully checked.
+- Reads and writes outside the declared extents are checked in the C model only (the tb's read hook,
+  `ROPE_TB_RDCHK`, and the whole-memory compare). The RTL's bus behaviour is not simulated (no cosim).
 - The base model's global HF cache entry (`~/.cache/huggingface/hub/models--HuggingFaceTB--SmolVLM2-500M-Video-Instruct`)
   is broken on this laptop: its snapshot folder is empty and only a 395 MB `.incomplete` blob from 2026-11-20 22:55
   remains. The checks above ran with `HF_HUB_CACHE` pointed at a complete copy in the session scratchpad

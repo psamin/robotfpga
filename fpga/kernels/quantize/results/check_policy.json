@@ -8,31 +8,45 @@
     "max_abs_err": 4.708766937255859e-06,
     "mean_abs_err": 2.3702780538314983e-07,
     "max_abs_err_deg": 0.00013787327043246478,
-    "seconds": 1.1
+    "seconds": 1.0
    },
    "actq": {
     "max_abs_err": 0.0010858774185180664,
     "mean_abs_err": 6.935241253813729e-05,
     "max_abs_err_deg": 0.03179462254047394,
-    "seconds": 6.4,
+    "seconds": 5.3,
     "max_abs_vs_laptop_fp32": 0.0010811686515808105
    },
-   "int16": {
-    "max_abs_err": 0.00046074390411376953,
-    "mean_abs_err": 5.190101728658192e-05,
-    "max_abs_err_deg": 0.013490636833012104,
-    "seconds": 8.1,
-    "max_abs_vs_laptop_fp32": 0.00045603513717651367
+   "c_lin": {
+    "max_abs_err": 0.0017342567443847656,
+    "mean_abs_err": 8.634047844680026e-05,
+    "max_abs_err_deg": 0.05077924579381943,
+    "seconds": 8.9,
+    "max_abs_vs_laptop_fp32": 0.0017295479774475098
    },
-   "int16_ref": {
-    "max_abs_err": 0.00046074390411376953,
-    "mean_abs_err": 5.190101728658192e-05,
-    "max_abs_err_deg": 0.013490636833012104,
-    "seconds": 2.0,
-    "max_abs_vs_laptop_fp32": 0.00045603513717651367
+   "c_lin_ref": {
+    "max_abs_err": 0.0017342567443847656,
+    "mean_abs_err": 8.634047844680026e-05,
+    "max_abs_err_deg": 0.05077924579381943,
+    "seconds": 2.9,
+    "max_abs_vs_laptop_fp32": 0.0017295479774475098
    },
-   "int16_vs_int16_ref_max_abs": 0.0,
-   "int16_bitwise_equal_int16_ref": true
+   "c_full": {
+    "max_abs_err": 0.0012905597686767578,
+    "mean_abs_err": 7.526077388320118e-05,
+    "max_abs_err_deg": 0.037787746638059616,
+    "seconds": 11.9,
+    "max_abs_vs_laptop_fp32": 0.0012952685356140137
+   },
+   "c_full_ref": {
+    "max_abs_err": 0.0012905597686767578,
+    "mean_abs_err": 7.526077388320118e-05,
+    "max_abs_err_deg": 0.037787746638059616,
+    "seconds": 4.6,
+    "max_abs_vs_laptop_fp32": 0.0012952685356140137
+   },
+   "c_lin_bitwise_equal_ref": true,
+   "c_full_bitwise_equal_ref": true
   },
   {
    "frame": 3563,
@@ -46,25 +60,39 @@
     "max_abs_err": 0.0001736283302307129,
     "mean_abs_err": 4.752389941131696e-05,
     "max_abs_err_deg": 0.00543839018791914,
-    "seconds": 5.8,
+    "seconds": 6.6,
     "max_abs_vs_laptop_fp32": 0.0001735389232635498
    },
-   "int16": {
-    "max_abs_err": 0.00013335049152374268,
-    "mean_abs_err": 4.138834628975019e-05,
-    "max_abs_err_deg": 0.004437343683093786,
-    "seconds": 8.1,
-    "max_abs_vs_laptop_fp32": 0.0001331418752670288
+   "c_lin": {
+    "max_abs_err": 8.496642112731934e-05,
+    "mean_abs_err": 3.158489926136099e-05,
+    "max_abs_err_deg": 0.0038589348550885916,
+    "seconds": 9.4,
+    "max_abs_vs_laptop_fp32": 8.472800254821777e-05
    },
-   "int16_ref": {
-    "max_abs_err": 0.00013335049152374268,
-    "mean_abs_err": 4.138834628975019e-05,
-    "max_abs_err_deg": 0.004437343683093786,
-    "seconds": 2.1,
-    "max_abs_vs_laptop_fp32": 0.0001331418752670288
+   "c_lin_ref": {
+    "max_abs_err": 8.496642112731934e-05,
+    "mean_abs_err": 3.158489926136099e-05,
+    "max_abs_err_deg": 0.0038589348550885916,
+    "seconds": 3.1,
+    "max_abs_vs_laptop_fp32": 8.472800254821777e-05
    },
-   "int16_vs_int16_ref_max_abs": 0.0,
-   "int16_bitwise_equal_int16_ref": true
+   "c_full": {
+    "max_abs_err": 0.00015270709991455078,
+    "mean_abs_err": 4.293742313166149e-05,
+    "max_abs_err_deg": 0.006833468563854694,
+    "seconds": 12.9,
+    "max_abs_vs_laptop_fp32": 0.0001526176929473877
+   },
+   "c_full_ref": {
+    "max_abs_err": 0.00015270709991455078,
+    "mean_abs_err": 4.293742313166149e-05,
+    "max_abs_err_deg": 0.006833468563854694,
+    "seconds": 4.9,
+    "max_abs_vs_laptop_fp32": 0.0001526176929473877
+   },
+   "c_lin_bitwise_equal_ref": true,
+   "c_full_bitwise_equal_ref": true
   },
   {
    "frame": 7489,
@@ -72,54 +100,97 @@
     "max_abs_err": 2.980232238769531e-07,
     "mean_abs_err": 8.29497963650283e-08,
     "max_abs_err_deg": 1.5098250514711253e-05,
-    "seconds": 1.0
+    "seconds": 1.1
    },
    "actq": {
     "max_abs_err": 0.0001552104949951172,
     "mean_abs_err": 4.4815293222200125e-05,
     "max_abs_err_deg": 0.00786316953599453,
-    "seconds": 6.2,
+    "seconds": 5.8,
     "max_abs_vs_laptop_fp32": 0.0001551508903503418
    },
-   "int16": {
-    "max_abs_err": 0.00012665987014770508,
-    "mean_abs_err": 3.2597432436887175e-05,
-    "max_abs_err_deg": 0.00467486260458827,
-    "seconds": 7.8,
-    "max_abs_vs_laptop_fp32": 0.0001266002655029297
+   "c_lin": {
+    "max_abs_err": 0.00016626715660095215,
+    "mean_abs_err": 4.886145325144753e-05,
+    "max_abs_err_deg": 0.00414094515144825,
+    "seconds": 8.9,
+    "max_abs_vs_laptop_fp32": 0.00016614794731140137
    },
-   "int16_ref": {
-    "max_abs_err": 0.00012665987014770508,
-    "mean_abs_err": 3.2597432436887175e-05,
-    "max_abs_err_deg": 0.00467486260458827,
-    "seconds": 2.4,
-    "max_abs_vs_laptop_fp32": 0.0001266002655029297
+   "c_lin_ref": {
+    "max_abs_err": 0.00016626715660095215,
+    "mean_abs_err": 4.886145325144753e-05,
+    "max_abs_err_deg": 0.00414094515144825,
+    "seconds": 2.9,
+    "max_abs_vs_laptop_fp32": 0.00016614794731140137
    },
-   "int16_vs_int16_ref_max_abs": 0.0,
-   "int16_bitwise_equal_int16_ref": true
+   "c_full": {
+    "max_abs_err": 0.00015801191329956055,
+    "mean_abs_err": 3.724058478837833e-05,
+    "max_abs_err_deg": 0.0027103202883154154,
+    "seconds": 12.0,
+    "max_abs_vs_laptop_fp32": 0.0001580566167831421
+   },
+   "c_full_ref": {
+    "max_abs_err": 0.00015801191329956055,
+    "mean_abs_err": 3.724058478837833e-05,
+    "max_abs_err_deg": 0.0027103202883154154,
+    "seconds": 5.0,
+    "max_abs_vs_laptop_fp32": 0.0001580566167831421
+   },
+   "c_lin_bitwise_equal_ref": true,
+   "c_full_bitwise_equal_ref": true
   }
  ],
- "activation_check": {
-  "calls": 4257,
-  "elems": 319051488,
-  "q_mismatch": 0,
-  "s_mismatch": 0,
-  "packfloat_mismatch": 0,
-  "rows": 326787,
-  "zero_rows": 0,
-  "sat": 330271,
-  "cols": [
-   32,
-   320,
-   720,
-   768,
-   960,
-   1440,
-   2048,
-   2560,
-   3072,
-   12288
-  ]
+ "quantizer_check": {
+  "linear inputs (QUANT_X / q-out)": {
+   "calls": 8514,
+   "rows": 653574,
+   "elems": 638102976,
+   "q_mismatch": 0,
+   "s_mismatch": 0,
+   "zero_rows": 1728,
+   "sat": 655395,
+   "cols": [
+    32,
+    320,
+    720,
+    768,
+    960,
+    1440,
+    2048,
+    2560,
+    3072,
+    12288
+   ],
+   "packfloat_mismatch": 0
+  },
+  "attn Q (p4 = -3)": {
+   "calls": 600,
+   "rows": 630144,
+   "elems": 40329216,
+   "q_mismatch": 0,
+   "s_mismatch": 0,
+   "zero_rows": 16560,
+   "sat": 613631,
+   "cols": [
+    64
+   ]
+  },
+  "attn K / V^T": {
+   "calls": 1440,
+   "rows": 768000,
+   "elems": 55483392,
+   "q_mismatch": 0,
+   "s_mismatch": 0,
+   "zero_rows": 66960,
+   "sat": 701724,
+   "cols": [
+    45,
+    50,
+    64,
+    256
+   ]
+  }
  },
  "dump_records": 302
 }

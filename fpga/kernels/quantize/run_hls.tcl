@@ -6,6 +6,7 @@
 #   QZ_PERIOD=3.333 ...    clock period in ns (default 4.0 = 250 MHz)
 #   QZ_IMPL=fdiv ...       per-lane FP32 divider core instead of the integer reciprocal datapath
 #   QZ_ENGINES=4 ...       reciprocal engines in sr (default 2)
+#   QZ_SMALL=0 ...         no single-word units (area probe: such commands return ME_DIMS)
 #   QZ_TAG=x ...           project name suffix
 # Project build/qzm_<impl>_p<period>[...] (Vitis HLS on Windows refuses '/' in a project name).
 set here [file dirname [file normalize [info script]]]
@@ -17,6 +18,7 @@ set cflags "-std=c++14"
 if {$impl eq "fdiv"} { append cflags " -DQZ_IMPL_FDIV" }
 set proj "qzm_${impl}_p[string map {. {}} $period]"
 if {[info exists ::env(QZ_ENGINES)]} { append cflags " -DQZ_SC_ENGINES=$::env(QZ_ENGINES)"; append proj "_e$::env(QZ_ENGINES)" }
+if {[info exists ::env(QZ_SMALL)]} { append cflags " -DQZ_SMALL=$::env(QZ_SMALL)"; append proj "_s$::env(QZ_SMALL)" }
 if {[info exists ::env(QZ_TAG)]} { append proj "_$::env(QZ_TAG)" }
 
 file mkdir "$here/build"

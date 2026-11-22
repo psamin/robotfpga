@@ -212,7 +212,8 @@ static inline ap_uint<26> recip_unrolled(ap_uint<24> S) {
 static inline ap_uint<32> stored_scale(abits_t a_bits, ap_uint<32> s_bits, ap_int<5> shift) {
 #pragma HLS INLINE
   const bool nonfinite = a_bits(30, 23) == 255;
-  const ap_uint<32> sh = s_bits + (ap_uint<32>(ap_int<32>(shift)) << 23);
+  ap_uint<32> sh = s_bits;  // s is positive and normal: only its 8-bit exponent field moves (no carry out)
+  sh(30, 23) = ap_uint<8>(s_bits(30, 23) + ap_uint<8>(ap_int<8>(shift)));
   return a_bits == 0 ? ap_uint<32>(ONE_BITS) : nonfinite ? ap_uint<32>(a_bits) : sh;
 }
 
@@ -239,11 +240,28 @@ static inline RowScale row_scale(abits_t a_bits) {
 // value >= 2^15 (saturate; unreachable when |x| <= the row's absmax), sh >= 26 means value < 0.5.
 static inline q_t rne_sat(ap_uint<25> M, ap_int<10> sh, bool neg) {
 #pragma HLS INLINE
-  // t = sh - 1 in 8..24 is the position of the round bit; k = t - 8 in 0..16. Constant shifts and
-  // explicit muxes only (a variable shift or bit index becomes a 32-bit barrel shifter in HLS).
-  // A sticky barrel shifter: every stage ORs the bits it drops into st, so st ends as
-  // OR(M[0 .. t-1]), any bit of M under the round bit.
+  // t = sh - 1 in 8..24 is the position of the round bit; k = t - 8 in 0..16.
   const ap_uint<5> k = ap_uint<5>(sh - 9);
+#ifdef QZ_SHIFT_DSP
+  // The right shift by sh = 9 + k as one DSP product P = M 2^(16 - k) (25 x 17 bits, a one-hot multiplier):
+  // floor(M / 2^sh) = P[40:25], the round bit M[t] = P[24], and every bit of M under it lands in P[23:0]
+  // (the bits under P[16 - k] are 0), so the sticky bit is P[23:0] != 0. 1 DSP48E2 per lane instead of a
+  // 5-stage sticky barrel shifter in fabric. Measured (csynth v5, 4 lanes): +4 DSP and +0.9k LUT, the deeper
+  // pipeline costs more shift registers than the shifter saves, so the fabric shifter is the default.
+  ap_uint<17> oh = 0;
+  for (int i = 0; i <= 16; i++) {
+#pragma HLS UNROLL
+    oh[i] = k == ap_uint<5>(16 - i);
+  }
+  const ap_uint<41> P = ap_uint<41>(M) * oh;
+#pragma HLS BIND_OP variable = P op = mul impl = dsp
+  const bool rb = P[24];
+  const bool st = P(23, 0) != 0;
+  const ap_uint<16> ip = P(40, 25);  // floor(M / 2^sh) <= 2^15
+#else
+  // Constant shifts and explicit muxes only (a variable shift or bit index becomes a 32-bit barrel shifter in
+  // HLS). A sticky barrel shifter: every stage ORs the bits it drops into st, so st ends as
+  // OR(M[0 .. t-1]), any bit of M under the round bit.
   const ap_uint<17> Y0 = M >> 8;  // floor(M / 2^t) after the 5 stages; <= 2^16
   const bool s0 = M(7, 0) != 0;
   const ap_uint<17> Y1 = k[0] ? ap_uint<17>(Y0 >> 1) : Y0;
@@ -258,6 +276,7 @@ static inline q_t rne_sat(ap_uint<25> M, ap_int<10> sh, bool neg) {
   const bool st = s4 | (k[4] & (Y4(15, 0) != 0));
   const bool rb = Y[0];
   const ap_uint<16> ip = Y >> 1;  // floor(M / 2^sh) <= 2^15
+#endif
   const ap_uint<17> v = ap_uint<17>(ip) + ap_uint<17>(rb & (st | ip[0]));
   ap_uint<16> mag = v > QMAX ? ap_uint<17>(QMAX) : v;
   if (sh < 9) mag = QMAX;   // value >= 2^15

@@ -8,14 +8,14 @@
 #   NR_SQ=dsp          the 4 exact 25 x 25 squares of the statistics: dsp | fabric
 #   NR_KFOLD=1         area measurement only, not contract 1.0: no gamma / beta (folded downstream) (suffix _kfold)
 #   NR_URAM=1          the gamma | beta table and the NORM row FIFO in URAM instead of BRAM (suffix _uram)
-#   cd fpga/kernels/norm_residual && vitis_hls -f run_nr_hls.tcl   -> build/nr5_<fmul>_<fadd>_<sq>_p<period>/sol1
+#   cd fpga/kernels/norm_residual && vitis_hls -f run_nr_hls.tcl   -> build/nr6_<fmul>_<fadd>_<sq>_p<period>/sol1
 set here [file dirname [file normalize [info script]]]
 set period [expr {[info exists ::env(NR_PERIOD)] ? $::env(NR_PERIOD) : 4.0}]
 set fmul [expr {[info exists ::env(NR_FMUL)] ? $::env(NR_FMUL) : "fulldsp"}]
 set fadd [expr {[info exists ::env(NR_FADD)] ? $::env(NR_FADD) : "fulldsp"}]
 set sq [expr {[info exists ::env(NR_SQ)] ? $::env(NR_SQ) : "dsp"}]
 set ptag [string map {. ""} $period]
-set proj "nr5_${fmul}_${fadd}_${sq}_p${ptag}"
+set proj "nr6_${fmul}_${fadd}_${sq}_p${ptag}"
 set cflags "-std=c++14 -I$here -I$here/.. -I$here/../quantize -DNR_FMUL_IMPL=$fmul -DNR_FADD_IMPL=$fadd -DNR_SQ_IMPL=$sq"
 if {[info exists ::env(NR_KFOLD)]} {
     append cflags " -DNR_KFOLD"

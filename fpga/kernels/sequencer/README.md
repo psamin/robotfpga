@@ -17,7 +17,7 @@ directory holds the walk, its testbenches, and the golden executor of the contra
 | `make_chunk.py` | the -12392 chunk list (`contract_plan.build` via `build_smolvla.chunk_plan`) and its Python decode trace |
 | `exec_ref.py` | golden executor of contract records in torch (gate T-P1): the walk of `seq_core.h`, every opcode's layouts and arithmetic |
 | `build_smolvla.py` | fills every buffer the list addresses with -12392's weights (packed and folded as CONTRACT.md 2.4), constants and per-chunk inputs |
-| `check_policy.py` | full policy through the list against `ref_chunk_raw`, in three modes |
+| `check_policy.py` | full policy through the list against `ref_chunk_raw` (modes exact, int16, int16k, int16k:<front end>; `--nsb`) |
 | `check_twin.py` | replays every testbench start through `exec_ref.py` and compares it with the C++ run |
 
 The 128-byte draft (`seq_format.h`, `seq_stubs.h`, `arena.py`, `count_cmds.py` and the old builder) is
@@ -81,7 +81,7 @@ int float_top(...) { /* shipped pragmas */ return (int)seq::top<Units>(w0, w1, w
   broke timing at 5.66 ns.
 - Take the top's ports as arguments, with no m_axi adapters of its own.
 
-## Tests (all run 2026-11-21; Vitis MinGW g++, clean PATH)
+## Tests (all re-run 2026-11-21 17:3x after the 16:54 crash; Vitis MinGW g++, clean PATH)
 
 `sh run_tests.sh` gives ALL PASS. The parts:
 
@@ -110,10 +110,25 @@ int float_top(...) { /* shipped pragmas */ return (int)seq::top<Units>(w0, w1, w
 **`check_twin.py`: PASS.** 2 × 44 testbench starts are replayed through `exec_ref.py`. Return value, status words
 0-9, dispatch trace and output bytes are identical.
 
+**The testbench is not vacuous.** Eight one-line mutations of `seq_core.h` each make `tb_seq` fail, with 1-44
+failures each: status word 9 = next instead of the last finished index; BAD_VERSION checked before BAD_CHECK; the
+previous tag kept on a bad record; F_YIELD ignored; LIMIT one index late; `done` not counted; `starts` not counted;
+B = 0 not mapped to 1.
+
+**The real units fit the dispatch.** A scratch host build (not in the repo) wires `qz::RowUnit::row`,
+`gs::act_unit`, `nr::norm_mode` and `smx::softmax_mode`, as they stood at 16:53, into `seq::top` unchanged. A
+5-record list (QUANT_X with shift −3, NP padding and a zero row; GELU; RMS NORM; SOFTMAX; END) then:
+- returns END, next 4, done 4;
+- matches `ctr::ref::quant_row` bit for bit on QUANT_X;
+- stays within 5e-6 of tanh-GELU, within 7e-7 of the RMSNorm reference, and within 5e-8 of 1 on the softmax sums.
+
+The merged row unit is the row-unit owner's work.
+
 ## Policy check (the golden executor, gate T-P1)
 
 ```
-HF_HUB_OFFLINE=1 python check_policy.py <ckpt> build/ckpt/smolvla-12392/batches-12392 --modes exact,int16,int16k --out build/py/policy.json
+HF_HUB_OFFLINE=1 python check_policy.py <ckpt> build/ckpt/smolvla-12392/batches-12392 --modes exact,int16,int16k --nsb 10 --threads 4 --out build/py/policy.json
+HF_HUB_OFFLINE=1 python check_policy.py <ckpt> ... --modes int16k:norm,int16k:act,int16k:rope,int16k:smx --out build/py/policy_attr.json
 ```
 
 The modes:
@@ -121,19 +136,41 @@ The modes:
 - **exact:** no quantization. FP32 torch front ends on the list's addresses, tilings and folded constants.
 - **int16:** the contract quantizer and epilogue everywhere, with torch front ends.
 - **int16k:** the contract quantizer and epilogue, with the kernels' bit-exact emulators (`nr_emul.kernel`,
-  `gs_emu.act` NSB 9, `smx_emu.kernel` with zero rows 1.0, `rope_emu.rope_rows`). This is the golden executor of
-  CONTRACT.md 7.
+  `gs_emu.act` NSB 10 (`--nsb`; the FPGA side's decision), `smx_emu.kernel` with zero rows 1.0,
+  `rope_emu.rope_rows`). This is the golden executor of CONTRACT.md 7.
+- **int16k:X:** as int16, but with only the emulator of front end X (attribution).
 
-Max |chunk − ref| on -12392's frames, list started once per frame, one arena for all frames:
+The emulator versions used (sha256[:12], mtime) are recorded in the json:
+- nr_emul 16:48, gs_emu 16:39, smx_emu 11-20 22:35, rope_emu 11-20 22:45;
+- contract.h / .py / _plan.py as of 11-20 22:00.
 
-| mode | frame 0 | frame 3563 | frame 7489 | gate (CONTRACT.md 7) |
+Max |chunk − ref| on -12392's frames (run 2026-11-21 17:35-17:45, base 0x8_0000_0000, 4 threads). The list
+is started once per frame, with one arena for all frames:
+
+| mode | frame 0 | frame 3563 | frame 7489 | target (CONTRACT.md 7) |
 |---|---|---|---|---|
-| torch FP32 policy, no list | 4.7e-6 | 3.6e-7 | 3.0e-7 | — |
+| torch FP32 policy, no list | 5.13e-6 | 4.62e-7 | 4.77e-7 | — |
 | exact | 1.56e-5 | 1.01e-6 | 5.96e-7 | wiring <= 1e-5 (frame 0: see below) |
-| int16 | 1.24e-3 | 1.35e-4 | 1.25e-4 | — |
-| **int16k (T-P1)** | **1.00e-3** | **1.14e-4** | **1.29e-4** | <= 0.006 / <= 2e-4 / <= 2e-4: **pass** |
+| int16 (torch front ends) | 1.24e-3 | 1.35e-4 | 1.25e-4 | — |
+| int16k:norm | 1.26e-3 | 1.09e-4 | 9.35e-5 | — |
+| int16k:act (NSB 10) | 2.20e-3 | 1.27e-4 | 1.15e-4 | — |
+| int16k:rope | 1.25e-3 | 1.19e-4 | 1.27e-4 | — |
+| int16k:smx | 2.45e-4 | 1.47e-4 | 9.62e-5 | — |
+| **int16k (T-P1), NSB 10** | **2.03e-4** | **2.11e-4** | **1.11e-4** | <= 0.006 / <= 2e-4 / <= 2e-4: **frame 3563 misses by 1.1e-5** |
+| int16k, NSB 9 (run at 16:53, same emulators) | 3.88e-4 | 2.08e-4 | 1.10e-4 | same miss |
+
+All of these are 240 times or more inside the policy gate of 0.05. The 2e-4 benign-frame number is the
+contract's estimate of the class (I7e), not a policy requirement. Whether to tighten a front end, or to accept
+2.1e-4, is a decision for the contract owner and psamin. It is not guessed here.
 
 How to read it:
+
+- **No single front end reaches 2e-4 on frame 3563.** The worst alone is the softmax at 1.47e-4. The four
+  together give 2.11e-4, and the errors do not add linearly.
+- **NSB 10 does not fix frame 3563** (2.08e-4 at NSB 9, 2.11e-4 at NSB 10). gelu_silu's own check found NSB 10
+  under 2e-4 with its other front ends in torch. That is consistent with this table: act alone gives 1.27e-4.
+- The README before the crash quoted int16k as 1.00e-3 / 1.14e-4 / 1.29e-4 "pass". No run on disk matches that
+  (the 16:53 json gives the NSB 9 row above), so it is withdrawn.
 
 - Frame 0 is the onset frame. The precision study puts int16 attention there at 0.0017-0.0057 (I7e 0.0057).
 - The exact mode's 1.56e-5 on frame 0 is above the 1e-5 wiring number. It comes from the folded constants:
@@ -161,12 +198,15 @@ HF cache's `refs/main` for SmolVLM2-500M-Video-Instruct was moved at 2026-11-20 
 
 ## Synthesis (Vitis HLS 2022.2 csynth, 4.0 ns, `sh run_hls_all.sh`, `python hls_summary.py`)
 
+The first two rows were re-run at 17:36 (`sh run_hls_all.sh "1:1:0:4.0 0:1:0:4.0"`, rc 0, about 1 minute each) and
+are identical to the run before the crash. The other two rows are from earlier today and were not re-run.
+
 | build | est. | sequencer LUT | FF | DSP | BRAM | clocks / command | top total LUT (adapters) |
 |---|---|---|---|---|---|---|---|
 | **sequencer alone** (`SEQ_UNITS=0`: walk + decode_hw + validate_hw + status + cycle counter) | **2.92 ns** | **6,330** | **6,758** | **7** | **0** | **72** | 10,618 (4,219: io + control) |
 | with 3 null units (`p40`: dispatch and port muxing) | 2.92 ns | 6,969 (13,814 − 6,845 null units) | 6,045 | 7 | 0 | 90 (incl. null units) | 27,452 (13,491) |
 | same, `validate_t` loops unrolled (`SEQ_UNROLLED=1`, alone) | 2.92 ns, slack −0.00 | 8,055 | 6,773 | 7 | 0 | 47 | 12,343 |
-| WIP before this conform (`ctr::decode`, alone) | 2.92 ns | 10,495 | 12,942 | 7 | 0 | 122 | 14,783 |
+| WIP before this conform (`ctr::decode`, alone; earlier run) | 2.92 ns | 10,495 | 12,942 | 7 | 0 | 122 | 14,783 |
 
 Notes:
 
@@ -184,6 +224,13 @@ Notes:
   multiplexers plus phi copies of the Cmd (10.4k FF). Its 63-input XOR check was estimated at 2,018 LUT.
 - **Warnings:** HLS 200-657 reports a "backward" channel in the cycle-counter region (walk → counter stop token).
   That is inherent to a counter that runs beside the walk.
+- **Timing:** the estimate is 2.92 ns. The walk sits at 0.00 slack and validate_hw at 0.01, against HLS's
+  internal 2.92 ns budget (4.0 ns minus 1.08 ns of clock uncertainty). That is under the 3.6 ns requirement.
+- **Interfaces, from csynth.rpt and the generated `xseq_top_hw.h`:** exactly the shipped ones.
+  - m_axi hp0..hp3 and io: 128-bit, 64-bit address, read burst 256, 16 outstanding; io write burst 256.
+  - s_axi_control has a 7-bit address: CTRL 0x00, ap_return 0x10, w0..w3 0x18 / 0x24 / 0x30 / 0x3C, xmem 0x48,
+    ymem 0x54, M 0x60, K 0x68, N 0x70.
+  - The sequencer never writes w0..w3.
 
 ## Review defects (CONTRACT.md 9, sequencer rows) and what changed
 
@@ -212,3 +259,7 @@ Notes:
   been synthesised.
 - **A frame-0 wiring number at or below 1e-5** would need the unfolded constants. The contract's folded recipe
   gives 1.56e-5.
+- **T-P1 on frame 3563: 2.11e-4 against a 2e-4 target.** Accepting it, or tightening a front end, is the contract
+  owner's and psamin's decision. The emulators of norm_residual, quantize, softmax and rope were mid-conform when
+  the laptop crashed at 16:54. Re-run `check_policy.py` when their owners finish; the json records which version
+  of each emulator a result used.

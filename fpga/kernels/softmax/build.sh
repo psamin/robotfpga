@@ -7,7 +7,8 @@
 #   tb_softmax_dfsim.exe  the processes as threads on FIFOs bounded at the pragma depths (deadlock model)
 # plus the prologue's integer c = fl32(p0 * log2 e) against the host FPU (--cparams), the divider on every
 # possible row sum against the host's 1.0f / S (--divider), and a negative control of the deadlock model: with
-# the row FIFO cut to 8 words (below one row of L = 256) it must report the deadlock (exit code 7).
+# the row FIFO cut to 8 words (below one row of L = 256) it must report the deadlock (exit code 7), and so must
+# the scale FIFO cut to 56 words (below one block of 256 rows).
 set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PY="${PY:-/c/kp/lerobot-venv/Scripts/python.exe}"
@@ -35,3 +36,10 @@ set +e
 rc=$?
 set -e
 if [ $rc -eq 7 ]; then echo "negative control (row FIFO 8 words, L = 256): deadlock detected as required: PASS"; else echo "negative control: expected deadlock exit 7, got $rc: FAIL"; exit 1; fi
+# second negative control: the scale FIFO below one block's 64 words (here 56) must deadlock on a 256-row block
+$CXX -DSMX_DFSIM -DSMX_RQ_DEPTH=56 -DSMX_DFSIM_TIMEOUT=5 -I"$HERE/tb_dfsim" -I"$INC" -o "$B/tb_softmax_neg_rq.exe" "$HERE/tb_softmax.cpp" -pthread
+set +e
+"$B/tb_softmax_neg_rq.exe" "$B/cases/plan_vision"
+rc=$?
+set -e
+if [ $rc -eq 7 ]; then echo "negative control (scale FIFO 56 words, 256-row block): deadlock detected as required: PASS"; else echo "negative control: expected deadlock exit 7, got $rc: FAIL"; exit 1; fi

@@ -2,16 +2,21 @@
 with this kernel's cycle model (norm_residual.h) and with the contract's row-unit model
 (contract_plan.cmd_clocks), side by side.
 
-Kernel model, per command (one DATAFLOW region; every flat loop one 128-bit word a clock):
-  per row   max(A words read   [flat read: the row pitch in words, gap words read and dropped; per-row bursts:
-                                K/4 + ddr_lat, the DDR latency is not overlapped across rows],
-                C words written [K/8 int16 or K/4 FP32; + wresp per row when C rows are not contiguous],
+Kernel model, per command (one DATAFLOW region: the row unit's backbone, quantize/quant_mode.h, with the NORM
+front end in its slot; every flat loop one 128-bit word a clock):
+  per row   max(A words read   [qz_rd: 16-word units, a row of K/4 words takes ceil(K/64) units (the last one
+                                shifted back over the row's end); units stay in flight across rows, so the DDR
+                                latency is paid once per command, not per row],
+                C words written [qz_wr: 8-word units: ceil(K/64) (int16) or ceil(K/32) (FP32) units a row, +
+                                one 8-word scale unit per 32 rows with F_QOUT],
                 K/4             [stats, affine, absmax, quantize],
-                l_scal          [p_scal: mean / var dividers, csynth row latency, LN or RMS],
-                l_rsqrt         [p_rsqrt: eps add + rsqrt, csynth row latency])
-  per chunk of <= 256 rows   a scale burst (rows / 4 words) + 2 wresp (the data burst's and the scale burst's)
-  per command   gamma (| beta) load (K/4 or K/2 words + ddr_lat) + ddr_lat + region fill (one row + l_scal +
-                l_rsqrt + l_pipe) + call_ovh
+                l_scal          [fe_scal: mean / var dividers, csynth row latency, LN or RMS],
+                l_rsqrt         [fe_rsqrt: eps add + rsqrt, csynth row latency])
+  rows [N, NP)   written as zero rows (8-word units)
+  per command   ddr_lat + the first row through the front end (K/4 + l_scal + l_rsqrt + l_pipe) + one row
+                through the backbone's absmax (K/4) + its reciprocal (30) + wresp + call_ovh; gamma (| beta)
+                load (K/4 or K/2 words + ddr_lat) runs in parallel with the first row and adds only what it
+                exceeds that by
 l_scal / l_rsqrt / l_pipe come from csynth (nr_top_csynth.rpt); ddr_lat, wresp and call_ovh are NOT measured
 on the board: assumptions, printed as such.
 
@@ -35,30 +40,31 @@ def kernel_clocks(c, a) -> float:
     K, N, B = c.K, c.N, c.B
     ln, q = bool(c.flags & C.F_LN), bool(c.flags & C.F_QOUT)
     NP = c.par(C.P_NP) or N
-    kw, cw = K / 4, (K / 8 if q else K / 4)
-    A, Cs = c.slot("A"), c.slot("C")
-    apw = A.pitch / 16
-    flat = N == 1 or (kw <= apw <= 1.5 * kw)
-    rd = apw if flat else kw + a.ddr_lat
-    cflat = NP == 1 or Cs.pitch / 16 == cw
-    wr = cw if cflat else cw + a.wresp
+    kw = K / 4
+    cw = K / 8 if q else K / 4
+    rd = 16 * -(-kw // 16) if kw >= 16 else kw
+    wr = 8 * -(-cw // 8) if cw >= 8 else cw
+    if q:
+        wr += 8 / 32  # one 8-word scale unit per 32 rows
     l_scal = a.l_scal_ln if ln else a.l_scal_rms
     row = max(rd, wr, kw, l_scal, a.l_rsqrt)
-    chunks = -(-NP // 256)
-    per_chunk = (NP / chunks / 4 if q else 0) + 2 * a.wresp
-    fill = (2 * kw if ln else kw) + 2 * a.ddr_lat + kw + l_scal + a.l_rsqrt + a.l_pipe + a.call_ovh
-    return B * (N * row + (NP - N) * cw + chunks * per_chunk) + fill
+    first = kw + l_scal + a.l_rsqrt + a.l_pipe
+    gload = max(0.0, (2 * kw if ln else kw) - first)
+    fill = a.ddr_lat + first + gload + kw + 30 + a.wresp + a.call_ovh
+    return B * (N * row + (NP - N) * wr) + fill
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--mhz", type=float, default=250.0)
-    ap.add_argument("--l_scal_ln", type=float, default=167, help="csynth: p_scal clocks per LayerNorm row")
-    ap.add_argument("--l_scal_rms", type=float, default=127, help="csynth: p_scal clocks per RMSNorm row")
-    ap.add_argument("--l_rsqrt", type=float, default=127, help="csynth: p_rsqrt clocks per row")
+    ap.add_argument("--l_scal_ln", type=float, default=167, help="csynth: fe_scal clocks per LayerNorm row")
+    ap.add_argument("--l_scal_rms", type=float, default=127, help="csynth: fe_scal clocks per RMSNorm row")
+    ap.add_argument("--l_rsqrt", type=float, default=127, help="csynth: fe_rsqrt clocks per row")
     ap.add_argument("--l_pipe", type=float, default=80, help="csynth: summed flat-loop pipeline depths")
     ap.add_argument("--ddr_lat", type=float, default=100, help="ASSUMED: DDR read latency, clocks")
-    ap.add_argument("--wresp", type=float, default=60, help="ASSUMED: write-response wait per burst, clocks")
+    ap.add_argument(
+        "--wresp", type=float, default=60, help="ASSUMED: write-response wait at the end of a command, clocks"
+    )
     ap.add_argument("--call_ovh", type=float, default=100, help="ASSUMED: dispatch + region start, clocks")
     a = ap.parse_args()
     P = CP.build(0x8_0000_0000)

@@ -1,5 +1,5 @@
-r"""Full-policy effect of the SOFTMAX unit (integration contract 1.0) on SmolVLA -12392 (3 replay frames), plus
-the softmax inventory and the unit's time model.
+r"""Full-policy effect of the SOFTMAX unit (integration contract 1.0) on SmolVLA -12392 (3 replay frames),
+plus the softmax inventory and the unit's time model.
 
 Every attention softmax of the policy (SigLIP vision tower, VLM prefix, action expert self- and
 cross-attention)

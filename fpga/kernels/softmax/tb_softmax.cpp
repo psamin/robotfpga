@@ -138,22 +138,16 @@ static int test_cparams() {
   return bad ? 1 : 0;
 }
 
-// The divider process on every row sum the unit can produce, S in [0, 2^23) (S <= 256 * 32767 < 2^23), against
-// the host's correctly rounded single division 1.0f / S (S is exact in FP32); S = 0 must give 1.0.
+// The divider (div_load + DSTEPS x div_step + div_result, the code compute's loop runs) on every row sum the unit
+// can produce, S in [0, 2^23) (S <= 256 * 32767 < 2^23), against the host's correctly rounded single division
+// 1.0f / S (S is exact in FP32); S = 0 must give 1.0.
 static int test_divider() {
-  const uint32_t per = 65536, items = (1u << 23) / per;
-  smx::Params p;
-  p.B = items;
-  p.NP4 = per;
-  smx::SStream sq("sq");
-  smx::RStream rq("rq");
-  for (uint32_t s = 0; s < (1u << 23); s++) sq.write(s);
-  smx::divider(sq, rq, p);
   long long bad = 0;
-  smx::Word w = 0;
   for (uint32_t s = 0; s < (1u << 23); s++) {
-    if (s % 4 == 0) w = rq.read();  // the divider packs 4 rows' scales per word, row n in lane n % 4
-    const uint32_t got = (uint32_t)w.range(32 * (s % 4) + 31, 32 * (s % 4));
+    smx::Div d;
+    smx::div_load(d, s);
+    for (int i = 0; i < smx::DSTEPS; i++) smx::div_step(d);
+    const uint32_t got = (uint32_t)smx::div_result(d);
     const uint32_t want = s ? ctr::f2u(1.0f / (float)s) : ctr::ONE_BITS;
     if (got != want) {
       if (bad < 5) printf("  divider S=%u: 0x%08x want 0x%08x\n", s, got, want);

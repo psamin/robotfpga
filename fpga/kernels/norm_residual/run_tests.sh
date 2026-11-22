@@ -18,7 +18,7 @@ mkdir -p "$HERE/build/vec"
   F="-std=c++14 -O2 -ffp-contract=off -D__USE_MINGW_ANSI_STDIO=1 -Wno-unknown-pragmas -Wno-unused-label"
   F="$F -I/c/Xilinx/Vitis_HLS/2022.2/include -I. -I.. -I../quantize"
   g++ $F tb_nr.cpp nr_top.cpp -static -o build/tb_nr_run.exe
-  g++ $F -DNR_DFSIM -pthread tb_nr.cpp nr_top.cpp -static -o build/tb_nr_df.exe
-  ./build/tb_nr_run.exe $UNITS build/vec/*.bin
-  ./build/tb_nr_df.exe build/vec/*.bin
+  g++ -Idfsim $F -DNR_DFSIM -DQZ_DFSIM -pthread tb_nr.cpp nr_top.cpp -static -o build/tb_nr_df.exe
+  ./build/tb_nr_run.exe $UNITS --passthrough 200 build/vec/*.bin
+  ./build/tb_nr_df.exe --passthrough 40 build/vec/*.bin
 )

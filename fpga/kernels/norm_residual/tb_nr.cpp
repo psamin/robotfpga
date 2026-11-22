@@ -3,8 +3,9 @@
 // bit-exact, everything else untouched), and the return code with contract.py's validate.
 // Two builds of the same sources:
 //   sequential   the processes of the DATAFLOW region run one after another on unbounded streams (C simulation)
-//   -DNR_DFSIM   every process in its own thread, every stream bounded at its declared depth (nr_dfsim.h):
-//                a FIFO-depth deadlock hangs here as on the IP and the watchdog exits with code 3
+//   -DNR_DFSIM   every process in its own thread, every stream bounded at its declared depth (dfsim/hls_stream.h,
+//                -Idfsim ahead of the Vitis include directory): the NORM front end and the backbone processes
+//                both; a FIFO-depth deadlock hangs here as on the IP and the watchdog exits with code 3
 //   g++ -std=c++14 -O2 -ffp-contract=off -I<Vitis_HLS>/include -I.. -I../quantize tb_nr.cpp nr_top.cpp -o tb.exe
 //   tb.exe [--units | --units-exhaustive] case1.bin ...   exit code 0 iff every unit test and case matches
 // The image sits at its DDR address: the ports point at image - base / 16, so the 64-bit / 40-bit address path
@@ -13,7 +14,10 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <cmath>
+#include <cstdlib>
 #include <random>
+#include <string>
 #include <vector>
 
 #include "norm_residual.h"
@@ -21,6 +25,23 @@
 namespace nr {
 long g_leftover = 0;
 }
+
+#ifdef NR_DFSIM
+// the depth of every stream of the region, by name: the same macros as the STREAM pragmas (norm_residual.h and
+// the backbone's quant_mode.h)
+int nr_dfsim_depth(const std::string& n) {
+  static const struct {
+    const char* name;
+    int depth;
+  } t[] = {{"qz_xs", QZ_D_XS}, {"nr_xz", NR_D_XZ}, {"qz_am", QZ_D_AM}, {"qz_d", QZ_D_D},   {"qz_ss", QZ_D_SS},
+           {"qz_sf", QZ_D_SF}, {"qz_ow", QZ_D_OW}, {"qz_sq", QZ_D_SQ}, {"qz_hd", QZ_D_HD}, {"qz_dd", QZ_D_DD},
+           {"nr_f2", NR_RFD},  {"nr_fs", 4},       {"nr_fv", 4},       {"nr_fm", 4}};
+  for (const auto& e : t)
+    if (n == e.name) return e.depth;
+  printf("dfsim: stream %s has no depth in tb_nr.cpp\n", n.c_str());
+  std::exit(4);
+}
+#endif
 
 int nr_top(const nr::word_t* w2, const nr::word_t* xmem, nr::word_t* ymem, int M, int K, int N);
 
@@ -252,7 +273,147 @@ static int unit_tests(bool exhaustive) {
   return (bad || badf || badr || badm) ? 1 : 0;
 }
 
+// ---------------------------------------------------------------- front-end slot transparency
+// The row unit keeps norm_front in the path of every opcode. With FC.on = false (any opcode but NORM) the region
+// qz_rd -> norm_front -> qz_amx .. qz_wr must write exactly what the backbone alone (qz::row_mode) writes. Random
+// valid QUANT_X (whole rows / 64-value segments, head-major or in-row), QUANT_W, QUANT_WT and COPY commands (the
+// construction follows quantize/tb_quant.cpp), placed above 4 GB; both runs start from the same image (sentinel
+// bytes everywhere but the A rows) and every byte is compared.
+static bool make_pt(std::mt19937_64& g, uint32_t op, ctr::Cmd& c, uint64_t ext[3]) {
+  auto r = [&](uint32_t n) { return (uint32_t)(g() % n); };
+  memset(&c, 0, sizeof c);
+  c.op = op;
+  c.B = 1 + (r(3) == 0 ? r(3) : 0);
+  c.N = r(4) == 0 ? 1 + r(8) : 1 + r(r(2) ? 80 : 200);
+  const uint32_t Ks[] = {8, 16, 24, 32, 40, 56, 64, 96, 128, 192, 320, 520, 720, 736, 768, 960, 1040, 2560, 3072};
+  c.K = (op == ctr::OP_QUANT_X || op == ctr::OP_COPY) ? Ks[r(19)] : 64 * (1 + r(r(2) ? 5 : 13));
+  if (op == ctr::OP_QUANT_WT && r(3) == 0) c.K = 32 * (1 + r(20));
+  const uint32_t K = c.K;
+  bool seg = false;
+  if (op == ctr::OP_QUANT_X) seg = K % 64 == 0 && K / 64 <= 64 && r(2);
+  if (op == ctr::OP_QUANT_W) seg = !(K == 64 && r(2));
+  if (op == ctr::OP_QUANT_WT) seg = K % 64 == 0 && r(3) != 0;
+  c.p[ctr::P_SEG] = seg ? 64 : 0;
+  const uint32_t SEG = seg ? 64 : K, nseg = K / SEG;
+  uint32_t NP = c.N;
+  if (op == ctr::OP_QUANT_W) NP = ctr::pad32(c.N) + 32 * r(2);
+  else if (op == ctr::OP_QUANT_WT) NP = ctr::pad8(c.N) + 8 * r(3);
+  else if (op == ctr::OP_QUANT_X && r(3) == 0) NP = c.N + r(9);
+  if (NP != c.N || r(2)) c.p[ctr::P_NP] = op == ctr::OP_COPY ? 0 : NP;
+  if (op != ctr::OP_COPY) c.p[ctr::P_SHIFT] = r(3) == 0 ? (uint32_t)((int)r(17) - 8) : 0;
+  c.flags = op == ctr::OP_QUANT_X ? ctr::F_QOUT : 0;
+  ctr::Slot& A = c.s[ctr::SLOT_A];
+  ctr::Slot& C = c.s[ctr::SLOT_C];
+  ctr::Slot& F = c.s[ctr::SLOT_F];
+  A.pitch = 4 * K + 16 * (r(3) ? 0 : 1 + r(8));
+  A.stride = c.B > 1 ? (uint32_t)(c.N * (uint64_t)A.pitch + 16 * r(5)) : 0;
+  uint64_t citem = 0, fitem = 0;
+  if (op == ctr::OP_COPY) {
+    C.pitch = 4 * K + 16 * r(3);
+    citem = (uint64_t)c.N * C.pitch;
+  } else if (op == ctr::OP_QUANT_X) {
+    if (nseg > 1 && r(2)) {
+      C.pitch = 128;
+      c.p[ctr::P_SEGC] = NP * 128 + 16 * r(3);
+      citem = (uint64_t)nseg * c.p[ctr::P_SEGC];
+    } else if (nseg > 1) {
+      C.pitch = 2 * K + 16 * r(3);
+      c.p[ctr::P_SEGC] = 128;
+      citem = (uint64_t)NP * C.pitch;
+    } else {
+      C.pitch = 2 * K + 16 * r(3);
+      citem = (uint64_t)NP * C.pitch + 16;
+    }
+  } else {
+    const uint32_t port = op == ctr::OP_QUANT_W ? (NP / 32) * SEG * 16 : (SEG / 32) * NP * 16;
+    C.pitch = port + 16 * r(3);
+    if (nseg > 1) c.p[ctr::P_SEGC] = 4 * C.pitch + 16 * r(2);
+    citem = nseg > 1 ? (uint64_t)nseg * c.p[ctr::P_SEGC] : 4 * (uint64_t)C.pitch;
+  }
+  C.stride = c.B > 1 ? (uint32_t)(citem + 16 * r(4)) : 0;
+  if (op != ctr::OP_COPY) {
+    const uint32_t nsc = op == ctr::OP_QUANT_WT ? SEG : NP;
+    if (nseg > 1) c.p[ctr::P_SEGF] = 4 * ctr::pad4(nsc) + 16 * r(3);
+    fitem = nseg > 1 ? (uint64_t)nseg * c.p[ctr::P_SEGF] : 4 * ctr::pad4(nsc);
+    F.stride = c.B > 1 ? (uint32_t)(fitem + 16 * r(3)) : 0;
+  }
+  ext[0] = (uint64_t)(c.B - 1) * A.stride + (uint64_t)(c.N - 1) * A.pitch + 4 * K;
+  ext[1] = (uint64_t)(c.B - 1) * C.stride + citem;
+  ext[2] = op == ctr::OP_COPY ? 0 : (uint64_t)(c.B - 1) * F.stride + fitem;
+  const uint64_t base = 0x1'0000'0000ull;  // above 4 GB
+  A.addr = base;
+  C.addr = (base + ext[0] + 8192) & ~4095ull;
+  if (op != ctr::OP_COPY) F.addr = (C.addr + ext[1] + 8192) & ~4095ull;
+  return ctr::validate(c) == ctr::ME_OK;
+}
+
+static int passthrough_tests(int n) {
+  std::mt19937_64 g(11);
+  const uint32_t ops[] = {ctr::OP_QUANT_X, ctr::OP_QUANT_W, ctr::OP_QUANT_WT, ctr::OP_COPY};
+  const char* names[] = {"QUANT_X", "QUANT_W", "QUANT_WT", "COPY"};
+  int fails = 0, runs[4] = {0, 0, 0, 0}, invalid = 0;
+  long bytes = 0;
+  for (int it = 0; it < n; it++) {
+    const int oi = it % 4;
+    ctr::Cmd c;
+    uint64_t ext[3];
+    if (!make_pt(g, ops[oi], c, ext)) {
+      invalid++;
+      it--;
+      if (invalid > 10 * n) break;
+      continue;
+    }
+    const uint64_t base = c.s[ctr::SLOT_A].addr;
+    const uint64_t end = (ops[oi] == ctr::OP_COPY ? c.s[ctr::SLOT_C].addr + ext[1] : c.s[ctr::SLOT_F].addr + ext[2]);
+    const size_t W = (size_t)((end - base + 4096) >> 4);
+    std::vector<nr::word_t> m1(W), m2;
+    nr::word_t sent = 0;
+    for (int b = 0; b < 16; b++) sent.range(8 * b + 7, 8 * b) = 0xA5;
+    for (size_t i = 0; i < W; i++) m1[i] = sent;
+    const ctr::Slot& A = c.s[ctr::SLOT_A];
+    for (uint32_t b = 0; b < c.B; b++)
+      for (uint32_t r = 0; r < c.N; r++) {
+        const bool zero = (g() % 17) == 0;  // all-zero rows: scale 1.0
+        for (uint32_t k = 0; k < c.K; k++) {
+          const uint64_t a = A.addr + (uint64_t)b * A.stride + (uint64_t)r * A.pitch + 4 * k - base;
+          std::normal_distribution<float> nd(0.0f, (float)std::ldexp(1.0, (int)(g() % 9) - 4));
+          const float v = zero ? 0.0f : nd(g);
+          m1[a >> 4].range(32 * ((a >> 2) & 3) + 31, 32 * ((a >> 2) & 3)) = ctr::f2u(v);
+        }
+      }
+    m2 = m1;
+    nr::word_t* p1 = m1.data() - (base >> 4);
+    nr::word_t* p2 = m2.data() - (base >> 4);
+    const long left0 = nr::g_leftover;
+    if (getenv("NR_PT_VERBOSE")) {
+      printf("  pt %d %s K=%u N=%u B=%u seg=%u NP=%u shift=%d\n", it, names[oi], c.K, c.N, c.B, c.p[ctr::P_SEG],
+             c.p[ctr::P_NP], (int)c.p[ctr::P_SHIFT]);
+      fflush(stdout);
+    }
+    const uint32_t r1 = qz::row_mode(c, p1, p1);
+    qz::RP p;
+    const uint32_t r2 = qz::row_plan(c, p);
+    if (r2 == ctr::ME_OK) nr::norm_df(p2, p2, p2, p, nr::front_plan(c));
+    long bad = 0;
+    for (size_t i = 0; i < W; i++)
+      if (m1[i] != m2[i]) bad++;
+    const bool ok = r1 == ctr::ME_OK && r2 == ctr::ME_OK && bad == 0 && nr::g_leftover == left0;
+    if (!ok) {
+      fails++;
+      printf("  pass-through %s K=%u N=%u B=%u seg=%u NP=%u: rc %u/%u, %ld words differ%s\n", names[oi], c.K, c.N,
+             c.B, c.p[ctr::P_SEG], c.p[ctr::P_NP], r1, r2, bad, nr::g_leftover != left0 ? ", leftover" : "");
+    }
+    runs[oi]++;
+    bytes += (long)(16 * W);
+  }
+  printf("front-end slot off (pass-through) vs qz::row_mode: %d QUANT_X, %d QUANT_W, %d QUANT_WT, %d COPY commands, "
+         "%ld image bytes compared: %s\n",
+         runs[0], runs[1], runs[2], runs[3], bytes, fails ? "FAIL" : "identical");
+  return fails ? 1 : 0;
+}
+
 int main(int argc, char** argv) {
+  setvbuf(stdout, nullptr, _IONBF, 0);  // a hang shows the last line printed
 #ifdef NR_DFSIM
   printf("build: threaded DATAFLOW model, streams bounded at their declared depths\n");
 #else
@@ -264,12 +425,16 @@ int main(int argc, char** argv) {
       fails += unit_tests(!strcmp(argv[i], "--units-exhaustive"));
       continue;
     }
+    if (!strcmp(argv[i], "--passthrough") && i + 1 < argc) {
+      fails += passthrough_tests(atoi(argv[++i]));
+      continue;
+    }
     fails += run_case(argv[i]);
     n++;
   }
 #ifdef NR_DFSIM
   printf("FIFO peaks over all cases (words or entries held / declared depth):\n");
-  for (auto& p : dfsim::peaks()) printf("  %-4s %4zu / %4zu\n", p.name.c_str(), p.peak, p.depth);
+  for (auto& p : dfsim::peaks()) printf("  %-6s %4zu / %4zu\n", p.name.c_str(), p.peak, p.depth);
 #endif
   printf("%s: %d case(s), %d failing\n", fails ? "FAIL" : "ALL PASS", n, fails);
   return fails ? 1 : 0;

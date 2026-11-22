@@ -3,10 +3,24 @@
 // Header only; the same code builds in Vitis HLS and in g++ (-I<Vitis_HLS>/include -ffp-contract=off).
 // nr_emul.py is its bit-exact model (tb_nr.cpp checks whole DDR images byte for byte).
 //
-// Call from the sequencer's dispatch switch (one call site, INLINE off), after ctr::validate_hw(c) == ME_OK:
-//     case ctr::OP_NORM: r = nr::norm_mode(c, w2, xmem, ymem); break;
-// Ports: rows A are read only on io (xmem); gamma / beta (host constants) on one hp port (read only); every
-// write goes out on io (ymem). No pointer argument, no register, no m_axi adapter of its own.
+// What this kernel contributes to the row unit (CONTRACT.md 4.1: "norm_residual: statistics + affine only") is the
+// NORM front end, nr::norm_front: a token stream in (the backbone reader's qz::XT tokens, one 128-bit word = 4 FP32
+// of a row each) and the same token stream out with every word replaced by its z = norm(y) word. It sits in the
+// front-end slot of the row unit's backbone (fpga/kernels/quantize/quant_mode.h), between qz_rd and qz_amx:
+//
+//     qz_rd -> [nr::norm_front] -> qz_amx -> qz_ss -> qz_sr -> qz_qt -> qz_wb -> qz_wr
+//
+// For any other opcode (FC.on = false) every token passes through unchanged, so the slot can stay in the path of
+// QUANT_X / QUANT_W / QUANT_WT / COPY. The reader, absmax, shared quantizer (quant_int16.h) and writer are the
+// backbone's, unchanged: NORM with F_QOUT is QUANT_X rows (p1 = 0) of z, NORM without F_QOUT is COPY rows of z.
+//
+// nr::norm_mode below is that composition for the NORM opcode alone, the mode function the sequencer's dispatch
+// switch calls (one call site, INLINE off) after ctr::validate_hw(c) == ME_OK:
+//     case ctr::OP_NORM: r = nr::norm_mode(c, hp, xmem, ymem); break;
+// In the merged row unit the backbone's row_plan maps OP_NORM to KX (F_QOUT) or KC (else) and its row_df calls
+// norm_front in the slot; then norm_mode is no longer needed (README "Integration").
+// Ports: rows A are read only on io (xmem, by qz_rd); gamma / beta (host constants) on one hp port, read only, once
+// per command; every write goes out on io (ymem, by qz_wr). No pointer argument, no register, no m_axi adapter.
 //
 // Record (CONTRACT.md 3.3): K = values per row (8..1024, K % 8 == 0), N rows per item, B items;
 //   A  FP32 rows   row n of item b at A.addr + b A.stride + n A.pitch
@@ -15,8 +29,8 @@
 //   F  F_QOUT: scales, row n at F.addr + b F.stride + 4 n; pad4(NP) floats, pad lanes 1.0
 //   p0 eps (FP32 bits), p4 scale shift (stored s 2^p4, zero rows 1.0), p5 NP (0 = N)
 //   flags F_QOUT, F_LN (F_RESID / F_SUM and the records layout are retired: the residual add is the GEMM epilogue)
-// Addresses: 64-bit in the record, 40-bit here (validate_hw rejects slot addresses >= 2^40). Row and item offsets
-// are sums of pitches / strides in 36-bit word indices, never a 32-bit product.
+// Addresses: 64-bit in the record, 40-bit in the datapath (validate_hw rejects slot addresses >= 2^40; the
+// backbone's word indices are 36 bits, rows and items advance by adding pitches and strides).
 //
 // Arithmetic (nr_emul.py has the same definition, CONTRACT.md 2.2 "NORM front end"):
 //   stats    block floating point with a running exponent, one pass: per 4-value word, E = max(E, max exponent
@@ -30,46 +44,35 @@
 //   rstd     ve = max(fl(var + eps), 2^-126) (an IEEE RNE add in integers, inputs flushed to zero);
 //            rstd = rn(1 / sqrt(ve)), correctly rounded (bit-serial 2^76 / M then integer sqrt); 0 if ve = inf
 //   z        ((y - mean) * rstd) * g + b, FP32 cores (RMSNorm: mean = 0, b = 0)
-//   q-out    the shared quantizer quantize/quant_int16.h (s = fl32(max(amax, 1e-30) / 32767), zero rows 1.0)
+//   q-out    the backbone's shared quantizer (quantize/quant_int16.h: s = fl32(max(amax, 1e-30) / 32767), zero rows 1.0)
 // Every FP32 core operation flushes denormal inputs and results to zero with the sign kept (the Xilinx cores,
 // contract 2.3); the g++ build models that with ctr::ref::ftz, so the host C model is the hardware.
 //
-// DATAFLOW processes (one 128-bit word = 4 FP32 a clock in each flat loop):
-//   ---- row-unit common parts: stand-ins for the shared reader / quantizer / writer (CONTRACT.md 4.1, quantize/)
-//   p_rd     A rows over io: one burst per item when the row gap is at most half a row (gap words dropped),
-//            else one burst per row                                                          -> fa
-//   ---- NORM front end: what the row unit takes from this kernel (nr::front_* below, word stream in and out)
-//   p_stats  running E, Y_i, S, Q (4 squares a clock); the row goes on to f2 (BRAM row FIFO)  -> f2, fs
-//   p_scal   K Q - S^2 (shift-add), then mean and var by two small bit-serial dividers (~160 clocks a LN row,
-//            ~125 an RMS row)                                                                -> fv
-//   p_rsqrt  ve and rstd in integers (~120 clocks a row)                                     -> fm
-//   p_affine gamma | beta into one dual-port BRAM once per command; z = ((y - mean) rstd) g + b -> fz
-//   ---- row-unit common parts (stand-ins)
-//   p_qamax  row FIFO + per-row absmax                                                       -> fq, fam
-//   p_qscal  qz::row_scale (1 reciprocal bit a clock)                                        -> frs
-//   p_quant  4 x qz::quant_elem a clock (or FP32 pass-through)                               -> fo, fsc
-//   p_wr     C rows (one burst per <= 256-row chunk when C rows are contiguous, else per row), zero rows
-//            [N, NP), then the chunk's scales in one burst (pad lanes 1.0)
-// Steady state: max(K/4, A words read, C words written) clocks a row, as long as p_scal and p_rsqrt keep up
-// (~160 LN / ~125 RMS and ~120 clocks a row): io-bound for LN rows of K >= 640 and RMS rows of K >= 512 (all
-// SmolVLA rows: vision LN 768, LM RMS 960, expert RMS 720); shorter rows are scalar-bound.
+// Front-end processes (nested DATAFLOW region; one token = one 128-bit word = 4 FP32 a clock in each flat loop):
+//   fe_stats   running E, Y_i, S, Q (4 squares a clock); every token goes on to f2 (BRAM row FIFO)  -> f2, fs
+//   fe_scal    K Q - S^2 (shift-add), then mean and var by two bit-serial dividers (~167 clocks a LN row,
+//              ~127 an RMS row)                                                                    -> fv
+//   fe_rsqrt   ve and rstd in integers (~127 clocks a row)                                         -> fm
+//   fe_affine  gamma | beta into one dual-port BRAM once per command; z = ((y - mean) rstd) g + b  -> out
+// Steady state: max(K/4, A words read, C words written) clocks a row, as long as fe_scal and fe_rsqrt keep up:
+// io-bound for LN rows of K >= 672 and RMS rows of K >= 512 (all SmolVLA rows: vision LN 768, LM RMS 960, expert
+// RMS 720); shorter rows are scalar-bound.
 #pragma once
 #include <ap_int.h>
 #include <hls_stream.h>
 #include <stdint.h>
+#ifdef NR_DFSIM
+#include <thread>
+#endif
 
 #include "contract.h"
-#include "quant_int16.h"
-
-#ifdef NR_DFSIM
-#include "nr_dfsim.h"
-#endif
+#include "quant_mode.h"  // the row unit's backbone (-I../quantize): qz::RP, qz::XT, qz::row_plan, qz_rd .. qz_wr
 
 #ifndef NR_FADD_IMPL
-#define NR_FADD_IMPL fulldsp  // FP32 add / sub cores of the normalize stage: fulldsp | fabric
+#define NR_FADD_IMPL fulldsp  // FP32 add / sub cores of the affine stage: fulldsp | fabric
 #endif
 #ifndef NR_FMUL_IMPL
-#define NR_FMUL_IMPL fulldsp  // FP32 multipliers of the normalize stage: maxdsp | fulldsp | meddsp | fabric
+#define NR_FMUL_IMPL fulldsp  // FP32 multipliers of the affine stage: maxdsp | fulldsp | meddsp | fabric
 #endif
 #ifndef NR_SQ_IMPL
 #define NR_SQ_IMPL dsp  // the 4 exact 25 x 25 squares of the statistics: dsp | fabric
@@ -77,9 +80,8 @@
 
 namespace nr {
 
-typedef ap_uint<128> word_t;
-typedef ap_uint<40> baddr_t;  // byte address (validate_hw: < 2^40)
-typedef ap_uint<36> waddr_t;  // 128-bit word index = byte address >> 4
+typedef qz::word_t word_t;  // ap_uint<128>: the io and hp word
+typedef qz::wa_t waddr_t;   // 128-bit word index = byte address >> 4 (36 bits: byte addresses < 2^40)
 
 constexpr int L = 4;                   // lanes: FP32 values per io word
 constexpr int KMAX = ctr::NORM_K_MAX;  // 1024
@@ -87,23 +89,19 @@ constexpr int KWMAX = KMAX / L;        // 256 words in the longest row
 #ifndef NR_RFD
 #define NR_RFD 512
 #endif
-constexpr int RFD = NR_RFD;  // row FIFOs (words): >= K/4 (one row) or the region deadlocks (p_stats / p_qamax hold
-                             // a whole row before its statistic; tb -DNR_DFSIM: 240 hangs at K = 1024, 256 runs);
+constexpr int RFD = NR_RFD;  // f2 row FIFO (tokens): >= K/4 (one row) or the region deadlocks (fe_stats passes a
+                             // whole row before its statistic; tb -DNR_DFSIM: 240 hangs at K = 1024, 256 runs);
                              // + the scalar latency (~300 clocks) for full rate
-constexpr int SCH = 256;     // writer chunk (rows): its scales are buffered, then written in one burst
+#ifndef NR_D_XZ
+#define NR_D_XZ 16  // norm_front -> qz_amx tokens (as the backbone's rd -> amx)
+#endif
 constexpr uint32_t FLT_MIN_BITS = 0x00800000u;
 constexpr uint32_t INF_BITS = 0x7F800000u;
 
-#ifdef NR_DFSIM
-template <class T>
-using strm = dfsim::stream<T>;
-#define NR_DECL(T, name, D) dfsim::stream<T> name(D, #name)
+#ifdef NR_DFSIM  // host deadlock model: every process its own thread, every stream bounded (dfsim/hls_stream.h)
 #define NR_RUN(call) dfsim::run([&] { call; })
 #define NR_JOIN() dfsim::join_all()
 #else
-template <class T>
-using strm = hls::stream<T>;
-#define NR_DECL(T, name, D) hls::stream<T, D> name
 #define NR_RUN(call) call
 #define NR_JOIN()
 #endif
@@ -112,46 +110,30 @@ using strm = hls::stream<T>;
 extern long g_leftover;  // host only: streams left non-empty at the end of a call (tb_nr.cpp defines it)
 #endif
 
-// One command, decoded once by norm_mode (STABLE in the region; every process reads only what it needs).
-struct Cfg {
-  ap_uint<11> K;
-  ap_uint<9> KW;    // K / 4: words of an FP32 row
-  ap_uint<9> CW;    // words of an output row: K / 8 (F_QOUT) or K / 4
-  ap_uint<17> N;    // rows per item (1..65535)
-  ap_uint<17> NP;   // rows written per item (F_QOUT: N..65535; else N)
-  ap_uint<17> B;    // items (1..65535)
-  ap_uint<25> NKW;  // N * KW: words of an item (< 2^24)
-  bool ln, qout;
-  ap_uint<32> eps;  // FP32 bits
-  ap_int<5> shift;  // p4 (-8..8)
+// The front end's view of one command (STABLE in the region; every process reads only what it needs).
+struct FC {
+  bool on;          // a NORM command; else every token passes through unchanged
+  bool ln;          // F_LN
+  ap_uint<11> K;    // values per row (8..1024)
+  ap_uint<9> KW;    // K / 4: words (tokens) of a row
   ap_uint<21> DV;   // divisor of var: K^2 (LN) or K (RMS: var = Q / K)
-  // A (io read)
-  waddr_t a_w;
-  ap_uint<28> a_pw, a_sw;  // pitch, stride in words
-  bool a_flat;
-  ap_uint<26> a_len;  // flat: (N - 1) a_pw + KW words a burst
-  // E (hp read)
-  waddr_t e_w;
-  // C, F (io write)
-  waddr_t c_w, f_w;
-  ap_uint<28> c_pw, c_sw, f_sw;
-  bool c_flat;
+  ap_uint<32> eps;  // FP32 bits (p0)
+  waddr_t e_w;      // gamma (word index on the hp port); beta at e_w + KW
 };
 
 struct Stat {
   ap_int<38> S;   // |S| < 2^35 + 2^8
   ap_uint<62> Q;  // < 2^60 + 2^8
   ap_uint<8> emax;
+  bool end;  // the command's last row
 };
 struct MV {
   uint32_t mean, var;
+  bool end;
 };
 struct MR {
   float mean, rstd;
-};
-struct QS {  // per-row quantizer state
-  qz::RowScale rs;
-  qz::abits_t a;  // row absmax (stored_scale: zero rows 1.0, non-finite rows the absmax)
+  bool end;
 };
 
 // ------------------------------------------------------------------------------------------ FP32 cores
@@ -208,22 +190,35 @@ static inline ap_uint<25> yfix_mag(uint32_t b, ap_uint<8> e_run) {
   const ap_uint<26> w = t > 26 ? ap_uint<26>(0) : ap_uint<26>(m4 >> ap_uint<5>(t));
   return ap_uint<25>((ap_uint<27>(w) + 1) >> 1);
 }
-// rnd(x / 2^s) = floor((x + 2^(s-1)) / 2^s) for s >= 1 (round half up), x for s = 0; = ((x >> (s-1)) + 1) >> 1
-template <int W>
-static inline ap_int<W> rshr_s(ap_int<W> x, ap_uint<9> s) {
+// rnd(x / 2^s) + a, rnd = round half up: rnd(x / 2^s) = floor((x + 2^(s-1)) / 2^s) = ((x >> (s-1)) + 1) >> 1 for
+// s >= 1, x for s = 0. One add: floor((y + 1) / 2) + a = floor((y + 1 + 2a) / 2) for integers y, a, so with
+// y = (2x) >> s (= x >> (s-1) for s >= 1, 2x for s = 0: one shifter) and c = (s >= 1): result = (y + (2a | c)) >> 1.
+// clr: the row's first word (x counts as 0). This is the statistics' loop-carried path: one shifter, one adder.
+template <int W, int WA>
+static inline ap_int<W> racc_s(ap_int<W> x, ap_uint<9> s, ap_int<WA> a, bool clr) {
 #pragma HLS INLINE
-  if (s == 0) return x;
-  const ap_uint<9> s1 = s - 1;
-  const ap_int<W> t = x >> (s1 > W - 1 ? ap_uint<9>(W - 1) : s1);  // >> W-1 of a W-bit signed is 0 or -1
-  return (ap_int<W + 1>(t) + 1) >> 1;
+  const ap_int<W + 1> x2 = ap_int<W + 1>(x) << 1;
+  const ap_int<W + 1> y = clr ? ap_int<W + 1>(0) : ap_int<W + 1>(x2 >> (s > W ? ap_uint<9>(W) : s));  // 0 or -1 past W
+  const ap_int<W + 2> a2 = (ap_int<W + 2>(a) << 1) | ap_int<W + 2>(!clr && s != 0);
+  return ap_int<W>((ap_int<W + 2>(y) + a2) >> 1);
 }
-template <int W>
-static inline ap_uint<W> rshr_u(ap_uint<W> x, ap_uint<9> s) {
+template <int W, int WA>
+static inline ap_uint<W> racc_u(ap_uint<W> x, ap_uint<10> s, ap_uint<WA> a, bool clr) {
 #pragma HLS INLINE
-  if (s == 0) return x;
-  const ap_uint<9> s1 = s - 1;
-  const ap_uint<W> t = s1 >= W ? ap_uint<W>(0) : ap_uint<W>(x >> s1);
-  return ap_uint<W>((ap_uint<W + 1>(t) + 1) >> 1);
+  const ap_uint<W + 1> x2 = ap_uint<W + 1>(x) << 1;
+  const ap_uint<W + 1> y = (clr || s > W) ? ap_uint<W + 1>(0) : ap_uint<W + 1>(x2 >> s);
+  const ap_uint<W + 2> a2 = (ap_uint<W + 2>(a) << 1) | ap_uint<W + 2>(!clr && s != 0);
+  return ap_uint<W>((ap_uint<W + 2>(y) + a2) >> 1);
+}
+
+// A pipeline register: identity in C, one clock of latency in hardware (the recipe of Vitis HLS's hls::reg,
+// include/utils/x_hls_utils.h). It keeps the statistics' feed-forward adder trees out of the loop-carried cycle.
+template <class T>
+static T nr_reg(T d) {
+#pragma HLS PIPELINE II = 1
+#pragma HLS LATENCY min = 1 max = 1
+#pragma HLS INLINE off
+  return d;
 }
 
 // ------------------------------------------------------------------------------------------ integer scalars
@@ -390,182 +385,154 @@ rs:
   return ((uint32_t)field << 23) | ((uint32_t)m & 0x7FFFFFu);
 }
 
-// ------------------------------------------------------------------------------------------ common: reader
-// One read burst of len words from word src + off; keeps the words whose position in a pw-word row is < KW.
-static void rd_seg(const word_t* src, waddr_t off, ap_uint<26> len, ap_uint<28> pw, ap_uint<9> KW,
-                   strm<word_t>& fo) {
-#pragma HLS INLINE off
-  ap_uint<28> jr = 0;
-rd:
-  for (ap_uint<26> j = 0; j < len; j++) {
-#pragma HLS PIPELINE II = 1
-#pragma HLS LOOP_TRIPCOUNT min = 180 max = 131072 avg = 12000
-    const word_t w = src[off + j];
-    if (jr < KW) fo.write(w);
-    jr = jr == pw - 1 ? ap_uint<28>(0) : ap_uint<28>(jr + 1);
-  }
-}
-
-static void p_rd(const word_t* xmem, Cfg c, strm<word_t>& fa) {
-  // flat: one segment per item over (N - 1) pitch + KW words; else N segments of KW words (one per row)
-  const ap_uint<17> nseg = c.a_flat ? ap_uint<17>(1) : c.N;
-  const ap_uint<26> len = c.a_flat ? c.a_len : ap_uint<26>(c.KW);
-  const ap_uint<28> pw = c.a_flat ? c.a_pw : ap_uint<28>(c.KW);
-  waddr_t ib = c.a_w;
-items:
-  for (ap_uint<17> b = 0; b < c.B; b++) {
-#pragma HLS LOOP_TRIPCOUNT min = 1 max = 2 avg = 1
-    waddr_t rb = ib;
-  segs:
-    for (ap_uint<17> n = 0; n < nseg; n++) {
-#pragma HLS LOOP_TRIPCOUNT min = 1 max = 512 avg = 1
-#pragma HLS LOOP_FLATTEN off
-      rd_seg(xmem, rb, len, pw, c.KW, fa);
-      rb += c.a_pw;
-    }
-    ib += c.a_sw;
-  }
-}
-
 // ------------------------------------------------------------------------------------------ NORM front end
-// Running exponent + exact block-fixed sums, 4 values a clock; every word goes on to f2 (the row FIFO the affine
-// stage reads once the row's mean / rstd are known).
-static void p_stats(Cfg c, strm<word_t>& fa, strm<word_t>& f2, strm<Stat>& fs) {
-items:
-  for (ap_uint<17> b = 0; b < c.B; b++) {
-#pragma HLS LOOP_TRIPCOUNT min = 1 max = 2 avg = 1
-    ap_uint<8> E = 0;
-    ap_int<38> S = 0;
-    ap_uint<62> Q = 0;
-    ap_uint<9> jr = 0;
-  acc:
-    for (ap_uint<25> j = 0; j < c.NKW; j++) {
-#pragma HLS LOOP_FLATTEN off
+// Running exponent + exact block-fixed sums, 4 values a clock; every token goes on to f2 (the row FIFO the affine
+// stage reads once the row's mean / rstd are known). Off (another opcode): tokens pass, no statistics are sent.
+static void fe_stats(const FC c, hls::stream<qz::XT>& xs, hls::stream<qz::XT>& f2, hls::stream<Stat>& fs) {
+  ap_uint<8> E = 0;
+  ap_int<38> S = 0;
+  ap_uint<62> Q = 0;
+  ap_uint<9> jr = 0;  // word of the row
+acc:
+  for (;;) {
 #pragma HLS PIPELINE II = 1
-#pragma HLS LOOP_TRIPCOUNT min = 9000 max = 131072 avg = 20000
-      const word_t w = fa.read();
-      ap_uint<8> m = 0;
-      for (int l = 0; l < L; l++) {
+#pragma HLS LOOP_TRIPCOUNT min = 2 max = 131072 avg = 20000
+    const qz::XT t = xs.read();
+    const bool dat = t.fwd;  // a row word (the reader's shift-back overlap tokens have fwd = 0: passed, not counted)
+    const word_t w = t.w;
+    ap_uint<8> m = 0;
+    for (int l = 0; l < L; l++) {
 #pragma HLS UNROLL
-        const ap_uint<8> e = w.range(32 * l + 30, 32 * l + 23);
-        m = e > m ? e : m;
-      }
-      const bool first = jr == 0;
-      const ap_uint<8> E1 = (first || m > E) ? m : E;
-      const ap_uint<9> d = first ? ap_uint<9>(0) : ap_uint<9>(E1 - E);
-      // sum of +-|Y|: a negative lane adds ~|Y| (its bits inverted) and 1 (counted in nneg): -x = ~x + 1
-      ap_int<28> s4 = 0;
-      ap_uint<3> nneg = 0;
-      ap_uint<52> q4 = 0;
-      for (int l = 0; l < L; l++) {
+      const ap_uint<8> e = w.range(32 * l + 30, 32 * l + 23);
+      m = e > m ? e : m;
+    }
+    const bool first = dat && jr == 0;
+    const ap_uint<8> E1 = (dat && (first || m > E)) ? m : E;
+    const ap_uint<9> d = first ? ap_uint<9>(0) : ap_uint<9>(E1 - E);  // 0 for a non-data token
+    // sum of +-|Y|: a negative lane adds ~|Y| (its bits inverted) and 1 (counted in nneg): -x = ~x + 1
+    ap_int<28> s4 = 0;
+    ap_uint<3> nneg = 0;
+    ap_uint<52> q4 = 0;
+    for (int l = 0; l < L; l++) {
 #pragma HLS UNROLL
-        const uint32_t bits = (uint32_t)w.range(32 * l + 31, 32 * l);
-        const ap_uint<25> mag = yfix_mag(bits, E1);
-        const bool neg = bits >> 31;
-        const ap_int<27> sm = ap_int<27>(ap_uint<27>(mag) ^ (neg ? ap_uint<27>(0x7FFFFFF) : ap_uint<27>(0)));
-        s4 += sm;
-        nneg += neg;
-        ap_uint<50> sq = mag * mag;
+      const uint32_t bits = (uint32_t)w.range(32 * l + 31, 32 * l);
+      const ap_uint<25> mag = yfix_mag(bits, E1);
+      const bool neg = bits >> 31;
+      const ap_int<27> sm = ap_int<27>(ap_uint<27>(mag) ^ (neg ? ap_uint<27>(0x7FFFFFF) : ap_uint<27>(0)));
+      s4 += sm;
+      nneg += neg;
+      ap_uint<50> sq = mag * mag;
 #pragma HLS BIND_OP variable = sq op = mul impl = NR_SQ_IMPL
-        q4 += sq;
-      }
-      s4 += nneg;
-      const ap_int<38> S0 = first ? ap_int<38>(0) : rshr_s<38>(S, d);
-      const ap_uint<62> Q0 = first ? ap_uint<62>(0) : rshr_u<62>(Q, ap_uint<9>(d << 1));
-      const ap_int<38> S1 = S0 + s4;
-      const ap_uint<62> Q1 = Q0 + q4;
-      S = S1;
-      Q = Q1;
-      E = E1;
-      f2.write(w);
-      if (jr == c.KW - 1) {
+      q4 += sq;
+    }
+    s4 += nneg;
+    if (!dat) {  // contributes nothing: S1 = S, Q1 = Q (zeroed before the register, off the loop-carried path)
+      s4 = 0;
+      q4 = 0;
+    }
+    // the row's sums: the exponent step d, s4 and q4 of this word are registered first (nr_reg), so the S / Q
+    // recurrence is one shift and one add a clock
+    ap_uint<90> pk = (ap_uint<1>(first), d, ap_uint<28>(s4), q4);
+    pk = nr_reg(pk);
+    const bool first_r = pk[89];
+    const ap_uint<9> d_r = pk(88, 80);
+    const ap_int<28> s4_r = ap_int<28>(ap_uint<28>(pk(79, 52)));
+    const ap_uint<52> q4_r = pk(51, 0);
+    const ap_int<38> S1 = racc_s<38, 28>(S, d_r, s4_r, first_r);
+    const ap_uint<62> Q1 = racc_u<62, 52>(Q, ap_uint<10>(ap_uint<10>(d_r) << 1), q4_r, first_r);
+    S = S1;
+    Q = Q1;
+    E = E1;
+    f2.write(t);
+    if (!dat) {
+    } else if (jr == c.KW - 1) {
+      if (c.on) {
         Stat st;
         st.S = S1;
         st.Q = Q1;
         st.emax = E1;
+        st.end = t.end;
         fs.write(st);
-        jr = 0;
-      } else {
-        jr++;
       }
+      jr = 0;
+    } else {
+      jr++;
     }
+    if (t.end) break;
   }
 }
 
 // num = max(K Q - S^2, 0) (LN: one signed shift-add accumulator, 37 clocks) or Q (RMS, divided by K instead of
 // K^2: the same rational); var = rn(num / DV) 2^(2 k1), mean = rn(|S| / K) 2^k1 (LN): two bit-serial dividers side
-// by side, 118 clocks. About 160 clocks a LayerNorm row, 125 an RMSNorm row.
-static void p_scal(Cfg c, strm<Stat>& fs, strm<MV>& fv) {
-items:
-  for (ap_uint<17> b = 0; b < c.B; b++) {
-#pragma HLS LOOP_TRIPCOUNT min = 1 max = 2 avg = 1
-  rows:
-    for (ap_uint<17> r = 0; r < c.N; r++) {
-#pragma HLS LOOP_TRIPCOUNT min = 50 max = 512 avg = 100
-#pragma HLS LOOP_FLATTEN off
+// by side, 118 clocks. About 167 clocks a LayerNorm row, 127 an RMSNorm row.
+static void fe_scal(const FC c, hls::stream<Stat>& fs, hls::stream<MV>& fv) {
+  if (!c.on) return;
+rows:
+  for (;;) {
+#pragma HLS LOOP_TRIPCOUNT min = 1 max = 1024 avg = 100
 #pragma HLS PIPELINE off
-      const Stat st = fs.read();
-      const bool sneg = st.S < 0;
-      const ap_uint<37> Sa = sneg ? ap_uint<37>(-st.S) : ap_uint<37>(st.S);
-      ap_uint<72> num = st.Q;
-      if (c.ln) {
-        ap_int<74> acc = 0;
-        ap_uint<72> qs = st.Q, ss = Sa;
-      mul:
-        for (int i = 0; i < 37; i++) {
+    const Stat st = fs.read();
+    const bool sneg = st.S < 0;
+    const ap_uint<37> Sa = sneg ? ap_uint<37>(-st.S) : ap_uint<37>(st.S);
+    ap_uint<72> num = st.Q;
+    if (c.ln) {
+      ap_int<74> acc = 0;
+      ap_uint<72> qs = st.Q, ss = Sa;
+    mul:
+      for (int i = 0; i < 37; i++) {
 #pragma HLS PIPELINE II = 1
-          const ap_uint<72> pa = (i < 11 && c.K[i < 11 ? i : 0]) ? qs : ap_uint<72>(0);
-          const ap_uint<72> pb = Sa[i] ? ss : ap_uint<72>(0);
-          acc = acc + ap_int<74>(pa) - ap_int<74>(pb);
-          qs = qs << 1;
-          ss = ss << 1;
-        }
-        num = acc < 0 ? ap_uint<72>(0) : ap_uint<72>(acc);
+        const ap_uint<72> pa = (i < 11 && c.K[i < 11 ? i : 0]) ? qs : ap_uint<72>(0);
+        const ap_uint<72> pb = Sa[i] ? ss : ap_uint<72>(0);
+        acc = acc + ap_int<74>(pa) - ap_int<74>(pb);
+        qs = qs << 1;
+        ss = ss << 1;
       }
-      Div<21> dv;
-      Div<11> dm;
-      div_init(dv, num);
-      div_init(dm, ap_uint<72>(Sa));
-    dvd:
-      for (int i = 1; i <= DIV_STEPS; i++) {
-#pragma HLS PIPELINE II = 1
-        div_step(dv, c.DV, ap_uint<7>(i));
-        div_step(dm, ap_uint<11>(c.K), ap_uint<7>(i));
-      }
-      const int k1 = (int)st.emax - 151;
-      MV o;
-      o.var = div_pack(dv, num == 0, 2 * k1, false);
-      o.mean = c.ln ? div_pack(dm, Sa == 0, k1, sneg) : 0u;
-      fv.write(o);
+      num = acc < 0 ? ap_uint<72>(0) : ap_uint<72>(acc);
     }
+    Div<21> dv;
+    Div<11> dm;
+    div_init(dv, num);
+    div_init(dm, ap_uint<72>(Sa));
+  dvd:
+    for (int i = 1; i <= DIV_STEPS; i++) {
+#pragma HLS PIPELINE II = 1
+      div_step(dv, c.DV, ap_uint<7>(i));
+      div_step(dm, ap_uint<11>(c.K), ap_uint<7>(i));
+    }
+    const int k1 = (int)st.emax - 151;
+    MV o;
+    o.var = div_pack(dv, num == 0, 2 * k1, false);
+    o.mean = c.ln ? div_pack(dm, Sa == 0, k1, sneg) : 0u;
+    o.end = st.end;
+    fv.write(o);
+    if (st.end) break;
   }
 }
 
-static void p_rsqrt(Cfg c, strm<MV>& fv, strm<MR>& fm) {
-items:
-  for (ap_uint<17> b = 0; b < c.B; b++) {
-#pragma HLS LOOP_TRIPCOUNT min = 1 max = 2 avg = 1
-  rows:
-    for (ap_uint<17> r = 0; r < c.N; r++) {
-#pragma HLS LOOP_TRIPCOUNT min = 50 max = 512 avg = 100
-#pragma HLS LOOP_FLATTEN off
+static void fe_rsqrt(const FC c, hls::stream<MV>& fv, hls::stream<MR>& fm) {
+  if (!c.on) return;
+rows:
+  for (;;) {
+#pragma HLS LOOP_TRIPCOUNT min = 1 max = 1024 avg = 100
 #pragma HLS PIPELINE off
-      const MV mv = fv.read();
-      uint32_t vb = fadd_pos(mv.var, (uint32_t)c.eps);
-      if (vb < FLT_MIN_BITS) vb = FLT_MIN_BITS;  // var = 0 with a flushed (denormal) eps
-      MR o;
-      o.mean = ctr::u2f(mv.mean);
-      o.rstd = vb >= INF_BITS ? 0.0f : ctr::u2f(rsqrt_cr(vb));
-      fm.write(o);
-    }
+    const MV mv = fv.read();
+    uint32_t vb = fadd_pos(mv.var, (uint32_t)c.eps);
+    if (vb < FLT_MIN_BITS) vb = FLT_MIN_BITS;  // var = 0 with a flushed (denormal) eps
+    MR o;
+    o.mean = ctr::u2f(mv.mean);
+    o.rstd = vb >= INF_BITS ? 0.0f : ctr::u2f(rsqrt_cr(vb));
+    o.end = mv.end;
+    fm.write(o);
+    if (mv.end) break;
   }
 }
 
 // gamma | beta from hp into one dual-port BRAM once per command (gamma at [0, KW), beta at [KWMAX, KWMAX + KW)),
-// then z = ((y - mean) rstd) g + b, 4 lanes a clock.
+// then z = ((y - mean) rstd) g + b, 4 lanes a clock; the token's flags pass unchanged.
 // -DNR_KFOLD (area measurement only, NOT contract 1.0: E is ignored): z = (y - mean) rstd, gamma / beta folded into
 // the next linear by the packer (README "Area"); removes 2 of the 4 FP32 cores a lane and the table.
-static void p_affine(const word_t* hp, Cfg c, strm<word_t>& f2, strm<MR>& fm, strm<word_t>& fz) {
+static void fe_affine(const word_t* hp, const FC c, hls::stream<qz::XT>& f2, hls::stream<MR>& fm,
+                      hls::stream<qz::XT>& out) {
 #ifndef NR_KFOLD
   word_t gb[2 * KWMAX];
 #ifdef NR_URAM
@@ -573,326 +540,176 @@ static void p_affine(const word_t* hp, Cfg c, strm<word_t>& f2, strm<MR>& fm, st
 #else
 #pragma HLS BIND_STORAGE variable = gb type = ram_t2p impl = bram
 #endif
-  // one burst: gamma (KW words), then beta (KW words, F_LN) right behind it
-  const ap_uint<10> nload = c.ln ? ap_uint<10>(2 * c.KW) : ap_uint<10>(c.KW);
-  ap_uint<9> jl = 0;
-  ap_uint<1> second = 0;
-load_gb:
-  for (ap_uint<10> j = 0; j < nload; j++) {
+  if (c.on) {
+    // one burst: gamma (KW words), then beta (KW words, F_LN) right behind it
+    const ap_uint<10> nload = c.ln ? ap_uint<10>(2 * c.KW) : ap_uint<10>(c.KW);
+    ap_uint<9> jl = 0;
+    ap_uint<1> second = 0;
+  load_gb:
+    for (ap_uint<10> j = 0; j < nload; j++) {
 #pragma HLS PIPELINE II = 1
-#pragma HLS LOOP_TRIPCOUNT min = 180 max = 512 avg = 200
-    gb[(second, ap_uint<8>(jl))] = hp[c.e_w + j];
-    if (jl == c.KW - 1) {
-      jl = 0;
-      second = 1;
-    } else {
-      jl++;
+#pragma HLS LOOP_TRIPCOUNT min = 2 max = 512 avg = 200
+      gb[(second, ap_uint<8>(jl))] = hp[c.e_w + j];
+      if (jl == c.KW - 1) {
+        jl = 0;
+        second = 1;
+      } else {
+        jl++;
+      }
     }
   }
 #else
   (void)hp;
 #endif
-items:
-  for (ap_uint<17> b = 0; b < c.B; b++) {
-#pragma HLS LOOP_TRIPCOUNT min = 1 max = 2 avg = 1
-    MR mr;
-    mr.mean = 0.0f;
-    mr.rstd = 0.0f;
-    ap_uint<8> jr = 0;
-  nz:
-    for (ap_uint<25> j = 0; j < c.NKW; j++) {
-#pragma HLS LOOP_FLATTEN off
+  MR mr;
+  mr.mean = 0.0f;
+  mr.rstd = 0.0f;
+  mr.end = false;
+  ap_uint<9> jr = 0;
+nz:
+  for (;;) {
 #pragma HLS PIPELINE II = 1
-#pragma HLS LOOP_TRIPCOUNT min = 9000 max = 131072 avg = 20000
-      if (jr == 0) mr = fm.read();
-      const word_t w = f2.read();
+#pragma HLS LOOP_TRIPCOUNT min = 2 max = 131072 avg = 20000
+    qz::XT t = f2.read();
+    const bool dat = t.fwd;  // row words only; other tokens pass unchanged
+    if (c.on && dat && jr == 0) mr = fm.read();
+    if (c.on && dat) {
 #ifndef NR_KFOLD
-      const word_t g = gb[(ap_uint<1>(0), jr)];
-      const word_t bb = c.ln ? gb[(ap_uint<1>(1), jr)] : word_t(0);
+      const word_t g = gb[(ap_uint<1>(0), ap_uint<8>(jr))];
+      const word_t bb = c.ln ? gb[(ap_uint<1>(1), ap_uint<8>(jr))] : word_t(0);
 #endif
       word_t wz;
       for (int l = 0; l < L; l++) {
 #pragma HLS UNROLL
-        float t = fp_sub(lane_f(w, l), mr.mean);
-        t = fp_mul(t, mr.rstd);
+        float v = fp_sub(lane_f(t.w, l), mr.mean);
+        v = fp_mul(v, mr.rstd);
 #ifndef NR_KFOLD
-        t = fp_mul(t, lane_f(g, l));
-        t = fp_add(t, lane_f(bb, l));
+        v = fp_mul(v, lane_f(g, l));
+        v = fp_add(v, lane_f(bb, l));
 #endif
-        set_lane_f(wz, l, t);
+        set_lane_f(wz, l, v);
       }
-      fz.write(wz);
-      jr = jr == c.KW - 1 ? ap_uint<8>(0) : ap_uint<8>(jr + 1);
+      t.w = wz;
     }
+    out.write(t);
+    if (dat) jr = jr == c.KW - 1 ? ap_uint<9>(0) : ap_uint<9>(jr + 1);
+    if (t.end) break;
   }
 }
 
-// ------------------------------------------------------------------------------------------ common: quantizer
-static void p_qamax(Cfg c, strm<word_t>& fz, strm<word_t>& fq, strm<qz::abits_t>& fam) {
-items:
-  for (ap_uint<17> b = 0; b < c.B; b++) {
-#pragma HLS LOOP_TRIPCOUNT min = 1 max = 2 avg = 1
-    qz::abits_t a = 0;
-    ap_uint<9> jr = 0;
-  w:
-    for (ap_uint<25> j = 0; j < c.NKW; j++) {
-#pragma HLS LOOP_FLATTEN off
-#pragma HLS PIPELINE II = 1
-#pragma HLS LOOP_TRIPCOUNT min = 9000 max = 131072 avg = 20000
-      const word_t w = fz.read();
-      const qz::abits_t m = qz::word_amax(w);
-      const qz::abits_t a1 = (jr == 0 || m > a) ? m : a;
-      a = a1;
-      fq.write(w);
-      if (jr == c.KW - 1) {
-        if (c.qout) fam.write(a1);
-        jr = 0;
-      } else {
-        jr++;
-      }
-    }
-  }
-}
-
-static void p_qscal(Cfg c, strm<qz::abits_t>& fam, strm<QS>& frs) {
-  if (!c.qout) return;
-items:
-  for (ap_uint<17> b = 0; b < c.B; b++) {
-#pragma HLS LOOP_TRIPCOUNT min = 1 max = 2 avg = 1
-  rows:
-    for (ap_uint<17> r = 0; r < c.N; r++) {
-#pragma HLS LOOP_TRIPCOUNT min = 50 max = 512 avg = 100
-#pragma HLS LOOP_FLATTEN off
-#pragma HLS PIPELINE off
-      const qz::abits_t a = fam.read();
-      QS o;
-      o.rs = qz::row_scale(a);
-      o.a = a;
-      frs.write(o);
-    }
-  }
-}
-
-static void p_quant(Cfg c, strm<word_t>& fq, strm<QS>& frs, strm<word_t>& fo, strm<uint32_t>& fsc) {
-items:
-  for (ap_uint<17> b = 0; b < c.B; b++) {
-#pragma HLS LOOP_TRIPCOUNT min = 1 max = 2 avg = 1
-    QS qs;
-    qs.rs = qz::row_scale_from_s(ap_uint<32>(qz::ONE_BITS));
-    qs.a = 0;
-    ap_uint<64> lo = 0;
-    ap_uint<9> jr = 0;
-  q:
-    for (ap_uint<25> j = 0; j < c.NKW; j++) {
-#pragma HLS LOOP_FLATTEN off
-#pragma HLS PIPELINE II = 1
-#pragma HLS LOOP_TRIPCOUNT min = 9000 max = 131072 avg = 20000
-      if (c.qout && jr == 0) qs = frs.read();
-      const word_t w = fq.read();
-      ap_uint<64> h;
-      for (int l = 0; l < L; l++) {
-#pragma HLS UNROLL
-        h.range(16 * l + 15, 16 * l) = ap_uint<16>(qz::quant_elem(qz::word_f32(w, l), qs.rs));
-      }
-      if (!c.qout) {
-        fo.write(w);
-      } else if (jr[0]) {
-        word_t o;
-        o.range(63, 0) = lo;
-        o.range(127, 64) = h;
-        fo.write(o);
-      } else {
-        lo = h;
-      }
-      if (jr == c.KW - 1) {
-        if (c.qout) fsc.write((uint32_t)qz::stored_scale(qs.a, qs.rs.s_bits, c.shift));
-        jr = 0;
-      } else {
-        jr++;
-      }
-    }
-  }
-}
-
-// ------------------------------------------------------------------------------------------ common: writer
-// Flat: nr rows of CW words from word off; rows >= nv are zero rows (written here, not read from fo). At each row
-// end the row's scale goes into sbuf.
-static void wr_flat(word_t* io, waddr_t off, ap_uint<9> nr, ap_uint<9> nv, ap_uint<9> CW, bool qout,
-                    strm<word_t>& fo, strm<uint32_t>& fsc, uint32_t sbuf[SCH]) {
-#pragma HLS INLINE off
-  const ap_uint<17> len = nr * CW;
-  ap_uint<9> jr = 0, n = 0;
-wr:
-  for (ap_uint<17> j = 0; j < len; j++) {
-#pragma HLS PIPELINE II = 1
-#pragma HLS LOOP_TRIPCOUNT min = 4500 max = 65536 avg = 20000
-    const bool real = n < nv;
-    io[off + j] = real ? fo.read() : word_t(0);
-    if (jr == CW - 1) {
-      if (qout) sbuf[n] = real ? fsc.read() : qz::ONE_BITS;
-      n++;
-      jr = 0;
-    } else {
-      jr++;
-    }
-  }
-}
-
-static void wr_row(word_t* io, waddr_t off, ap_uint<9> CW, bool real, strm<word_t>& fo) {
-#pragma HLS INLINE off
-wr:
-  for (ap_uint<9> j = 0; j < CW; j++) {
-#pragma HLS PIPELINE II = 1
-#pragma HLS LOOP_TRIPCOUNT min = 90 max = 256 avg = 120
-    io[off + j] = real ? fo.read() : word_t(0);
-  }
-}
-
-// nw scale words from sbuf (4 a word); lanes at or past nr are padding (1.0)
-static void wr_scales(word_t* io, waddr_t off, ap_uint<9> nr, const uint32_t sbuf[SCH]) {
-#pragma HLS INLINE off
-  const ap_uint<7> nw = (nr + 3) >> 2;
-wf:
-  for (ap_uint<7> w = 0; w < nw; w++) {
-#pragma HLS PIPELINE II = 1
-#pragma HLS LOOP_TRIPCOUNT min = 13 max = 64 avg = 20
-    word_t sw;
-    for (int l = 0; l < 4; l++) {
-#pragma HLS UNROLL
-      const ap_uint<9> i = 4 * w + l;
-      sw.range(32 * l + 31, 32 * l) = i < nr ? sbuf[i] : qz::ONE_BITS;
-    }
-    io[off + w] = sw;
-  }
-}
-
-static void p_wr(word_t* io, Cfg c, strm<word_t>& fo, strm<uint32_t>& fsc) {
-  uint32_t sbuf[SCH];
-#pragma HLS ARRAY_PARTITION variable = sbuf cyclic factor = 4
-#pragma HLS BIND_STORAGE variable = sbuf type = ram_2p impl = lutram
-  waddr_t ic = c.c_w, iF = c.f_w;
-items:
-  for (ap_uint<17> b = 0; b < c.B; b++) {
-#pragma HLS LOOP_TRIPCOUNT min = 1 max = 2 avg = 1
-    waddr_t rc = ic, rf = iF;
-    ap_uint<17> n0 = 0;
-  chunks:
-    while (n0 < c.NP) {
-#pragma HLS LOOP_TRIPCOUNT min = 1 max = 2 avg = 1
-      const ap_uint<17> left = c.NP - n0;
-      const ap_uint<9> nr = left < SCH ? ap_uint<9>(left) : ap_uint<9>(SCH);
-      const ap_uint<17> vleft = c.N > n0 ? ap_uint<17>(c.N - n0) : ap_uint<17>(0);
-      const ap_uint<9> nv = vleft < nr ? ap_uint<9>(vleft) : nr;  // real (not zero-padding) rows of the chunk
-      if (c.c_flat) {
-        wr_flat(io, rc, nr, nv, c.CW, c.qout, fo, fsc, sbuf);
-        rc += nr * c.CW;
-      } else {
-      rows:
-        for (ap_uint<9> r = 0; r < nr; r++) {
-#pragma HLS LOOP_TRIPCOUNT min = 50 max = 256 avg = 100
-          const bool real = r < nv;
-          wr_row(io, rc, c.CW, real, fo);
-          if (c.qout) sbuf[r] = real ? fsc.read() : qz::ONE_BITS;
-          rc += c.c_pw;
-        }
-      }
-      if (c.qout) {
-        wr_scales(io, rf, nr, sbuf);
-        rf += SCH / 4;
-      }
-      n0 += nr;
-    }
-    ic += c.c_sw;
-    iF += c.f_sw;
-  }
-}
-
-// ------------------------------------------------------------------------------------------ the region
-// The row unit integrates the NORM front end as p_stats -> {p_scal -> p_rsqrt} -> p_affine between its reader and
-// its absmax stage (streams: input words in row order, K/4 per row, N rows per item, B items; z words out in the
-// same order). Its sizes: f2 (RFD words, BRAM), fs / fv / fm (4 entries), the gamma|beta table (2 KWMAX words).
-static void norm_df(const word_t* hp, const word_t* xmem, word_t* ymem, Cfg c) {
+// The NORM front end: tokens in (the row words of every row in row order, marked fwd = 1, K/4 per row; tokens with
+// fwd = 0, e.g. the reader's shift-back overlap, pass unchanged and are not counted; the command's last token
+// flagged end), the same tokens out with z words. One process of the row unit's DATAFLOW region (a nested region). Sizes: f2 (RFD tokens,
+// BRAM), fs / fv / fm (4 entries each), the gamma | beta table (2 KWMAX words, BRAM).
+static void norm_front(const word_t* hp, const FC c, hls::stream<qz::XT>& xs, hls::stream<qz::XT>& out) {
 #pragma HLS DATAFLOW
 #pragma HLS STABLE variable = c
-  NR_DECL(word_t, fa, 32);
-#pragma HLS BIND_STORAGE variable = fa type = fifo impl = srl
-  NR_DECL(word_t, f2, RFD);
-  NR_DECL(word_t, fq, RFD);
+  hls::stream<qz::XT> f2("nr_f2");
+  hls::stream<Stat> fs("nr_fs");
+  hls::stream<MV> fv("nr_fv");
+  hls::stream<MR> fm("nr_fm");
+#pragma HLS STREAM variable = f2 depth = RFD
+#pragma HLS STREAM variable = fs depth = 4
+#pragma HLS STREAM variable = fv depth = 4
+#pragma HLS STREAM variable = fm depth = 4
 #ifdef NR_URAM
 #pragma HLS BIND_STORAGE variable = f2 type = fifo impl = uram
 #else
 #pragma HLS BIND_STORAGE variable = f2 type = fifo impl = bram
 #endif
-#pragma HLS BIND_STORAGE variable = fq type = fifo impl = bram
-  NR_DECL(word_t, fz, 32);
-#pragma HLS BIND_STORAGE variable = fz type = fifo impl = srl
-  NR_DECL(word_t, fo, 32);
-#pragma HLS BIND_STORAGE variable = fo type = fifo impl = srl
-  NR_DECL(Stat, fs, 4);
-  NR_DECL(MV, fv, 4);
-  NR_DECL(MR, fm, 4);
-  NR_DECL(qz::abits_t, fam, 4);
-  NR_DECL(QS, frs, 4);
-  NR_DECL(uint32_t, fsc, 8);
-  NR_RUN(p_rd(xmem, c, fa));
-  NR_RUN(p_stats(c, fa, f2, fs));
-  NR_RUN(p_scal(c, fs, fv));
-  NR_RUN(p_rsqrt(c, fv, fm));
-  NR_RUN(p_affine(hp, c, f2, fm, fz));
-  NR_RUN(p_qamax(c, fz, fq, fam));
-  NR_RUN(p_qscal(c, fam, frs));
-  NR_RUN(p_quant(c, fq, frs, fo, fsc));
-  NR_RUN(p_wr(ymem, c, fo, fsc));
+  NR_RUN(fe_stats(c, xs, f2, fs));
+  NR_RUN(fe_scal(c, fs, fv));
+  NR_RUN(fe_rsqrt(c, fv, fm));
+  NR_RUN(fe_affine(hp, c, f2, fm, out));
   NR_JOIN();
 #ifndef __SYNTHESIS__
-  g_leftover += !fa.empty() + !f2.empty() + !fq.empty() + !fz.empty() + !fo.empty() + !fs.empty() + !fv.empty() +
-                !fm.empty() + !fam.empty() + !frs.empty() + !fsc.empty();
+  g_leftover += !f2.empty() + !fs.empty() + !fv.empty() + !fm.empty();
 #endif
 }
 
-// The mode function: decode the command's fields once, then the DATAFLOW region. Returns ME_OK, or ME_DIMS for a
-// command whose counters could not hold it (validate_hw already rejects it; this guard only keeps the region from
-// hanging when called without it). hp: the hp port gamma / beta sit behind; xmem / ymem: the io bundle.
+// The front end's command view. Any opcode: on = (OP_NORM); assumes validate_hw(c) == ME_OK for a NORM.
+static inline FC front_plan(const ctr::Cmd& c) {
+#pragma HLS INLINE
+  FC f;
+  const uint32_t K = c.K & 0x7FF;
+  f.on = c.op == ctr::OP_NORM;
+  f.ln = (c.flags & ctr::F_LN) != 0;
+  f.K = K;
+  f.KW = K >> 2;
+  f.DV = f.ln ? ap_uint<21>(ap_uint<11>(K) * ap_uint<11>(K)) : ap_uint<21>(K);
+  f.eps = c.p[ctr::P_EPS];
+  f.e_w = waddr_t(c.s[ctr::SLOT_E].addr >> 4);
+  return f;
+}
+
+// ------------------------------------------------------------------------------------------ the NORM mode
+// The row unit's backbone with the NORM front end in its slot, for the NORM opcode only (the standalone mode; the
+// stream names, depths and storage are the backbone's row_df, quantize/quant_mode.h).
+static void norm_df(const word_t* hp, const word_t* xmem, word_t* ymem, const qz::RP p, const FC f) {
+#pragma HLS DATAFLOW
+#pragma HLS STABLE variable = p
+#pragma HLS STABLE variable = f
+  hls::stream<qz::XT> xs("qz_xs");
+  hls::stream<qz::XT> xz("nr_xz");
+  hls::stream<qz::AM> am("qz_am");
+  hls::stream<word_t> d("qz_d");
+  hls::stream<qz::SS> ss("qz_ss");
+  hls::stream<qz::ST> sf("qz_sf");
+  hls::stream<word_t> ow("qz_ow");
+  hls::stream<ap_uint<32>> sq("qz_sq");
+  hls::stream<qz::UH> hd("qz_hd");
+  hls::stream<word_t> dd("qz_dd");
+#pragma HLS STREAM variable = xs depth = QZ_D_XS
+#pragma HLS STREAM variable = xz depth = NR_D_XZ
+#pragma HLS STREAM variable = am depth = QZ_D_AM
+#pragma HLS STREAM variable = d depth = QZ_D_D
+#pragma HLS STREAM variable = ss depth = QZ_D_SS
+#pragma HLS STREAM variable = sf depth = QZ_D_SF
+#pragma HLS STREAM variable = ow depth = QZ_D_OW
+#pragma HLS STREAM variable = sq depth = QZ_D_SQ
+#pragma HLS STREAM variable = hd depth = QZ_D_HD
+#pragma HLS STREAM variable = dd depth = QZ_D_DD
+#pragma HLS BIND_STORAGE variable = d type = fifo impl = bram
+#pragma HLS BIND_STORAGE variable = am type = fifo impl = lutram
+#pragma HLS BIND_STORAGE variable = sq type = fifo impl = lutram
+#pragma HLS BIND_STORAGE variable = ow type = fifo impl = lutram
+#pragma HLS BIND_STORAGE variable = xs type = fifo impl = lutram
+#pragma HLS BIND_STORAGE variable = xz type = fifo impl = lutram
+#pragma HLS BIND_STORAGE variable = dd type = fifo impl = lutram
+  NR_RUN(qz::qz_rd(xmem, p, xs));
+  NR_RUN(norm_front(hp, f, xs, xz));
+  NR_RUN(qz::qz_amx(p, xz, am, d));
+  NR_RUN(qz::qz_ss(p, am, ss));
+  NR_RUN(qz::qz_sr(p, ss, sf));
+  NR_RUN(qz::qz_qt(p, d, sf, ow, sq));
+  NR_RUN(qz::qz_wb(p, ow, sq, hd, dd));
+  NR_RUN(qz::qz_wr(ymem, p, hd, dd));
+  NR_JOIN();
+#ifndef __SYNTHESIS__
+  g_leftover += !xs.empty() + !xz.empty() + !am.empty() + !d.empty() + !ss.empty() + !sf.empty() + !ow.empty() +
+                !sq.empty() + !hd.empty() + !dd.empty();
+#endif
+}
+
+// The mode function. Returns ME_OK, or ME_DIMS without touching memory for a command its counters could not hold
+// (validate_hw already rejects every such record; this guard only keeps the region from hanging when called
+// without it). hp: the hp port gamma / beta sit behind (its pointer register is 0: absolute addresses); xmem /
+// ymem: the io bundle. Returns after the last write response (R-ORD): the region ends when qz_wr's last write is
+// acknowledged.
 static uint32_t norm_mode(const ctr::Cmd& cmd, const word_t* hp, const word_t* xmem, word_t* ymem) {
 #pragma HLS INLINE off
   const uint32_t K = cmd.K, N = cmd.N, B = cmd.B;
   const bool qout = cmd.flags & ctr::F_QOUT;
   const uint32_t NP = cmd.p[ctr::P_NP] ? cmd.p[ctr::P_NP] : N;
   if (cmd.op != ctr::OP_NORM || K < 8 || K > (uint32_t)KMAX || (K & 7) || N < 1 || N > ctr::N_MAX || B < 1 ||
-      B > ctr::B_MAX || NP < N || NP > ctr::N_MAX || (!qout && NP != N))
+      B > ctr::B_MAX || NP < N || NP > ctr::N_MAX || (!qout && NP != N) || cmd.p[ctr::P_SEG])
     return ctr::ME_DIMS;
-  Cfg c;
-  c.K = K;
-  c.KW = K / 4;
-  c.CW = qout ? K / 8 : K / 4;
-  c.N = N;
-  c.NP = NP;
-  c.B = B;
-  c.NKW = ap_uint<25>(N) * ap_uint<9>(K / 4);
-  c.ln = cmd.flags & ctr::F_LN;
-  c.qout = qout;
-  c.eps = cmd.p[ctr::P_EPS];
-  c.shift = (int)cmd.p[ctr::P_SHIFT];
-  c.DV = c.ln ? ap_uint<21>(ap_uint<11>(K) * ap_uint<11>(K)) : ap_uint<21>(K);
-  const ctr::Slot& A = cmd.s[ctr::SLOT_A];
-  const ctr::Slot& E = cmd.s[ctr::SLOT_E];
-  const ctr::Slot& Cs = cmd.s[ctr::SLOT_C];
-  const ctr::Slot& F = cmd.s[ctr::SLOT_F];
-  c.a_w = baddr_t(A.addr) >> 4;
-  c.a_pw = A.pitch >> 4;
-  c.a_sw = A.stride >> 4;
-  // one burst per item when the gap after each row is at most half a row (the expert's residual rows: 736 of 720)
-  c.a_flat = N == 1 || (c.a_pw >= c.KW && 2 * c.a_pw <= 3 * c.KW);
-  c.a_len = c.a_flat ? ap_uint<26>(ap_uint<17>(N - 1) * ap_uint<9>(N == 1 ? 0u : (uint32_t)c.a_pw) + c.KW)
-                     : ap_uint<26>(0);
-  c.e_w = baddr_t(E.addr) >> 4;
-  c.c_w = baddr_t(Cs.addr) >> 4;
-  c.c_pw = Cs.pitch >> 4;
-  c.c_sw = Cs.stride >> 4;
-  c.c_flat = NP == 1 || c.c_pw == c.CW;
-  c.f_w = baddr_t(F.addr) >> 4;
-  c.f_sw = F.stride >> 4;
-  norm_df(hp, xmem, ymem, c);
+  // the backbone's plan: NORM with F_QOUT = QUANT_X rows (one scale per row), without = COPY rows
+  ctr::Cmd b = cmd;
+  b.op = qout ? ctr::OP_QUANT_X : ctr::OP_COPY;
+  qz::RP p;
+  if (qz::row_plan(b, p) != ctr::ME_OK) return ctr::ME_DIMS;
+  norm_df(hp, xmem, ymem, p, front_plan(cmd));
   return ctr::ME_OK;
 }
 

@@ -16,7 +16,7 @@ Modes (exec_ref.py):
            rope, smx) uses the emulators of those front ends only
 
     HF_HUB_OFFLINE=1 python check_policy.py <ckpt dir> <batches dir> [--modes exact,int16,int16k]
-        [--frames 0,3563] [--out x.json] [--no-plan-fix]
+        [--frames 0,3563] [--out x.json] [--no-plan-fix] [--nsb 10]
 """
 
 from __future__ import annotations
@@ -82,6 +82,7 @@ def main() -> int:
         "--no-plan-fix", action="store_true", help="contract_plan.build as is (build_smolvla.chunk_plan)"
     )
     ap.add_argument("--frames", default="", help="comma-separated frame numbers (default: all)")
+    ap.add_argument("--nsb", type=int, default=10, help="gelu_silu table size for fe=kernels (9 or 10)")
     a = ap.parse_args()
     torch.set_num_threads(a.threads)
     from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
@@ -95,6 +96,7 @@ def main() -> int:
         "frames": [int(d["frame"]) for d in frames],
         "base": hex(a.base),
         "plan_fix": not a.no_plan_fix,
+        "nsb": a.nsb,
         "sources": sources(),
         "modes": {},
     }
@@ -112,7 +114,7 @@ def main() -> int:
         if ":" in mode:  # int16k:norm+act = the kernels' emulators for these front ends only (attribution)
             fe = "kernels:" + mode.split(":", 1)[1]
         t0 = time.perf_counter()
-        prog = Program(p, base=a.base, exact=exact, fe=fe, plan_fix=not a.no_plan_fix)
+        prog = Program(p, base=a.base, exact=exact, fe=fe, plan_fix=not a.no_plan_fix, nsb=a.nsb)
         tb = time.perf_counter() - t0
         print(
             f"[{mode}] {len(prog.cmds)} records, {prog.n_blobs} weight blobs written ({tb:.1f} s)", flush=True

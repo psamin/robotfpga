@@ -1,32 +1,34 @@
-W1121 16:49:07.727000 32708 Lib\site-packages\torch\distributed\elastic\multiprocessing\redirects.py:29] NOTE: Redirects are currently not supported in Windows or MacOs.
+W1121 17:39:12.766000 32588 Lib\site-packages\torch\distributed\elastic\multiprocessing\redirects.py:29] NOTE: Redirects are currently not supported in Windows or MacOs.
 WARNING:root:No accelerated backend detected. Using default cpu, this will be slow.
 WARNING:lerobot.configs.policies:Device 'cuda' is not available. Switching to 'cpu'.
 Loading  HuggingFaceTB/SmolVLM2-500M-Video-Instruct weights ...
 `torch_dtype` is deprecated! Use `dtype` instead!
+Loading weights:   0%|          | 0/489 [00:00<?, ?it/s]Loading weights:   0%|          | 1/489 [00:00<02:28,  3.28it/s]Loading weights:  34%|###4      | 167/489 [00:00<00:00, 527.07it/s]Loading weights:  54%|#####3    | 263/489 [00:00<00:00, 456.83it/s]Loading weights:  68%|######8   | 333/489 [00:00<00:00, 499.12it/s]Loading weights:  88%|########7 | 429/489 [00:00<00:00, 611.06it/s]Loading weights: 100%|##########| 489/489 [00:00<00:00, 527.40it/s]
 Reducing the number of VLM layers to 16 ...
-loaded in 16.8 s
+Loading weights from local directory
+loaded in 10.5 s
 config: {"vision": {"layers": 12, "hidden": 768, "ln_eps": 1e-06, "image_size": 512, "patch": 16}, "text": {"layers": 16, "hidden": 960, "heads": 15, "kv_heads": 5, "rms_eps": 1e-05}, "expert": {"layers": 16, "hidden": 720, "heads": 15, "kv_heads": 5, "rms_eps": 1e-05, "intermediate": 2048}, "num_steps": 10, "chunk": 50}
 patched 91 norm modules of 91 in the policy
-frame 0 stats     max|chunk-ref| 5.126e-06 mean 2.454e-07 (12.5 s)
-frame 0 torch     max|chunk-ref| 5.126e-06 mean 2.454e-07 (2.0 s)
-frame 0 zf32      max|chunk-ref| 5.722e-06 mean 2.579e-07 (9.1 s)
-frame 0 kernel    max|chunk-ref| 1.343e-03 mean 7.450e-05 (9.3 s)
-frame 0 torchq16  max|chunk-ref| 7.789e-04 mean 4.519e-05 (1.9 s)
-frame 0 kfold     max|chunk-ref| 7.831e-04 mean 4.069e-05 (8.7 s)
+frame 0 stats     max|chunk-ref| 5.126e-06 mean 2.454e-07 (8.2 s)
+frame 0 torch     max|chunk-ref| 5.126e-06 mean 2.454e-07 (1.7 s)
+frame 0 zf32      max|chunk-ref| 5.722e-06 mean 2.579e-07 (8.0 s)
+frame 0 kernel    max|chunk-ref| 1.343e-03 mean 7.450e-05 (8.2 s)
+frame 0 torchq16  max|chunk-ref| 7.789e-04 mean 4.519e-05 (1.8 s)
+frame 0 kfold     max|chunk-ref| 7.831e-04 mean 4.069e-05 (8.8 s)
 frame 0: kernel vs torchq16 0.002121448516845703, zf32 vs torch 5.960464477539062e-07
-frame 3563 stats     max|chunk-ref| 4.619e-07 mean 1.197e-07 (11.0 s)
-frame 3563 torch     max|chunk-ref| 4.619e-07 mean 1.197e-07 (1.8 s)
-frame 3563 zf32      max|chunk-ref| 2.384e-07 mean 7.997e-08 (8.6 s)
-frame 3563 kernel    max|chunk-ref| 1.428e-04 mean 5.315e-05 (7.7 s)
-frame 3563 torchq16  max|chunk-ref| 1.298e-04 mean 4.333e-05 (1.7 s)
-frame 3563 kfold     max|chunk-ref| 1.608e-04 mean 6.659e-05 (7.5 s)
+frame 3563 stats     max|chunk-ref| 4.619e-07 mean 1.197e-07 (8.3 s)
+frame 3563 torch     max|chunk-ref| 4.619e-07 mean 1.197e-07 (1.9 s)
+frame 3563 zf32      max|chunk-ref| 2.384e-07 mean 7.997e-08 (8.3 s)
+frame 3563 kernel    max|chunk-ref| 1.428e-04 mean 5.315e-05 (9.5 s)
+frame 3563 torchq16  max|chunk-ref| 1.298e-04 mean 4.333e-05 (2.2 s)
+frame 3563 kfold     max|chunk-ref| 1.608e-04 mean 6.659e-05 (9.6 s)
 frame 3563: kernel vs torchq16 6.794929504394531e-05, zf32 vs torch 3.2782554626464844e-07
-frame 7489 stats     max|chunk-ref| 4.768e-07 mean 1.048e-07 (7.5 s)
-frame 7489 torch     max|chunk-ref| 4.768e-07 mean 1.048e-07 (1.9 s)
-frame 7489 zf32      max|chunk-ref| 2.980e-07 mean 7.908e-08 (11.0 s)
-frame 7489 kernel    max|chunk-ref| 1.515e-04 mean 3.792e-05 (10.6 s)
-frame 7489 torchq16  max|chunk-ref| 1.523e-04 mean 3.698e-05 (2.5 s)
-frame 7489 kfold     max|chunk-ref| 1.665e-04 mean 6.620e-05 (10.5 s)
+frame 7489 stats     max|chunk-ref| 4.768e-07 mean 1.048e-07 (9.4 s)
+frame 7489 torch     max|chunk-ref| 4.768e-07 mean 1.048e-07 (2.1 s)
+frame 7489 zf32      max|chunk-ref| 2.980e-07 mean 7.908e-08 (8.5 s)
+frame 7489 kernel    max|chunk-ref| 1.515e-04 mean 3.792e-05 (7.3 s)
+frame 7489 torchq16  max|chunk-ref| 1.523e-04 mean 3.698e-05 (1.7 s)
+frame 7489 kfold     max|chunk-ref| 1.665e-04 mean 6.620e-05 (7.4 s)
 frame 7489: kernel vs torchq16 4.088878631591797e-05, zf32 vs torch 2.980232238769531e-07
 counts per chunk:
    {'group': 'expert', 'kind': 'RMS', 'D': 720, 'out': 'q16', 'calls': 320, 'rows': 16000, 'elements': 11520000}
@@ -123,4 +125,4 @@ kernel vs torch per norm call (all calls of the frames run): {
   "qdiff_max": 1
  }
 }
-wrote C:\Users\athit\robotfpga\fpga\kernels\norm_residual\policy_check.json
+wrote C:/Users/athit/AppData/Local/Temp/claude/fc9063f622b17764/435f2b13-e830-45d8-aafa-af10d6ff539c/scratchpad/policy_check.json

@@ -1,10 +1,10 @@
 // RoPE front end of the row unit (fpga/kernels/CONTRACT.md 4.1, opcode ROPE 0x60): the rope-specific part of the
 // mode, i.e. what the shared row unit gains for ROPE. It rotates FP32 rows of 64-value segments (head_dim 64,
 // natural lerobot order: x1 = values 0..31, x2 = 32..63 of a segment) and emits the rotated FP32 values, 4 per clock,
-// in natural order, plus each segment's absmax (as magnitude bits) for the shared contract quantizer.
+// in natural order: the row unit's [front end] slot (quantize/quant_mode.h), ahead of the shared per-segment absmax.
 //
 //   rot_stage   xs (16 FP32 words per segment) + cs (its 16-word table row) -> rs (16 rotated groups)
-//   emit_stage  rs -> fw (16 FP32 words per segment, natural order) + am (segment absmax, when quantizing)
+//   emit_stage  rs -> fe (16 FP32 words per segment, natural order)
 //
 // The FP32 values are, bit for bit, rope_emu.to_f32 (CONTRACT.md 2.2); everything after them (int16 + scales by
 // the contract quantizer, the KW weight tiling, FP32 rows) is rope_mode.h. tb_rope.cpp checks every bit.
@@ -187,10 +187,8 @@ rot:
 }
 
 // Collects the 16 groups of a segment (normalized, as Ent) while emitting the previous segment in natural order:
-// fw gets 16 FP32 words per segment; with quant, am gets each segment's absmax (an integer max over the 31
-// magnitude bits of its 64 FP32 outputs, as qz::word_amax).
-static void emit_stage(hls::stream<Rot>& rs, hls::stream<Word>& fw, hls::stream<abits_t>& am, rcount_t rows,
-                       bool quant) {
+// fe gets 16 FP32 words per segment. (The segment absmax is the shared backbone's: rope_mode.h am_stage.)
+static void emit_stage(hls::stream<Rot>& rs, hls::stream<Word>& fe, rcount_t rows) {
   Ent ev[2 * HALF], od[2 * HALF];  // groups 2j / 2j + 1 of the segment in slot s at s * 8 + j
 #pragma HLS BIND_STORAGE variable = ev type = ram_s2p impl = lutram
 #pragma HLS BIND_STORAGE variable = od type = ram_s2p impl = lutram
@@ -198,7 +196,6 @@ static void emit_stage(hls::stream<Rot>& rs, hls::stream<Word>& fw, hls::stream<
 #pragma HLS DEPENDENCE variable = od inter false
   ap_uint<4> w = 0;
   ap_uint<1> sl = 0;
-  abits_t amx = 0;
   rcount_t r = 0;  // segment being collected; r - 1 is emitted
   bool more = rows != 0;
 emit:
@@ -245,18 +242,11 @@ emit:
       v[3] = y2 ? B.range(107, 81) : B.range(53, 27);
       const ap_uint<10> mA = A.range(117, 108), mB = B.range(117, 108);
       Word o;
-      abits_t wm = 0;
       for (int l = 0; l < 4; l++) {
 #pragma HLS UNROLL
-        const ap_uint<32> f = to_f32(v[l][26], v[l].range(25, 0), l < 2 ? mA : mB);
-        o.range(32 * l + 31, 32 * l) = f;
-        const abits_t fa = f.range(30, 0);
-        wm = fa > wm ? fa : wm;
+        o.range(32 * l + 31, 32 * l) = to_f32(v[l][26], v[l].range(25, 0), l < 2 ? mA : mB);
       }
-      fw.write(o);
-      const abits_t prev = w == 0 ? (abits_t)0 : amx;
-      amx = wm > prev ? wm : prev;
-      if (quant && w == WORDS - 1) am.write(amx);
+      fe.write(o);
     }
     if (w == WORDS - 1) {
       if (!more) break;

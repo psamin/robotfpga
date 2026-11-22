@@ -69,6 +69,10 @@ constexpr unsigned ROWBUF_W = ctr::ROW_BUF / 4;  // 768 words: QUANT_X rows up t
 #define QZ_SC_ENGINES 2  // reciprocal engines in sr: 2 give one scale per 13.5 clocks (one per 16 words is needed)
 #endif
 constexpr int NE = QZ_SC_ENGINES;
+#ifndef QZ_SMALL
+#define QZ_SMALL 1  // single-word read / write units for rows shorter than one unit (K < 64 read; int16 rows
+#endif              // K < 64, FP32 rows K < 32, scale vectors of NP <= 28). 0: those commands return ME_DIMS
+                    // (an area probe for a contract that pads such rows: see README "Area")
 static_assert(NE == 2 || NE == 4, "QZ_SC_ENGINES: 2 or 4");
 
 // stream depths (named so the threaded deadlock model in tb_quant.cpp uses the same numbers)
@@ -126,6 +130,23 @@ struct RP {
   wp_t ap, as, cp, cs, fs;  // pitches / strides (words)
   wp_t segc, segf;          // p2 / p3 (words)
   ap_uint<30> cp2, cp3;     // 2 C.pitch, 3 C.pitch (KW / VW port offsets)
+  // loop invariants of wb, computed once per command (else each is a subtractor or comparator in the pipeline)
+  bool blk;                 // KW / KT: block mode
+  ap_uint<17> Bm1, NRm1;    // B - 1; rows per (item, segment) - 1 (KC: N, else NP)
+  ap_uint<9> njm1, nsegm1;  // vectors per item - 1; nseg - 1
+  ap_uint<13> num1, WO8;    // rows mode: units per row - 1; first word of a shifted-back last unit (WO - 8)
+  ap_uint<4> nf;            // rows mode: words of the last unit that are re-sent (8 - WO % 8, 0 if none)
+  ap_uint<15> Lw8, Lwm1;    // scale vector (rows modes): its last unit's first word, its last word
+  ap_uint<2> npl;           // valid lanes of the vector's last word (0 = all 4)
+  ap_uint<14> ngrm1;        // block mode: blocks per (item, segment / chunk) - 1
+  wp_t vstep;               // scale vector step per segment / chunk (words)
+  ap_uint<30> np2;          // KT p1 = 0: words between 64-channel chunks (2 NP)
+  // rd / qt invariants
+  ap_uint<17> Nm1;          // N - 1
+  ap_uint<13> Wm1, W16;     // W - 1; W - 16 (first word of a shifted-back 16-word read unit)
+  ap_uint<9> rnum1;         // KX / KC: 16-word read units per row - 1
+  ap_uint<5> rskip;         // KX / KC: leading words of a row's shifted-back last read unit (0: none)
+  ap_uint<13> SWm1;         // qt: words per segment - 1 (KX: the row; KXS / KW: 16)
 };
 
 // ---------------------------------------------------------------- stream tokens
@@ -173,7 +194,7 @@ struct UH {             // unit header (wb -> wr)
 static void qz_rd(const word_t* mem, const RP p, hls::stream<XT>& xs) {
   const bool kt = p.kind == KT, kc = p.kind == KC, kx = p.kind == KX;
   const bool segmaj = p.kind == KXS || p.kind == KW;
-  if (p.rsmall) {  // rows of < 64 values (KX, KC, KT with K = 32): single words, (b, [pass,] n, w)
+  if (QZ_SMALL && p.rsmall) {  // rows of < 64 values (KX, KC, KT with K = 32): single words, (b, [pass,] n, w)
     ap_uint<17> b = 0, n = 0;
     ap_uint<4> w = 0;
     ap_uint<1> pass = 0;  // KT: 0 = column absmax, 1 = data
@@ -184,7 +205,7 @@ static void qz_rd(const word_t* mem, const RP p, hls::stream<XT>& xs) {
 #pragma HLS LOOP_TRIPCOUNT min = 2 max = 4096 avg = 400
       XT t;
       t.w = mem[row + w];
-      const bool rowend = w == p.W - 1, lastrow = n == p.N - 1, lastitem = b == p.B - 1;
+      const bool rowend = w == p.Wm1, lastrow = n == p.Nm1, lastitem = b == p.Bm1;
       t.fwd = !kt || pass == 1;
       t.amx = kx || (kt && pass == 0);
       t.last = kx ? rowend : (kt && pass == 0 && rowend && lastrow);
@@ -219,9 +240,7 @@ static void qz_rd(const word_t* mem, const RP p, hls::stream<XT>& xs) {
   }
   // 16-word units. Loop order (b, j, n, pass, u): j is the KXS / KW segment or the QUANT_WT step (c1 / c2 count the
   // chunks whose pass 1 / pass 2 is done), pass the QUANT_X re-read, u the unit in a QUANT_X / COPY row.
-  const ap_uint<9> nu = (p.W + 15) >> 4;  // KX / KC units per row
-  const ap_uint<4> tail = p.W(3, 0);     // KX / KC: words of the last unit that are new (0 = all 16)
-  const ap_uint<9> nl = p.nseg - 1;
+  const ap_uint<9> nl = p.nsegm1;
   ap_uint<17> b = 0, n = 0;
   ap_uint<9> j = 0, u = 0, c1 = 0, c2 = 0;
   bool pass = false;
@@ -233,7 +252,7 @@ rd16:
     // QUANT_WT step: P1(c1) while c1 < nseg and c1 - c2 < 2, else P2(c2): P1(0) P1(1) P2(0) P1(2) P2(1) ... P2(nl)
     const bool p1 = kt && c1 != p.nseg && ap_uint<9>(c1 - c2) != 2;
     const ap_uint<9> cc = p1 ? c1 : c2;
-    const bool lastunit = u == nu - 1;
+    const bool lastunit = u == p.rnum1;
     // the unit's first word and the number of leading words that are not new (shift-back)
     ap_uint<13> uo;
     ap_uint<5> skip = 0;
@@ -241,19 +260,19 @@ rd16:
       uo = ap_uint<13>(j) << 4;
     } else if (kt) {
       if (p.half && cc == nl) {
-        uo = p.W - 16;
+        uo = p.W16;
         skip = 8;
       } else {
         uo = ap_uint<13>(cc) << 4;
       }
-    } else if (lastunit && tail != 0) {
-      uo = p.W - 16;
-      skip = ap_uint<5>(16) - tail;
+    } else if (lastunit && p.rskip != 0) {
+      uo = p.W16;
+      skip = p.rskip;
     } else {
       uo = ap_uint<13>(u) << 4;
     }
     const wa_t addr = rb + uo;
-    const bool lastrow = n == p.N - 1, lastitem = b == p.B - 1;
+    const bool lastrow = n == p.Nm1, lastitem = b == p.Bm1;
     const bool rowdone = segmaj || kt || lastunit;            // this pass over the row is done
     const bool rowfin = rowdone && (!p.twopass || pass);      // the row is done (KX two-pass: both passes)
     const bool lastj = segmaj ? j == nl : kt ? (!p1 && c2 == nl) : true;
@@ -261,20 +280,21 @@ rd16:
     const bool amx = kx ? (!p.twopass || !pass) : kt ? p1 : segmaj;
     const bool last = kx ? (lastunit && amx) : kt ? (p1 && lastrow) : segmaj;
     const bool lam = last && lastitem && (kt ? cc == nl : lastrow && (!segmaj || j == nl));
+    const bool fwd = kx ? (!p.twopass || pass) : kt ? !p1 : true;
     for (int k = 0; k < 16; k++) {
 #pragma HLS UNROLL
-      const word_t v = mem[addr + k];  // unconditional: one 16-beat burst, pipelined across iterations
-      if (k >= skip) {
-        XT t;
-        t.w = v;
-        t.fwd = kx ? (!p.twopass || pass) : kt ? !p1 : true;
-        t.amx = amx;
-        t.last = k == 15 && last;
-        t.lam = k == 15 && lam;
-        t.col = ap_uint<4>(k - skip);
-        t.end = k == 15 && fin;
-        xs.write(t);
-      }
+      // 16 reads (one 16-beat burst, pipelined across iterations) and 16 tokens, all unconditional: the leading
+      // words of a shifted-back unit are not new, so they go out as tokens amx ignores (neither data nor absmax)
+      const bool nw = ap_uint<5>(k) >= skip;
+      XT t;
+      t.w = mem[addr + k];
+      t.fwd = nw && fwd;
+      t.amx = nw && amx;
+      t.last = k == 15 && last;
+      t.lam = k == 15 && lam;
+      t.col = ap_uint<4>(k - skip);
+      t.end = k == 15 && fin;
+      xs.write(t);
     }
     if (fin) break;
     // advance: u (KX / KC), then the KX re-read, then n, then j (KXS / KW / KT), then b
@@ -364,7 +384,7 @@ outer:
       if (pass_end || end) break;
     }
     if (pass_end) {  // the chunk's column absmax, in column order, and clear for the next chunk
-      const ap_uint<7> cw = (p.half && cc == p.nseg - 1) ? 32 : 64;
+      const ap_uint<7> cw = (p.half && cc == p.nsegm1) ? 32 : 64;
     emit:
       for (ap_uint<7> c = 0; c < cw; c++) {
 #pragma HLS PIPELINE II = 1
@@ -374,7 +394,7 @@ outer:
         am.write(o);
         cm[c(1, 0)][c(5, 2)] = 0;
       }
-      cc = cc == p.nseg - 1 ? ap_uint<9>(0) : ap_uint<9>(cc + 1);
+      cc = cc == p.nsegm1 ? ap_uint<9>(0) : ap_uint<9>(cc + 1);
     }
     if (end) break;
   }
@@ -392,12 +412,12 @@ scales:
     const RowScale rs = row_scale_from_s(s);
     SS o;
     o.S = rs.S;
-    o.T = rs.T;
     o.B = rs.B;
 #ifdef QZ_IMPL_FDIV
     o.s = s;
 #endif
     o.seed = recip_seed(rs.S);
+    o.T = ap_uint<25>(o.seed.r0) | (ap_uint<25>(1) << 24);  // 2^25 - S = (2^24 - S) + 2^24, r0 < 2^24
     o.st = stored_scale(t.a, s, p.shift);
     o.end = t.end;
     ss.write(o);
@@ -406,20 +426,34 @@ scales:
 }
 
 // ---------------------------------------------------------------- sr: R = floor(2^49 / S), NE restoring dividers
-// Each engine runs recip_step (quant_int16.h, 1 quotient bit a clock) 25 times on its own S. Inputs go to the
-// engines round robin and leave in the same order. ss is read without blocking, so a result waiting for qt never
-// stops the engines from taking new work (and qt waiting for a result never waits on ss).
+// Each engine computes recip_sig(S) (quant_int16.h: 25 restoring steps of 1 quotient bit a clock from recip_seed):
+// it steps on every clock (busy or not; an idle engine's state is never used) and captures its quotient when the
+// 25th bit comes out, so the remainder recurrence is one compare-subtract and one load mux, nothing else. Jobs go
+// to the engines round robin and leave in the same order. The loop never blocks: ss is read with read_nb and sf
+// written with write_nb (a finished engine holds its result until sf has room), so no stall reaches the
+// recurrence, and a result waiting for qt never stops the other engine.
 static void qz_sr(const RP p, hls::stream<SS>& ss, hls::stream<ST>& sf) {
   if (p.kind == KC) return;
-  RecipState es[NE];
-  SS ev[NE];  // the engine's job (S, T, B, stored scale, end)
+  ap_uint<25> er[NE];    // partial remainder (< S while the engine works)
+  ap_uint<26> eq[NE];    // quotient bits, shifted in
+  ap_uint<26> eres[NE];  // the quotient, captured at the 25th bit
+  ap_uint<5> en[NE];     // bits still to produce
   bool busy[NE];
-#pragma HLS ARRAY_PARTITION variable = es complete
-#pragma HLS ARRAY_PARTITION variable = ev complete
+  SS ev[NE];  // the engine's job (S, T, B, seed, stored scale, end)
+#pragma HLS ARRAY_PARTITION variable = er complete
+#pragma HLS ARRAY_PARTITION variable = eq complete
+#pragma HLS ARRAY_PARTITION variable = eres complete
+#pragma HLS ARRAY_PARTITION variable = en complete
 #pragma HLS ARRAY_PARTITION variable = busy complete
+#pragma HLS ARRAY_PARTITION variable = ev complete
   for (int e = 0; e < NE; e++) {
 #pragma HLS UNROLL
+    er[e] = 0;
+    eq[e] = 0;
+    eres[e] = 0;
+    en[e] = 0;
     busy[e] = false;
+    ev[e].S = 0;
   }
   ap_uint<2> ein = 0, eout = 0;
   bool got_end = false;
@@ -427,16 +461,13 @@ recip:
   for (;;) {
 #pragma HLS PIPELINE II = 1
 #pragma HLS LOOP_TRIPCOUNT min = 27 max = 1000000 avg = 30000
-    // every decision below uses the state at the start of the clock: an engine finished last clock leaves now, a
-    // free engine takes a job now, the others step
+    // every decision uses the state at the start of the clock
     const ap_uint<2> eo = eout & (NE - 1), ei = ein & (NE - 1);
-    const bool out = busy[eo] && es[eo].n == 0;
-    const bool can_in = !got_end && !busy[ei];
-    bool fin = false;
-    if (out) {
+    bool sent = false, fin = false;
+    if (busy[eo] && en[eo] == 0) {
       ST o;
       o.S = ev[eo].S;
-      o.R = recip_result(es[eo]);
+      o.R = ev[eo].seed.pow2 ? ap_uint<26>((1u << 26) - 1) : eres[eo];
       o.T = ev[eo].T;
       o.B = ev[eo].B;
 #ifdef QZ_IMPL_FDIV
@@ -444,28 +475,39 @@ recip:
 #endif
       o.st = ev[eo].st;
       o.end = ev[eo].end;
-      sf.write(o);
-      fin = ev[eo].end;
+      sent = sf.write_nb(o);
+      fin = sent && ev[eo].end;
     }
+    SS t;
+    bool ld = false;
+    if (!got_end && !busy[ei]) ld = ss.read_nb(t);
     for (int e = 0; e < NE; e++) {
 #pragma HLS UNROLL
-      if (busy[e]) recip_step(es[e], ev[e].S);  // a no-op once its 25 bits are out (n == 0)
-    }
-    if (out) {
-      busy[eo] = false;
-      eout++;
-    }
-    if (fin) break;
-    if (can_in) {
-      SS t;
-      if (ss.read_nb(t)) {
-        ev[ei] = t;
-        es[ei] = recip_load(t.seed);
-        busy[ei] = true;
-        got_end = t.end;
-        ein++;
+      const ap_uint<25> r2 = er[e] << 1;  // er < S < 2^24 while working: no bit lost
+      const ap_uint<26> d = ap_uint<26>(r2) - ap_uint<26>(ev[e].S);
+      const bool ge = !d[25];
+      const ap_uint<25> rs = ge ? ap_uint<25>(d) : r2;
+      const ap_uint<26> qs = (eq[e] << 1) | ap_uint<26>(ge);
+      if (en[e] == 1) eres[e] = qs;
+      if (ld && ei == e) {
+        ev[e] = t;
+        er[e] = t.seed.r0;
+        eq[e] = 1;
+        en[e] = 25;
+        busy[e] = true;
+      } else {
+        er[e] = rs;
+        eq[e] = qs;
+        if (en[e] != 0) en[e] = en[e] - 1;
+        if (sent && eo == e) busy[e] = false;
       }
     }
+    if (sent) eout++;
+    if (ld) {
+      ein++;
+      got_end = t.end;
+    }
+    if (fin) break;
   }
 }
 
@@ -480,15 +522,15 @@ static void qz_qt(const RP p, hls::stream<word_t>& d, hls::stream<ST>& sf, hls::
 #pragma HLS PIPELINE II = 1
 #pragma HLS LOOP_TRIPCOUNT min = 2 max = 100000 avg = 20000
       ow.write(d.read());
-      if (w != p.W - 1) {
+      if (w != p.Wm1) {
         w++;
       } else {
         w = 0;
-        if (n != p.N - 1) {
+        if (n != p.Nm1) {
           n++;
         } else {
           n = 0;
-          if (b == p.B - 1) break;
+          if (b == p.Bm1) break;
           b++;
         }
       }
@@ -496,7 +538,6 @@ static void qz_qt(const RP p, hls::stream<word_t>& d, hls::stream<ST>& sf, hls::
     return;
   }
   const bool kt = p.kind == KT;
-  const ap_uint<13> SW = p.kind == KX ? p.W : ap_uint<13>(16);  // words per segment (KX: the row)
   ap_uint<24> tS[4][16];  // QUANT_WT: the row parameters of column 4 w + l of the chunk
   ap_uint<26> tR[4][16];
   ap_uint<25> tT[4][16];
@@ -512,9 +553,13 @@ static void qz_qt(const RP p, hls::stream<word_t>& d, hls::stream<ST>& sf, hls::
 #ifdef QZ_IMPL_FDIV
   ap_uint<32> tF[4][16];
 #pragma HLS ARRAY_PARTITION variable = tF dim = 1 complete
+#endif
+#ifdef QZ_IMPL_FDIV
   ap_uint<32> cs = ONE_BITS;
 #endif
   ap_uint<64> lo = 0;      // the 4 int16 of the even word of a pair
+  word_t pend = 0;         // the last finished word, written to ow on the next clock (keeps the FIFO write
+  bool pv = false;         // off the quantizer's path)
   ap_uint<13> wi = 0;      // word in the segment (KT: in the chunk row)
   ap_uint<17> n = 0, b = 0;
   ap_uint<9> cc = 0;       // KT chunk
@@ -526,20 +571,48 @@ quant:
   for (;;) {
 #pragma HLS PIPELINE II = 1
 #pragma HLS LOOP_TRIPCOUNT min = 2 max = 1048576 avg = 20000
-#pragma HLS DEPENDENCE variable = tS inter false  // an entry is rewritten >= 2 clocks after its last read (a row /
-#pragma HLS DEPENDENCE variable = tR inter false  // segment is >= 2 words); within a clock the write comes first
+#pragma HLS DEPENDENCE variable = tS inter false  // KT: a chunk's entries are written in its load phase, read
+#pragma HLS DEPENDENCE variable = tR inter false  // after it; others: entry 0 is rewritten >= 2 clocks after its
+                                                  // last read (a row / segment is >= 2 words), and within a clock
+                                                  // the write comes first
 #pragma HLS DEPENDENCE variable = tT inter false
 #pragma HLS DEPENDENCE variable = tB inter false
-    if (load) {
-      const ST t = sf.read();
-      tS[lc(1, 0)][lc(5, 2)] = t.S;
-      tR[lc(1, 0)][lc(5, 2)] = t.R;
-      tT[lc(1, 0)][lc(5, 2)] = t.T;
-      tB[lc(1, 0)][lc(5, 2)] = t.B;
+    if (pv) {
+      ow.write(pend);
+      pv = false;
+    }
+    // One sf read and one table store per lane, whatever the phase (two store sites per table cost II = 2):
+    // KT load phase: entry lc of lane lc % 4's table; a new row / segment (not KT): entry 0 of every lane's table
+    // (a register per lane instead costs a parameter mux per lane: +0.6k LUT, measured)
+    const bool rd_sf = load || (!kt && wi == 0);
+    ST t;
+    t.S = 0;
+    t.R = 0;
+    t.T = 0;
+    t.B = 0;
+    t.st = 0;
+    t.end = 0;
 #ifdef QZ_IMPL_FDIV
-      tF[lc(1, 0)][lc(5, 2)] = t.s;
+    t.s = 0;
 #endif
+    if (rd_sf) {
+      t = sf.read();
       sq.write(t.st);
+    }
+    const ap_uint<4> wad = load ? ap_uint<4>(lc(5, 2)) : ap_uint<4>(0);
+    for (int l = 0; l < 4; l++) {
+#pragma HLS UNROLL
+      if (rd_sf && (!load || lc(1, 0) == l)) {
+        tS[l][wad] = t.S;
+        tR[l][wad] = t.R;
+        tT[l][wad] = t.T;
+        tB[l][wad] = t.B;
+#ifdef QZ_IMPL_FDIV
+        tF[l][wad] = t.s;
+#endif
+      }
+    }
+    if (load) {
       if (lc == cw - 1) {
         lc = 0;
         load = false;
@@ -547,20 +620,11 @@ quant:
         lc++;
       }
     } else {
-      if (!kt && wi == 0) {  // a new row / segment: its parameters into entry 0 of every lane's table
-        const ST t = sf.read();
-        for (int l = 0; l < 4; l++) {
-#pragma HLS UNROLL
-          tS[l][0] = t.S;
-          tR[l][0] = t.R;
-          tT[l][0] = t.T;
-          tB[l][0] = t.B;
-        }
+      if (rd_sf) {
 #ifdef QZ_IMPL_FDIV
         cs = t.s;
 #endif
         endseg = t.end;
-        sq.write(t.st);
       }
       const word_t w = d.read();
       const ap_uint<4> ti = kt ? ap_uint<4>(wi(3, 0)) : ap_uint<4>(0);
@@ -579,26 +643,30 @@ quant:
 #endif
         h(16 * l + 15, 16 * l) = ap_uint<16>(quant_elem(word_f32(w, l), rs));
       }
-      if (wi[0]) ow.write((word_t(h) << 64) | word_t(lo));
-      else lo = h;
-      const ap_uint<13> wlast = kt ? ap_uint<13>((cw >> 2) - 1) : ap_uint<13>(SW - 1);
+      if (wi[0]) {
+        pend = (word_t(h) << 64) | word_t(lo);
+        pv = true;
+      } else {
+        lo = h;
+      }
+      const ap_uint<13> wlast = kt ? ap_uint<13>(cw == 64 ? 15 : 7) : p.SWm1;
       if (wi != wlast) {
         wi++;
       } else {
         wi = 0;
         if (kt) {
-          if (n != p.N - 1) {
+          if (n != p.Nm1) {
             n++;
           } else {
             n = 0;
-            if (cc != p.nseg - 1) {
+            if (cc != p.nsegm1) {
               cc++;
             } else {
               cc = 0;
-              if (b == p.B - 1) break;
+              if (b == p.Bm1) break;
               b++;
             }
-            cw = (p.half && cc == p.nseg - 1) ? 32 : 64;
+            cw = (p.half && cc == p.nsegm1) ? 32 : 64;
             load = true;
           }
         } else if (endseg) {
@@ -607,6 +675,7 @@ quant:
       }
     }
   }
+  if (pv) ow.write(pend);  // the command's last word (every exit is on a word with wi odd: rows are >= 2 words)
 }
 
 // ---------------------------------------------------------------- wb: words + stored scales -> units for wr
@@ -638,26 +707,17 @@ static inline ap_uint<16> lane16(const word_t& x, ap_uint<3> k) {
 
 static void qz_wb(const RP p, hls::stream<word_t>& ow, hls::stream<ap_uint<32>>& sq, hls::stream<UH>& hd,
                   hls::stream<word_t>& dd) {
-  const bool blk = p.kind == KW || p.kind == KT, kt = p.kind == KT, scl = p.kind != KC;
-  const ap_uint<4> USm = p.wsmall ? 0 : 7;  // unit words - 1
+  const bool blk = p.blk, kt = p.kind == KT, scl = p.kind != KC;
+  const ap_uint<4> USm = (QZ_SMALL && p.wsmall) ? 0 : 7;  // unit words - 1
   ap_uint<32> win[4][16];                   // stored scales: entry e at [e % 4][(e / 4) % 16] (rows modes, KW: % 8)
 #pragma HLS ARRAY_PARTITION variable = win dim = 1 complete
 #pragma HLS BIND_STORAGE variable = win type = ram_2p impl = lutram
-  // ---- rows mode state
-  word_t ring[8];
+  word_t ring[8];  // rows mode: the row's last 8 words (shift-back re-sends)
 #pragma HLS BIND_STORAGE variable = ring type = ram_2p impl = lutram
-  const ap_uint<9> nj = p.kind == KX || p.kind == KC ? ap_uint<9>(1) : ap_uint<9>(p.nseg);  // vectors / item
-  const ap_uint<17> NR = p.kind == KC ? p.N : p.NP;                          // rows per (item, segment)
-  const ap_uint<13> nu = p.wsmall ? p.WO : ap_uint<13>((p.WO + 7) >> 3);    // units per row
-  const ap_uint<3> tl = p.wsmall ? ap_uint<3>(0) : ap_uint<3>(p.WO(2, 0));  // new words of the row's last unit
-  const ap_uint<15> Lw = (p.NP + 3) >> 2;                                     // words of a scale vector (not KT)
-  // ---- block mode state
-  word_t buf[8][8];  // [row / key][word]
+  word_t buf[8][8];  // block mode: [row / key][word]
 #pragma HLS ARRAY_PARTITION variable = buf dim = 1 complete
 #pragma HLS BIND_STORAGE variable = buf type = ram_2p impl = lutram
 #pragma HLS DEPENDENCE variable = buf inter false  // filled, then drained, then refilled: never both in one clock
-  const ap_uint<14> ngr = p.NP >> 3;  // blocks per (item, segment / chunk)
-  // ---- common
   ap_uint<17> b = 0, n = 0;  // item; row (rows mode) / block row base 8 g (block mode)
   ap_uint<9> j = 0;          // segment (KXS, KW) / chunk (KT)
   ap_uint<14> g = 0;         // block
@@ -666,119 +726,87 @@ static void qz_wb(const RP p, hls::stream<word_t>& ow, hls::stream<ap_uint<32>>&
   ap_uint<3> r = 0, w = 0;   // block fill: row, word
   ap_uint<7> e = 0;          // KT: chunk scale entries loaded
   ap_uint<15> sw0 = 0;       // first word of the scale unit being sent
-  ap_uint<2> su = 0;         // KT: scale units of the chunk sent
+  bool su = false;           // KT: the chunk's first scale unit has been sent
   // phase: 0 data (rows) / block fill, 1 block drain, 2 scale unit, 3 KT chunk scale load
   ap_uint<2> ph = kt ? 3 : 0;
-  bool after_blk = false;    // a scale unit sent after a KW block / a row: then advance
   wa_t cb = p.c, jb = p.c, rowa = p.c;  // item base, segment base, row base (rows mode)
   wa_t gb = p.c, kb = p.c;              // block base; KT chunk base (jb + 2 cc NP for p1 = 0)
   wa_t fb = p.f, vj = p.f;              // scale vectors: item base, vector base
-  const wp_t vstep = (kt && !p.kseg) ? wp_t(16) : p.segf;  // QUANT_WT p1 = 0: chunk cc's 64 scales at + 16 cc words
 wb:
   for (;;) {
 #pragma HLS PIPELINE II = 1
 #pragma HLS LOOP_TRIPCOUNT min = 8 max = 1048576 avg = 20000
-    const bool lastb = b == p.B - 1, lastj = j == nj - 1;
-    const bool lastchunk = j == p.nseg - 1;
-    bool adv = false;  // rows mode: the row and its scale unit are done; block mode: the block (and scales) done
-    if (ph == 3) {     // ---- KT: the chunk's channel scales into the window
-      const ap_uint<7> cw = (p.half && lastchunk) ? 32 : 64;
-      win[e(1, 0)][e(5, 2)] = sq.read();
-      if (e == cw - 1) {
+    const bool lastb = b == p.Bm1, lastj = j == p.njm1, lastchunk = j == p.nsegm1;
+    const bool khalf = kt && p.half && lastchunk;  // KT: this chunk has 32 channels
+    // ---- this clock's control (state at the start of the clock)
+    const bool p3 = ph == 3, p2 = ph == 2, p0 = ph == 0, p1 = ph == 1;
+    const bool rows = !blk && p0;  // rows mode: a word of the current row's unit
+    const bool fill = blk && p0;   // block fill
+    const bool lastu = u == p.num1;
+    const bool shb = rows && lastu && p.nf != 0;  // the row's shifted-back last unit
+    const bool zrow = n >= p.N;                   // rows [N, NP)
+    const ap_uint<17> frow = n | r;               // block fill: the row / key being filled
+    const bool freal = frow < p.N;
+    const bool resend = shb && k < p.nf;
+    const bool rd_ow = (rows && !zrow && !resend) || (fill && freal);
+    const bool rd_sq = p3 || (rows && scl && u == 0 && k == 0 && !zrow) || (fill && !kt && w == 0 && freal);
+    const bool emit = !p3 && !fill;  // a unit word goes to dd
+    // ---- stream reads
+    word_t x = 0;
+    if (rd_ow) x = ow.read();
+    ap_uint<32> sv = ONE_BITS;
+    if (rd_sq) sv = sq.read();
+    // ---- scale window: one store site (three cost II = 3): KT chunk load (entry e), a row's scale at its start
+    // (1.0 for rows [N, NP)), a KW row's scale as its block row is filled
+    const bool wwin = p3 || (rows && scl && u == 0 && k == 0) || (fill && !kt && w == 0);
+    const ap_uint<6> we = p3 ? e(5, 0) : rows ? ap_uint<6>(n(4, 0)) : ap_uint<6>(frow(4, 0));
+    if (wwin) win[we(1, 0)][we(5, 2)] = sv;
+    // ---- the unit word
+    const ap_uint<13> ps = shb ? p.WO8 : (QZ_SMALL && p.wsmall) ? u : ap_uint<13>(u << 3);  // rows: first word of the unit
+    const ap_uint<3> ri = ap_uint<3>(ps(2, 0) + k(2, 0));
+    if (rows && rd_ow) ring[ri] = x;
+    if (fill) buf[r][w] = freal ? x : word_t(0);
+    const ap_uint<4> wi = kt ? ap_uint<4>(sw0(3, 0) + k) : ap_uint<4>(ap_uint<3>(sw0(2, 0) + k(2, 0)));
+    const bool lastw = !blk && ap_uint<15>(sw0 + k) == p.Lwm1 && p.npl != 0;  // rows modes: pad lanes here
+    word_t ws, wk;
+    for (int l = 0; l < 4; l++) {
+#pragma HLS UNROLL
+      ws(32 * l + 31, 32 * l) = (lastw && ap_uint<2>(l) >= p.npl) ? ap_uint<32>(ONE_BITS) : win[l][wi];
+    }
+    for (int q = 0; q < 8; q++) {
+#pragma HLS UNROLL
+      wk(16 * q + 15, 16 * q) = lane16(buf[q][u(2, 0)], k(2, 0));  // KW: 8 rows of one int16 column
+    }
+    const word_t wt = buf[k(2, 0)][u(2, 0)];  // KT: word u of key k
+    const word_t o = p2 ? ws : p1 ? (kt ? wt : wk) : zrow ? word_t(0) : resend ? ring[ri] : x;
+    // ---- the unit header (on its first word)
+    const ap_uint<2> pi = kt ? ap_uint<2>(u(1, 0)) : ap_uint<2>(g(1, 0));
+    const wa_t po = pi == 0 ? wa_t(0) : pi == 1 ? wa_t(p.cp) : pi == 2 ? wa_t(p.cp2) : wa_t(p.cp3);
+    const wa_t in = kt ? (u[2] ? wa_t(p.NP) : wa_t(0)) : wa_t(ap_uint<6>(u(2, 0)) << 3);
+    // KW: gb + (g % 4) pitch + (g / 4) 64 + 8 u;  KT: gb + (u % 4) pitch + (u / 4) NP + 8 g;  rows: rowa + ps
+    const wa_t ua = p2 ? wa_t(vj + sw0) : p1 ? wa_t(gb + po + in) : wa_t(rowa + ps);
+    if (emit) {
+      if (k == 0) {
+        UH h;
+        h.addr = ua;
+        h.last = 0;
+        hd.write(h);
+      }
+      dd.write(o);
+    }
+    // ---- next state
+    bool adv = false;  // rows mode: the row (and its scale unit) done; block mode: the block (and scales) done
+    if (p3) {
+      if (e == (khalf ? 31 : 63)) {
         e = 0;
         ph = 2;
         sw0 = 0;
-        su = 0;
+        su = false;
       } else {
         e++;
       }
-    } else if (ph == 2) {  // ---- one word of a scale unit
-      const ap_uint<4> wi = kt ? ap_uint<4>(sw0(3, 0) + k) : ap_uint<4>(ap_uint<3>(sw0(2, 0) + k(2, 0)));
-      word_t o;
-      for (int l = 0; l < 4; l++) {
-#pragma HLS UNROLL
-        // a lane past the vector's NP entries (rows modes: the pad lanes of the last word) is 1.0
-        const bool pad = !kt && !blk && ap_uint<17>(((sw0 + k) << 2) + l) >= p.NP;
-        o(32 * l + 31, 32 * l) = pad ? ap_uint<32>(ONE_BITS) : win[l][wi];
-      }
-      if (k == 0) {
-        UH h;
-        h.addr = vj + sw0;
-        h.last = 0;
-        hd.write(h);
-      }
-      dd.write(o);
-      if (k == USm) {
-        k = 0;
-        if (kt) {
-          const ap_uint<2> nsu = (p.half && lastchunk) ? 1 : 2;
-          if (su == nsu - 1) {
-            ph = 0;  // the chunk's blocks
-          } else {
-            su++;
-            sw0 = 8;
-          }
-        } else {
-          ph = 0;
-          adv = true;
-        }
-      } else {
-        k++;
-      }
-    } else if (!blk) {  // ---- rows mode: one word of the current row's unit
-      const bool lastu = u == nu - 1;
-      const bool shb = lastu && tl != 0;
-      const ap_uint<13> ps = shb ? ap_uint<13>(p.WO - 8) : p.wsmall ? u : ap_uint<13>(u << 3);
-      const ap_uint<4> nf = shb ? ap_uint<4>(ap_uint<4>(8) - tl) : ap_uint<4>(0);
-      const bool zrow = n >= p.N;
-      if (scl && u == 0 && k == 0) {  // the row's stored scale (rows [N, NP): 1.0)
-        win[n(1, 0)][n(4, 2)] = zrow ? ap_uint<32>(ONE_BITS) : sq.read();
-      }
-      const ap_uint<3> ri = ap_uint<3>(ps(2, 0) + k(2, 0));
-      word_t o = 0;
-      if (zrow) {
-        o = 0;
-      } else if (k < nf) {
-        o = ring[ri];
-      } else {
-        o = ow.read();
-        ring[ri] = o;
-      }
-      if (k == 0) {
-        UH h;
-        h.addr = rowa + ps;
-        h.last = 0;
-        hd.write(h);
-      }
-      dd.write(o);
-      if (k == USm) {
-        k = 0;
-        if (!lastu) {
-          u++;
-        } else {
-          u = 0;
-          // the row is done: a scale unit after every 32nd row (wsmall: every 4th) and after the vector's last row
-          const bool vend = n == NR - 1;
-          const bool full = p.wsmall ? n(1, 0) == 3 : n(4, 0) == 31;
-          if (scl && (full || vend)) {
-            ph = 2;
-            sw0 = p.wsmall ? ap_uint<15>(n >> 2) : full ? ap_uint<15>((n >> 2) - 7) : ap_uint<15>(Lw - 8);
-          } else {
-            adv = true;
-          }
-        }
-      } else {
-        k++;
-      }
-    } else if (ph == 0) {  // ---- block fill: word w of row r of block g
-      const ap_uint<3> RWm = (kt && p.half && lastchunk) ? 3 : 7;  // words per row in the block, - 1
-      const ap_uint<17> row = n | r;
-      const bool real = row < p.N;
-      if (!kt && w == 0) {  // KW: the row's stored scale (rows [N, NP): 1.0)
-        win[row(1, 0)][ap_uint<4>(row(4, 2))] = real ? sq.read() : ap_uint<32>(ONE_BITS);
-      }
-      buf[r][w] = real ? ow.read() : word_t(0);
-      if (w != RWm) {
+    } else if (fill) {
+      if (w != (khalf ? 3 : 7)) {
         w++;
       } else {
         w = 0;
@@ -789,31 +817,39 @@ wb:
           ph = 1;
         }
       }
-    } else {  // ---- block drain: word k of unit u
-      const ap_uint<3> RWm = (kt && p.half && lastchunk) ? 3 : 7;
-      word_t o;
-      if (kt) {
-        o = buf[k(2, 0)][u(2, 0)];
-      } else {
-        for (int q = 0; q < 8; q++) {
-#pragma HLS UNROLL
-          o(16 * q + 15, 16 * q) = lane16(buf[q][u(2, 0)], k(2, 0));
+    } else if (k != USm) {
+      k++;
+    } else {
+      k = 0;
+      if (p2) {
+        if (kt) {
+          if (su || khalf) {
+            ph = 0;  // the chunk's blocks
+          } else {
+            su = true;
+            sw0 = 8;
+          }
+        } else {
+          ph = 0;
+          adv = true;
         }
-      }
-      if (k == 0) {
-        // KW: (g % 4) pitch + (g / 4) 64 + 8 u;  KT: (u % 4) pitch + (u / 4) NP + 8 g (gb holds the 8 g part)
-        const ap_uint<2> pi = kt ? ap_uint<2>(u(1, 0)) : ap_uint<2>(g(1, 0));
-        const wa_t po = pi == 0 ? wa_t(0) : pi == 1 ? wa_t(p.cp) : pi == 2 ? wa_t(p.cp2) : wa_t(p.cp3);
-        const wa_t in = kt ? (u[2] ? wa_t(p.NP) : wa_t(0)) : wa_t(ap_uint<6>(u(2, 0)) << 3);
-        UH h;
-        h.addr = gb + po + in;
-        h.last = 0;
-        hd.write(h);
-      }
-      dd.write(o);
-      if (k == 7) {
-        k = 0;
-        if (u != (kt ? RWm : ap_uint<3>(7))) {
+      } else if (rows) {
+        if (!lastu) {
+          u++;
+        } else {
+          u = 0;
+          // the row is done: a scale unit after every 32nd row (wsmall: every 4th) and after the vector's last row
+          const bool vend = n == p.NRm1;
+          const bool full = (QZ_SMALL && p.wsmall) ? n(1, 0) == 3 : n(4, 0) == 31;
+          if (scl && (full || vend)) {
+            ph = 2;
+            sw0 = (QZ_SMALL && p.wsmall) ? ap_uint<15>(n >> 2) : full ? ap_uint<15>((n >> 2) - 7) : p.Lw8;
+          } else {
+            adv = true;
+          }
+        }
+      } else {  // block drain
+        if (u != (khalf ? 3 : 7)) {
           u++;
         } else {
           u = 0;
@@ -825,13 +861,11 @@ wb:
             adv = true;
           }
         }
-      } else {
-        k++;
       }
     }
     if (adv) {  // ---- advance to the next row (rows mode) / block (block mode); the end
       if (!blk) {
-        const bool lastn = n == NR - 1;
+        const bool lastn = n == p.NRm1;
         if (lastn && lastj && lastb) break;
         if (!lastn) {
           n++;
@@ -853,21 +887,21 @@ wb:
           rowa = jb;
         }
       } else {
-        const bool lastg = g == ngr - 1;
+        const bool lastg = g == p.ngrm1;
         if (lastg && lastchunk && lastb) break;
         if (!lastg) {
+          if (kt) gb += 8;
+          else if (g(1, 0) == 3) gb += 64;  // KW: the next 32-row group (g before the increment)
           g++;
           n += 8;
-          if (kt) gb += 8;
-          else if (g(1, 0) == 0) gb += 64;  // KW: the next 32-row group
         } else {
           g = 0;
           n = 0;
           if (!lastchunk) {
             j++;
-            vj += vstep;
+            vj += p.vstep;
             if (kt && !p.kseg) {
-              kb += wa_t(p.NP) << 1;
+              kb += p.np2;
             } else {
               jb += p.segc;
               kb = jb;
@@ -895,7 +929,7 @@ wb:
 
 // ---------------------------------------------------------------- wr: units -> ymem
 static void qz_wr(word_t* mem, const RP p, hls::stream<UH>& hd, hls::stream<word_t>& dd) {
-  if (p.wsmall) {
+  if (QZ_SMALL && p.wsmall) {
   wr1:
     for (;;) {
 #pragma HLS PIPELINE II = 1
@@ -933,7 +967,7 @@ static inline uint32_t row_plan(const ctr::Cmd& c, RP& p) {
   // QUANT_W with p1 = 0 and K != 64: one scale over a whole row of K > 64 values in the KW tiling. validate()
   // accepts it but the -12392 list never builds it (every QUANT_W is per head, p1 = 64); see README "Contract notes".
   if (c.op == ctr::OP_QUANT_W && seg == 0 && K != ctr::SEG_HEAD) return ctr::ME_DIMS;
-  if (K < 8 || K > ctr::ROW_K_MAX || (K & 7) || c.N == 0 || c.B == 0) return ctr::ME_DIMS;
+  // K, N, B, NP, p1..p5 and the slots are validate_hw's (the sequencer runs it before every dispatch): not re-checked
   p.B = c.B;
   p.N = c.N;
   p.NP = (c.op == ctr::OP_COPY || c.p[ctr::P_NP] == 0) ? c.N : c.p[ctr::P_NP];
@@ -948,6 +982,7 @@ static inline uint32_t row_plan(const ctr::Cmd& c, RP& p) {
   const uint32_t npw = (c.op == ctr::OP_QUANT_W || c.op == ctr::OP_QUANT_WT) ? 8u : (uint32_t)(p.NP + 3) >> 2;
   p.rsmall = p.W < 16;  // only KX, KC, KT can have K < 64 (KXS / KW have 64-value segments)
   p.wsmall = ((p.kind == KX || p.kind == KC) && p.WO < 8) || ((p.kind == KX || p.kind == KXS) && npw < 8);
+  if (!QZ_SMALL && (p.rsmall || p.wsmall)) return ctr::ME_DIMS;
   p.a = c.s[ctr::SLOT_A].addr >> 4;
   p.c = c.s[ctr::SLOT_C].addr >> 4;
   p.f = c.s[ctr::SLOT_F].addr >> 4;
@@ -960,6 +995,29 @@ static inline uint32_t row_plan(const ctr::Cmd& c, RP& p) {
   p.segf = c.p[ctr::P_SEGF] >> 4;
   p.cp2 = ap_uint<30>(p.cp) << 1;
   p.cp3 = p.cp2 + p.cp;
+  // wb's invariants
+  const uint32_t WO = p.WO, NP = p.NP, Lw = (NP + 3) >> 2;
+  const uint32_t nu = p.wsmall ? WO : (WO + 7) >> 3, tl = p.wsmall ? 0 : WO & 7;
+  p.blk = p.kind == KW || p.kind == KT;
+  p.Bm1 = c.B - 1;
+  p.NRm1 = (p.kind == KC ? (uint32_t)c.N : NP) - 1;
+  p.njm1 = (p.kind == KX || p.kind == KC) ? 0u : (uint32_t)p.nseg - 1;
+  p.nsegm1 = p.nseg - 1;
+  p.num1 = nu - 1;
+  p.WO8 = WO - 8;  // used only when WO % 8 != 0 and WO > 8 (not wsmall)
+  p.nf = tl ? 8 - tl : 0;
+  p.Lw8 = Lw - 8;  // used only when not wsmall (Lw >= 8)
+  p.Lwm1 = Lw - 1;
+  p.npl = NP & 3;
+  p.ngrm1 = (NP >> 3) - 1;
+  p.vstep = (p.kind == KT && !p.kseg) ? wp_t(16) : p.segf;
+  p.np2 = ap_uint<30>(NP) << 1;
+  p.Nm1 = c.N - 1;
+  p.Wm1 = p.W - 1;
+  p.W16 = p.W - 16;  // used only when W > 16
+  p.rnum1 = ((K >> 2) + 15) / 16 - 1;
+  p.rskip = (K >> 2) % 16 ? 16 - (K >> 2) % 16 : 0;
+  p.SWm1 = (p.kind == KX ? (K >> 2) : 16u) - 1;
   return ctr::ME_OK;
 }
 

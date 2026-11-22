@@ -2,11 +2,12 @@
 //
 //   uint32_t rope::rope_mode(const ctr::Cmd& c, const Word* hp, const Word* xmem, Word* ymem)
 //
-// One call site in the sequencer's dispatch switch (`case ctr::OP_ROPE: return rope::rope_mode(c, w0, xmem, ymem);`),
-// INLINE off, no m_axi adapter, no decode and no register of its own: hp is the top's hp0 port (w0, read only: the
-// RoPE table, a host-written constant), xmem / ymem are the top's io port (activations are read and written only on
-// io). Every address is the record's absolute byte address (the pointer registers are 0), handled as a 128-bit word
-// index of 36 bits: validate_hw guarantees addr < 2^40 and the host's validate every extent end <= 2^40 (CONTRACT.md
+// One call site in the sequencer's dispatch switch (`case ctr::OP_ROPE: return rope::rope_mode(c, w0, xmem, ymem);`,
+// or with seq_core.h's unit signature `rope::rope_unit(c, hp0, hp1, hp2, hp3, io_rd, io_wr)`), INLINE off, no m_axi
+// adapter, no decode and no register of its own: hp is the top's hp0 port (w0, read only: the RoPE table, a
+// host-written constant), xmem / ymem are the top's io port (activations are read and written only on io). Every
+// address is the record's absolute byte address (the pointer registers are 0), handled as a 128-bit word index of
+// 36 bits: validate_hw guarantees addr < 2^40 and the host's validate every extent end <= 2^40 (CONTRACT.md
 // 3.2), so no sum wraps for a list that passed validate; there is no int anywhere in the address path.
 //
 // Record (validate_hw has checked it; rope_mode re-checks the fields that size its loops and returns ME_* with nothing
@@ -32,7 +33,8 @@
 // Processes (one DATAFLOW region per command; segments in the order (b, j, n): head-major, as quant_mode.h's QUANT_W):
 //   rd      xmem + hp: per segment one 16-word x unit and one 16-word table unit (II = 16, unconditional bursts
 //           pipelined across segments)
-//   rot_stage, emit_stage (rope_core.h): the rotation -> FP32 words in natural order + each segment's absmax
+//   rot_stage, emit_stage (rope_core.h): the rotation -> FP32 words in natural order (the rope front end)
+//   am      each segment's absmax (as quant_mode.h's amx; the words pass on into the fw FIFO, the row buffer)
 //   sc      absmax -> s = qz::scale_bits, the stored scale (qz::stored_scale), the divider seed
 //   rc      R = floor(2^49 / S): 2 iterative restoring dividers (qz::recip_step, 1 bit a clock), round robin
 //   qt      4 lanes of qz::quant_elem: 16 FP32 words -> 8 int16 words per segment; FP32 words pass through
@@ -41,9 +43,9 @@
 //           on a unit ends with a shift-back unit over its last 8 words, re-writing the overlap with the same data);
 //           Q vectors shorter than 8 words (NP <= 28) make the whole command single-word units
 //   wr      ymem: one 8-beat burst per unit (II = 8), or single words
-// rd / sc / rc / qt / kw / pk / wr are what the shared row unit (quantize/quant_mode.h) replaces; rope_core.h's two stages
-// are the rope-specific front end (CONTRACT.md 4.1). ROPE_DFSIM builds every process as a thread on bounded FIFOs
-// (dfsim/hls_stream.h): the deadlock model of CONTRACT.md 7.
+// rd / am / sc / rc / qt / kw / pk / wr are what the shared row unit (quantize/quant_mode.h) replaces; rope_core.h's
+// two stages are the rope-specific front end (CONTRACT.md 4.1). ROPE_DFSIM builds every process as a thread on
+// bounded FIFOs (dfsim/hls_stream.h): the deadlock model of CONTRACT.md 7.
 #pragma once
 #include <stdint.h>
 
@@ -64,6 +66,9 @@
 #endif
 #ifndef ROPE_D_RS
 #define ROPE_D_RS 4   // rotated groups
+#endif
+#ifndef ROPE_D_FE
+#define ROPE_D_FE 4   // front end -> absmax words
 #endif
 #ifndef ROPE_D_FW
 #define ROPE_D_FW 64  // FP32 words waiting for their segment's (s, R): 16 + the sc + rc latency (~35 clocks)
@@ -116,6 +121,11 @@ struct Args {
 };
 
 // ------------------------------------------------------------------------------------- reader
+#ifdef ROPE_TB_RDCHK
+// Testbench hook (tb_rope.cpp, never in synthesis): every 16-word read unit of rd, as absolute word indices of the x
+// unit and the table unit, so the tb can prove each read lies inside the record's declared input extents.
+void rope_tb_read(uint64_t xw, uint64_t ew);
+#endif
 // Segment (b, j, n): x row min(n, N - 1) of head j (zeroed for n >= N) and table row min(n, N - 1).
 static void rd(const Word* xmem, const Word* hp, const Args g, hls::stream<Word>& xs, hls::stream<Word>& cs) {
   cnt_t b = 0, n = 0;
@@ -128,6 +138,9 @@ rd:
     Word v[WORDS], t[WORDS];
 #pragma HLS ARRAY_PARTITION variable = v complete
 #pragma HLS ARRAY_PARTITION variable = t complete
+#ifdef ROPE_TB_RDCHK
+    rope_tb_read((uint64_t)xa, (uint64_t)ea);
+#endif
     for (int k = 0; k < WORDS; k++) {
 #pragma HLS UNROLL
       v[k] = xmem[xa + k];  // unconditional: one 16-beat burst on each port, pipelined across segments
@@ -164,6 +177,38 @@ rd:
         ea = eb;
       }
     }
+  }
+}
+
+// ------------------------------------------------------------------------------------- segment absmax
+// The backbone's per-segment absmax (quant_mode.h amx): an integer max over the 31 magnitude bits of the segment's
+// 64 FP32 values (as qz::word_amax); the words go on to fw (the row buffer) as they pass.
+static void am_stage(hls::stream<Word>& fe, hls::stream<Word>& fw, hls::stream<abits_t>& am, rcount_t segs,
+                     bool quant) {
+  abits_t amx = 0;
+  ap_uint<4> w = 0;
+  rcount_t r = 0;
+  if (segs == 0) return;
+am:
+  for (;;) {
+#pragma HLS PIPELINE II = 1
+#pragma HLS LOOP_TRIPCOUNT min = 16 max = 20000 avg = 5000
+    const Word o = fe.read();
+    fw.write(o);
+    abits_t wm = 0;
+    for (int l = 0; l < 4; l++) {
+#pragma HLS UNROLL
+      const abits_t fa = lane(o, l).range(30, 0);
+      wm = fa > wm ? fa : wm;
+    }
+    const abits_t prev = w == 0 ? (abits_t)0 : amx;
+    amx = wm > prev ? wm : prev;
+    if (w == WORDS - 1) {
+      if (quant) am.write(amx);
+      r++;
+      if (r == segs) break;
+    }
+    w++;
   }
 }
 
@@ -579,7 +624,8 @@ static void rope_df(const Word* hp, const Word* xmem, Word* ymem, const Args g, 
 #pragma HLS STABLE variable = kw
 #pragma HLS STABLE variable = shift
 #pragma HLS STABLE variable = wsmall
-  hls::stream<Word> xs("rope_xs"), cs("rope_cs"), fw("rope_fw"), ow("rope_ow"), ot("rope_ot"), dd("rope_dd");
+  hls::stream<Word> xs("rope_xs"), cs("rope_cs"), fe("rope_fe"), fw("rope_fw"), ow("rope_ow"), ot("rope_ot"),
+      dd("rope_dd");
   hls::stream<Rot> rs("rope_rs");
   hls::stream<abits_t> am("rope_am");
   hls::stream<SD> sdf("rope_sd");
@@ -590,6 +636,7 @@ static void rope_df(const Word* hp, const Word* xmem, Word* ymem, const Args g, 
 #pragma HLS STREAM variable = xs depth = ROPE_D_XS
 #pragma HLS STREAM variable = cs depth = ROPE_D_CS
 #pragma HLS STREAM variable = rs depth = ROPE_D_RS
+#pragma HLS STREAM variable = fe depth = ROPE_D_FE
 #pragma HLS STREAM variable = fw depth = ROPE_D_FW
 #pragma HLS STREAM variable = am depth = ROPE_D_AM
 #pragma HLS STREAM variable = sdf depth = ROPE_D_SD
@@ -610,7 +657,8 @@ static void rope_df(const Word* hp, const Word* xmem, Word* ymem, const Args g, 
 #ifndef ROPE_DFSIM
   rd(xmem, hp, g, xs, cs);
   rot_stage(xs, cs, rs, segs);
-  emit_stage(rs, fw, am, segs, quant);
+  emit_stage(rs, fe, segs);
+  am_stage(fe, fw, am, segs, quant);
   sc_stage(am, sdf, spf, nq, shift);
   rc_stage(sdf, rf, nq);
   qt_stage(fw, spf, rf, ow, ss, segs, quant);
@@ -620,7 +668,8 @@ static void rope_df(const Word* hp, const Word* xmem, Word* ymem, const Args g, 
 #else  // threads on bounded FIFOs: a deadlock blocks a stream and dfsim/hls_stream.h reports it
   std::thread t0([&] { rd(xmem, hp, g, xs, cs); });
   std::thread t1([&] { rot_stage(xs, cs, rs, segs); });
-  std::thread t2([&] { emit_stage(rs, fw, am, segs, quant); });
+  std::thread t2([&] { emit_stage(rs, fe, segs); });
+  std::thread t2b([&] { am_stage(fe, fw, am, segs, quant); });
   std::thread t3([&] { sc_stage(am, sdf, spf, nq, shift); });
   std::thread t3b([&] { rc_stage(sdf, rf, nq); });
   std::thread t4([&] { qt_stage(fw, spf, rf, ow, ss, segs, quant); });
@@ -630,6 +679,7 @@ static void rope_df(const Word* hp, const Word* xmem, Word* ymem, const Args g, 
   t0.join();
   t1.join();
   t2.join();
+  t2b.join();
   t3.join();
   t3b.join();
   t4.join();
@@ -682,6 +732,16 @@ static uint32_t rope_mode(const ctr::Cmd& c, const Word* hp, const Word* xmem, W
   rope_df(hp, xmem, ymem, g, segs, quant ? segs : (rcount_t)0, nwords, kw ? (rcount_t)(segs >> 3) : (rcount_t)0, quant,
           kw, (ap_int<5>)sh, g.wsmall);
   return ctr::ME_OK;
+}
+
+// The sequencer's unit signature (fpga/kernels/sequencer/seq_core.h "Units"): the row unit's row() calls this for
+// OP_ROPE. Only hp0 (the table) and io are used; tb_rope.cpp runs every layout through seq::dispatch and this.
+template <class WP, class W>
+static uint32_t rope_unit(const ctr::Cmd& c, const WP* hp0, const WP* hp1, const WP* hp2, const WP* hp3,
+                          const W* io_rd, W* io_wr) {
+#pragma HLS INLINE
+  (void)hp1, (void)hp2, (void)hp3;
+  return rope_mode(c, hp0, io_rd, io_wr);
 }
 
 }  // namespace rope
